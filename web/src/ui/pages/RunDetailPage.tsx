@@ -5,6 +5,14 @@ import { cancelScan, getScan } from "../../lib/api";
 
 export function RunDetailPage() {
   const { id } = useParams();
+
+  const cancelM = useMutation({
+    mutationFn: async () => {
+      if (!id) throw new Error("Missing scan id");
+      return cancelScan(id);
+    }
+  });
+
   const runQ = useQuery({
     queryKey: ["run", id],
     queryFn: () => getScan(id!),
@@ -16,12 +24,6 @@ export function RunDetailPage() {
   if (runQ.isError) return <Alert severity="error">Failed to load run.</Alert>;
 
   const run = runQ.data!;
-  const cancelM = useMutation({
-    mutationFn: () => cancelScan(run.id),
-    onSuccess: () => {
-      runQ.refetch();
-    }
-  });
 
   return (
     <Box>
@@ -43,7 +45,10 @@ export function RunDetailPage() {
                 color="error"
                 size="small"
                 disabled={cancelM.isPending}
-                onClick={() => cancelM.mutate()}
+                onClick={async () => {
+                  await cancelM.mutateAsync();
+                  await runQ.refetch();
+                }}
               >
                 Stop scan
               </Button>

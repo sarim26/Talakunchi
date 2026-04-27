@@ -22,13 +22,11 @@ export async function explainWithGemini(opts: {
   input: ExplainInput;
 }): Promise<ExplainOutput> {
   const client = new GoogleGenerativeAI(opts.apiKey);
-  const model = client.getGenerativeModel({
-    model: opts.model,
-    generationConfig: {
-      temperature: 0.2,
-      maxOutputTokens: 600
-    }
-  });
+  const candidates = [
+    opts.model,
+    // Some environments require fully qualified names.
+    opts.model.startsWith("models/") ? opts.model : `models/${opts.model}`
+  ];
 
   const prompt = [
     "You are assisting an internal security team. Summarize the finding and provide remediation guidance.",
@@ -49,8 +47,27 @@ export async function explainWithGemini(opts: {
     JSON.stringify(opts.input, null, 2)
   ].join("\n");
 
-  const resp = await model.generateContent(prompt);
-  const text = resp.response.text();
+  let lastErr: unknown = null;
+  let text: string | null = null;
+  for (const m of candidates) {
+    try {
+      const model = client.getGenerativeModel({
+        model: m,
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 600
+        }
+      });
+      const resp = await model.generateContent(prompt);
+      text = resp.response.text();
+      break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!text) {
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+  }
 
   // Extract JSON robustly (model sometimes wraps in ```json ... ```).
   const jsonText = text

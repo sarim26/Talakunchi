@@ -8,7 +8,8 @@ const EnvSchema = z.object({
   NEO4J_PASSWORD: z.string().min(1),
   AI_MODE: z.enum(["mock", "gemini"]).default("mock"),
   GEMINI_API_KEY: z.string().optional(),
-  GEMINI_MODEL: z.string().optional().default("gemini-1.5-flash")
+  // Default to a commonly-available alias; can be overridden via .env
+  GEMINI_MODEL: z.string().optional().default("gemini-1.5-flash-latest")
 });
 
 export type Env = z.infer<typeof EnvSchema>;

@@ -25,6 +25,32 @@ await app.register(cors, {
 
 app.get("/health", async () => ({ ok: true }));
 
+app.get("/api/ai/models", async (_req, reply) => {
+  if (env.AI_MODE !== "gemini") return reply.send({ provider: env.AI_MODE, models: [] });
+  if (!env.GEMINI_API_KEY) return reply.code(400).send({ error: "GEMINI_API_KEY is not set" });
+
+  const { GoogleGenerativeAI } = await import("@google/generative-ai");
+  const client = new GoogleGenerativeAI(env.GEMINI_API_KEY);
+  // listModels exists in recent versions of the SDK; if not, return a hint.
+  const anyClient: any = client as any;
+  if (typeof anyClient.listModels !== "function") {
+    return reply.send({
+      provider: "gemini",
+      models: [],
+      note: "SDK does not expose listModels(); set GEMINI_MODEL manually."
+    });
+  }
+
+  const models = await anyClient.listModels();
+  return reply.send({
+    provider: "gemini",
+    models: (models?.models ?? models ?? []).map((m: any) => ({
+      name: m.name,
+      supportedGenerationMethods: m.supportedGenerationMethods
+    }))
+  });
+});
+
 app.post("/api/targets", async (req, reply) => {
   const body = CreateTargetSchema.parse(req.body);
   const row = await withClient(async (c) => {
