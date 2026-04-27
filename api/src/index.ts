@@ -5,7 +5,7 @@ import { env } from "./env.js";
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 import { CreateScanSchema, CreateTargetSchema, UpdateFindingSchema } from "./schemas.js";
-import { explainWithGemini } from "./llm/gemini.js";
+import { explainWithGemini, summarizeSurfaceWithGemini } from "./llm/gemini.js";
 
 const app = Fastify({ logger: true });
 
@@ -141,6 +141,86 @@ app.get("/api/targets", async () => {
     owner: r.owner,
     createdAt: r.created_at
   }));
+});
+
+app.get("/api/services", async (req) => {
+  const q = req.query as any;
+  const targetId = q.targetId ? z.string().uuid().parse(q.targetId) : undefined;
+  if (!targetId) return [];
+
+  const rows = await withClient(async (c) => {
+    const res = await c.query(
+      `select id, target_id, port, protocol, service_name, product, version, banner, first_seen_at, last_seen_at
+       from services
+       where target_id = $1
+       order by port asc`,
+      [targetId]
+    );
+    return res.rows;
+  });
+  return rows.map((r) => ({
+    id: r.id,
+    targetId: r.target_id,
+    port: r.port,
+    protocol: r.protocol,
+    serviceName: r.service_name ?? null,
+    product: r.product ?? null,
+    version: r.version ?? null,
+    banner: r.banner ?? null,
+    firstSeenAt: r.first_seen_at,
+    lastSeenAt: r.last_seen_at
+  }));
+});
+
+app.post("/api/targets/:id/explain-surface", async (req, reply) => {
+  const targetId = z.string().uuid().parse((req.params as any).id);
+  const target = await withClient(async (c) => {
+    const tRes = await c.query(`select id, name, address from targets where id=$1`, [targetId]);
+    return tRes.rows[0];
+  });
+  if (!target) return reply.code(404).send({ error: "Target not found" });
+
+  const services = await withClient(async (c) => {
+    const sRes = await c.query(
+      `select port, protocol, service_name, product, version
+       from services
+       where target_id=$1
+       order by port asc`,
+      [targetId]
+    );
+    return sRes.rows;
+  });
+
+  const input = {
+    targetName: target.name as string,
+    targetAddress: target.address as string,
+    services: services.map((s: any) => ({
+      port: Number(s.port),
+      protocol: String(s.protocol),
+      serviceName: s.service_name ?? null,
+      product: s.product ?? null,
+      version: s.version ?? null
+    }))
+  };
+
+  if (env.AI_MODE !== "gemini") {
+    return reply.send({
+      mode: env.AI_MODE,
+      summary: `Found ${input.services.length} open services on ${input.targetName} (${input.targetAddress}).`,
+      keyRisks: [],
+      topExposures: [],
+      remediation: ["Restrict exposure to required subnets only.", "Patch/harden services."],
+      verification: ["Re-run the scan and confirm exposure is reduced."]
+    });
+  }
+  if (!env.GEMINI_API_KEY) return reply.code(400).send({ error: "GEMINI_API_KEY is not set" });
+
+  const out = await summarizeSurfaceWithGemini({
+    apiKey: env.GEMINI_API_KEY,
+    model: env.GEMINI_MODEL,
+    input
+  });
+  return reply.send({ mode: "gemini", ...out });
 });
 
 app.post("/api/scans", async (req, reply) => {

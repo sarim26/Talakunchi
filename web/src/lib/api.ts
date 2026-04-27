@@ -71,6 +71,20 @@ export const FindingSchema = z.object({
 });
 export type Finding = z.infer<typeof FindingSchema>;
 
+export const ServiceSchema = z.object({
+  id: z.string().uuid(),
+  targetId: z.string().uuid(),
+  port: z.number(),
+  protocol: z.string(),
+  serviceName: z.string().nullable(),
+  product: z.string().nullable(),
+  version: z.string().nullable(),
+  banner: z.string().nullable(),
+  firstSeenAt: z.any(),
+  lastSeenAt: z.any()
+});
+export type Service = z.infer<typeof ServiceSchema>;
+
 export async function listTargets() {
   return http("/api/targets", undefined, z.array(TargetSchema));
 }
@@ -107,6 +121,34 @@ export async function listFindings(params?: { targetId?: string; severity?: stri
   if (params?.status) qp.set("status", params.status);
   const qs = qp.toString() ? `?${qp.toString()}` : "";
   return http(`/api/findings${qs}`, undefined, z.array(FindingSchema));
+}
+
+export async function listServices(targetId: string) {
+  const qp = new URLSearchParams();
+  qp.set("targetId", targetId);
+  return http(`/api/services?${qp.toString()}`, undefined, z.array(ServiceSchema));
+}
+
+export async function explainSurface(targetId: string) {
+  return http(
+    `/api/targets/${targetId}/explain-surface`,
+    { method: "POST", body: "{}" },
+    z.object({
+      mode: z.string(),
+      summary: z.string(),
+      keyRisks: z.array(z.string()),
+      topExposures: z.array(
+        z.object({
+          port: z.number(),
+          protocol: z.string(),
+          risk: z.enum(["low", "medium", "high", "critical"]),
+          reason: z.string()
+        })
+      ),
+      remediation: z.array(z.string()),
+      verification: z.array(z.string())
+    })
+  );
 }
 
 export async function updateFinding(id: string, input: { status?: string; severity?: string }) {
