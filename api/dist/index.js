@@ -1,0 +1,283 @@
+import Fastify from "fastify";
+import cors from "@fastify/cors";
+import { z } from "zod";
+import { env } from "./env.js";
+import { withClient } from "./db.js";
+import { withSession } from "./neo4j.js";
+import { CreateScanSchema, CreateTargetSchema, UpdateFindingSchema } from "./schemas.js";
+const app = Fastify({ logger: true });
+await app.register(cors, {
+    origin: true
+});
+app.get("/health", async () => ({ ok: true }));
+app.post("/api/targets", async (req, reply) => {
+    const body = CreateTargetSchema.parse(req.body);
+    const row = await withClient(async (c) => {
+        const res = await c.query(`insert into targets (name, address, tags, owner)
+       values ($1, $2, $3, $4)
+       returning id, name, address, tags, owner, created_at`, [body.name, body.address, body.tags, body.owner ?? null]);
+        return res.rows[0];
+    });
+    return reply.code(201).send({
+        id: row.id,
+        name: row.name,
+        address: row.address,
+        tags: row.tags,
+        owner: row.owner,
+        createdAt: row.created_at
+    });
+});
+app.get("/api/targets", async () => {
+    const rows = await withClient(async (c) => {
+        const res = await c.query(`select id, name, address, tags, owner, created_at
+       from targets
+       order by created_at desc`);
+        return res.rows;
+    });
+    return rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        address: r.address,
+        tags: r.tags,
+        owner: r.owner,
+        createdAt: r.created_at
+    }));
+});
+app.post("/api/scans", async (req, reply) => {
+    const body = CreateScanSchema.parse(req.body);
+    const scanRun = await withClient(async (c) => {
+        await c.query("begin");
+        try {
+            const runRes = await c.query(`insert into scan_runs (target_id, profile, status, requested_by)
+         values ($1, $2, 'queued', $3)
+         returning id, target_id, profile, status, requested_by, created_at`, [body.targetId, body.profile, body.requestedBy]);
+            const run = runRes.rows[0];
+            await c.query(`insert into jobs (type, status, payload)
+         values ('scan', 'queued', $1::jsonb)`, [
+                JSON.stringify({
+                    scanRunId: run.id
+                })
+            ]);
+            await c.query("commit");
+            return run;
+        }
+        catch (e) {
+            await c.query("rollback");
+            throw e;
+        }
+    });
+    return reply.code(202).send({
+        id: scanRun.id,
+        targetId: scanRun.target_id,
+        profile: scanRun.profile,
+        status: scanRun.status,
+        requestedBy: scanRun.requested_by,
+        createdAt: scanRun.created_at
+    });
+});
+app.get("/api/scans", async () => {
+    const rows = await withClient(async (c) => {
+        const res = await c.query(`select sr.id, sr.target_id, t.name as target_name, t.address as target_address,
+              sr.profile, sr.status, sr.requested_by, sr.started_at, sr.finished_at, sr.created_at
+       from scan_runs sr
+       join targets t on t.id = sr.target_id
+       order by sr.created_at desc
+       limit 50`);
+        return res.rows;
+    });
+    return rows.map((r) => ({
+        id: r.id,
+        targetId: r.target_id,
+        target: { name: r.target_name, address: r.target_address },
+        profile: r.profile,
+        status: r.status,
+        requestedBy: r.requested_by,
+        startedAt: r.started_at,
+        finishedAt: r.finished_at,
+        createdAt: r.created_at
+    }));
+});
+app.get("/api/scans/:id", async (req) => {
+    const scanRunId = z.string().uuid().parse(req.params.id);
+    const result = await withClient(async (c) => {
+        const runRes = await c.query(`select sr.id, sr.target_id, t.name as target_name, t.address as target_address,
+              sr.profile, sr.status, sr.requested_by, sr.started_at, sr.finished_at, sr.created_at
+       from scan_runs sr
+       join targets t on t.id = sr.target_id
+       where sr.id = $1`, [scanRunId]);
+        const run = runRes.rows[0];
+        const stepsRes = await c.query(`select id, name, status, started_at, finished_at, log, created_at
+       from scan_steps
+       where scan_run_id = $1
+       order by created_at asc`, [scanRunId]);
+        return { run, steps: stepsRes.rows };
+    });
+    return {
+        id: result.run.id,
+        targetId: result.run.target_id,
+        target: { name: result.run.target_name, address: result.run.target_address },
+        profile: result.run.profile,
+        status: result.run.status,
+        requestedBy: result.run.requested_by,
+        startedAt: result.run.started_at,
+        finishedAt: result.run.finished_at,
+        createdAt: result.run.created_at,
+        steps: result.steps.map((s) => ({
+            id: s.id,
+            name: s.name,
+            status: s.status,
+            startedAt: s.started_at,
+            finishedAt: s.finished_at,
+            log: s.log,
+            createdAt: s.created_at
+        }))
+    };
+});
+app.get("/api/findings", async (req) => {
+    const q = req.query;
+    const targetId = q.targetId ? z.string().uuid().parse(q.targetId) : undefined;
+    const severity = q.severity ? z.enum(["info", "low", "medium", "high", "critical"]).parse(q.severity) : undefined;
+    const status = q.status
+        ? z
+            .enum(["open", "triaged", "in_progress", "fixed", "verified", "false_positive", "accepted_risk"])
+            .parse(q.status)
+        : undefined;
+    const rows = await withClient(async (c) => {
+        const where = [];
+        const params = [];
+        if (targetId) {
+            params.push(targetId);
+            where.push(`f.target_id = $${params.length}`);
+        }
+        if (severity) {
+            params.push(severity);
+            where.push(`f.severity = $${params.length}`);
+        }
+        if (status) {
+            params.push(status);
+            where.push(`f.status = $${params.length}`);
+        }
+        const whereSql = where.length ? `where ${where.join(" and ")}` : "";
+        const res = await c.query(`
+      select f.id, f.title, f.severity, f.status, f.evidence_redacted, f.first_seen_at, f.last_seen_at,
+             t.id as target_id, t.name as target_name, t.address as target_address,
+             s.port as service_port, s.protocol as service_protocol, s.service_name as service_name
+      from findings f
+      join targets t on t.id = f.target_id
+      left join services s on s.id = f.service_id
+      ${whereSql}
+      order by f.last_seen_at desc
+      limit 200
+      `, params);
+        return res.rows;
+    });
+    return rows.map((r) => ({
+        id: r.id,
+        title: r.title,
+        severity: r.severity,
+        status: r.status,
+        evidenceRedacted: r.evidence_redacted,
+        firstSeenAt: r.first_seen_at,
+        lastSeenAt: r.last_seen_at,
+        target: { id: r.target_id, name: r.target_name, address: r.target_address },
+        service: r.service_port
+            ? { port: r.service_port, protocol: r.service_protocol, name: r.service_name ?? null }
+            : null
+    }));
+});
+app.patch("/api/findings/:id", async (req) => {
+    const findingId = z.string().uuid().parse(req.params.id);
+    const body = UpdateFindingSchema.parse(req.body);
+    const updated = await withClient(async (c) => {
+        const res = await c.query(`update findings
+       set status = coalesce($2, status)
+       where id = $1
+       returning id, status`, [findingId, body.status ?? null]);
+        return res.rows[0];
+    });
+    return { id: updated.id, status: updated.status };
+});
+app.post("/api/findings/:id/explain", async (req) => {
+    const findingId = z.string().uuid().parse(req.params.id);
+    const finding = await withClient(async (c) => {
+        const res = await c.query(`select f.id, f.title, f.severity, f.evidence_redacted, t.name as target_name, t.address as target_address,
+              s.port as service_port, s.protocol as service_protocol, s.service_name as service_name
+       from findings f
+       join targets t on t.id = f.target_id
+       left join services s on s.id = f.service_id
+       where f.id = $1`, [findingId]);
+        return res.rows[0];
+    });
+    // Prototype: always mock.
+    return {
+        mode: env.AI_MODE,
+        summary: `This finding indicates a potentially risky exposure on ${finding.target_name} (${finding.target_address}).`,
+        whyItMatters: "Even in staging, these issues often mirror production misconfigurations and can lead to lateral movement or data exposure if not fixed early.",
+        remediation: [
+            "Confirm this service is required on the host.",
+            "Restrict access to trusted subnets only (firewall/NSG).",
+            "Patch/upgrade the component and enforce secure configuration baselines.",
+            "Re-run the scan to verify the issue no longer appears."
+        ],
+        verification: [
+            "Re-run the same scan profile.",
+            "Confirm the port/service exposure is reduced or the configuration is corrected.",
+            "Ensure monitoring/logging is enabled for the service."
+        ],
+        detailsUsed: {
+            title: finding.title,
+            severity: finding.severity,
+            service: finding.service_port
+                ? { port: finding.service_port, protocol: finding.service_protocol, name: finding.service_name ?? null }
+                : null
+        }
+    };
+});
+app.get("/api/graph/target/:id", async (req) => {
+    const targetId = z.string().uuid().parse(req.params.id);
+    const graph = await withSession(async (s) => {
+        const res = await s.run(`
+      match (t:Target {id: $targetId})
+      optional match (t)-[:HAS_SERVICE]->(svc:Service)
+      optional match (svc)-[:HAS_FINDING]->(f:Finding)
+      with t, collect(distinct svc) as services, collect(distinct f) as findings
+      optional match (t)-[:HAS_SERVICE]->(svc2:Service)
+      optional match (svc2)-[:HAS_FINDING]->(f2:Finding)
+      return t,
+             services,
+             findings,
+             collect(distinct { from: svc2.id, to: f2.id }) as serviceFindingPairs
+      `, { targetId });
+        const rec = res.records[0];
+        if (!rec)
+            return { target: null, services: [], findings: [], edges: [] };
+        const t = rec.get("t").properties;
+        const services = rec.get("services").filter(Boolean).map((n) => n.properties);
+        const findings = rec.get("findings").filter(Boolean).map((n) => n.properties);
+        const pairs = rec.get("serviceFindingPairs").filter((p) => p?.from && p?.to);
+        const edges = [
+            ...services.map((s) => ({
+                id: `t->s:${t.id}:${s.id}`,
+                source: `target:${t.id}`,
+                target: `service:${s.id}`
+            })),
+            ...pairs.map((p) => ({
+                id: `s->f:${p.from}:${p.to}`,
+                source: `service:${p.from}`,
+                target: `finding:${p.to}`
+            }))
+        ];
+        const nodes = [
+            { id: `target:${t.id}`, kind: "Target", data: t },
+            ...services.map((s) => ({ id: `service:${s.id}`, kind: "Service", data: s })),
+            ...findings.map((f) => ({ id: `finding:${f.id}`, kind: "Finding", data: f }))
+        ];
+        return { target: t, services, findings, nodes, edges };
+    });
+    return graph;
+});
+await app.listen({ port: env.PORT, host: "0.0.0.0" });
+process.on("SIGINT", async () => {
+    await app.close();
+    process.exit(0);
+});
