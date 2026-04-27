@@ -25,6 +25,57 @@ await app.register(cors, {
 
 app.get("/health", async () => ({ ok: true }));
 
+// --- Demo admin: reset database (two-step confirmation) ---
+const resetState: { code: string | null; expiresAt: number } = { code: null, expiresAt: 0 };
+function newResetCode() {
+  const code = Math.random().toString(36).slice(2, 8).toUpperCase();
+  resetState.code = code;
+  resetState.expiresAt = Date.now() + 2 * 60 * 1000;
+  return code;
+}
+
+app.post("/api/admin/reset/request", async (_req, reply) => {
+  const code = newResetCode();
+  return reply.send({ code, expiresInSeconds: 120 });
+});
+
+app.post("/api/admin/reset/confirm", async (req, reply) => {
+  const body = z.object({ code: z.string().min(1) }).parse(req.body);
+  if (!resetState.code || Date.now() > resetState.expiresAt) {
+    return reply.code(400).send({ error: "Reset code expired. Request a new one." });
+  }
+  if (body.code.trim().toUpperCase() !== resetState.code) {
+    return reply.code(400).send({ error: "Reset code mismatch." });
+  }
+
+  // Wipe Postgres tables (demo only)
+  await withClient(async (c) => {
+    await c.query("begin");
+    try {
+      await c.query("truncate table finding_events restart identity cascade");
+      await c.query("truncate table findings restart identity cascade");
+      await c.query("truncate table services restart identity cascade");
+      await c.query("truncate table scan_steps restart identity cascade");
+      await c.query("truncate table scan_runs restart identity cascade");
+      await c.query("truncate table jobs restart identity cascade");
+      await c.query("truncate table targets restart identity cascade");
+      await c.query("commit");
+    } catch (e) {
+      await c.query("rollback");
+      throw e;
+    }
+  });
+
+  // Wipe Neo4j (demo only)
+  await withSession(async (s) => {
+    await s.run("match (n) detach delete n");
+  });
+
+  resetState.code = null;
+  resetState.expiresAt = 0;
+  return reply.send({ ok: true });
+});
+
 app.get("/api/ai/models", async (_req, reply) => {
   if (env.AI_MODE !== "gemini") return reply.send({ provider: env.AI_MODE, models: [] });
   if (!env.GEMINI_API_KEY) return reply.code(400).send({ error: "GEMINI_API_KEY is not set" });

@@ -139,6 +139,22 @@ export async function cancelScan(scanRunId: string) {
   );
 }
 
+export async function requestReset() {
+  return http(
+    "/api/admin/reset/request",
+    { method: "POST", body: "{}" },
+    z.object({ code: z.string(), expiresInSeconds: z.number() })
+  );
+}
+
+export async function confirmReset(code: string) {
+  return http(
+    "/api/admin/reset/confirm",
+    { method: "POST", body: JSON.stringify({ code }) },
+    z.object({ ok: z.boolean() })
+  );
+}
+
 export async function getGraphForTarget(targetId: string) {
   return http(
     `/api/graph/target/${targetId}`,
