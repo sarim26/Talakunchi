@@ -109,11 +109,11 @@ export async function listFindings(params?: { targetId?: string; severity?: stri
   return http(`/api/findings${qs}`, undefined, z.array(FindingSchema));
 }
 
-export async function updateFinding(id: string, input: { status?: string }) {
+export async function updateFinding(id: string, input: { status?: string; severity?: string }) {
   return http(
     `/api/findings/${id}`,
     { method: "PATCH", body: JSON.stringify(input) },
-    z.object({ id: z.string().uuid(), status: z.string() })
+    z.object({ id: z.string().uuid(), status: z.string(), severity: z.string().optional() })
   );
 }
 
@@ -126,7 +126,8 @@ export async function explainFinding(id: string) {
       summary: z.string(),
       whyItMatters: z.string(),
       remediation: z.array(z.string()),
-      verification: z.array(z.string())
+      verification: z.array(z.string()),
+      suggestedSeverity: z.enum(["info", "low", "medium", "high", "critical"]).optional()
     })
   );
 }

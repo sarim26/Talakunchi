@@ -21,5 +21,6 @@ export const UpdateFindingSchema = z.object({
         "false_positive",
         "accepted_risk"
     ])
-        .optional()
+        .optional(),
+    severity: z.enum(["info", "low", "medium", "high", "critical"]).optional()
 });

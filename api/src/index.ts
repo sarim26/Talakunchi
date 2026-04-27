@@ -342,15 +342,16 @@ app.patch("/api/findings/:id", async (req) => {
   const updated = await withClient(async (c) => {
     const res = await c.query(
       `update findings
-       set status = coalesce($2, status)
+       set status = coalesce($2, status),
+           severity = coalesce($3, severity)
        where id = $1
-       returning id, status`,
-      [findingId, body.status ?? null]
+       returning id, status, severity`,
+      [findingId, body.status ?? null, body.severity ?? null]
     );
     return res.rows[0];
   });
 
-  return { id: updated.id, status: updated.status };
+  return { id: updated.id, status: updated.status, severity: updated.severity };
 });
 
 app.post("/api/findings/:id/explain", async (req, reply) => {

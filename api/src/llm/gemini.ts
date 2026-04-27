@@ -14,6 +14,7 @@ export type ExplainOutput = {
   whyItMatters: string;
   remediation: string[];
   verification: string[];
+  suggestedSeverity?: "info" | "low" | "medium" | "high" | "critical";
 };
 
 export async function explainWithGemini(opts: {
@@ -40,7 +41,8 @@ export async function explainWithGemini(opts: {
     '  "summary": string,',
     '  "whyItMatters": string,',
     '  "remediation": string[],',
-    '  "verification": string[]',
+    '  "verification": string[],',
+    '  "suggestedSeverity": "info" | "low" | "medium" | "high" | "critical" (optional)',
     "}",
     "",
     "Finding data:",
@@ -92,7 +94,10 @@ export async function explainWithGemini(opts: {
     summary: String(parsed.summary ?? ""),
     whyItMatters: String(parsed.whyItMatters ?? ""),
     remediation: Array.isArray(parsed.remediation) ? parsed.remediation.map(String) : [],
-    verification: Array.isArray(parsed.verification) ? parsed.verification.map(String) : []
+    verification: Array.isArray(parsed.verification) ? parsed.verification.map(String) : [],
+    suggestedSeverity: ["info", "low", "medium", "high", "critical"].includes(parsed.suggestedSeverity)
+      ? parsed.suggestedSeverity
+      : undefined
   };
 }
 

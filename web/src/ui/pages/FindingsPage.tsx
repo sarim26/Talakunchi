@@ -34,8 +34,10 @@ export function FindingsPage() {
     whyItMatters: string;
     remediation: string[];
     verification: string[];
+    suggestedSeverity?: "info" | "low" | "medium" | "high" | "critical";
   }>(null);
   const [explainError, setExplainError] = useState<string | null>(null);
+  const [explainedFindingId, setExplainedFindingId] = useState<string | null>(null);
 
   const statusM = useMutation({
     mutationFn: ({ id, status }: { id: string; status: string }) => updateFinding(id, { status }),
@@ -49,6 +51,7 @@ export function FindingsPage() {
     onMutate: async () => {
       setExplainError(null);
       setExplainData(null);
+      setExplainedFindingId(null);
       setDialogOpen(true);
     },
     onSuccess: (data) => {
@@ -56,6 +59,13 @@ export function FindingsPage() {
     },
     onError: (e) => {
       setExplainError(String(e));
+    }
+  });
+
+  const applySeverityM = useMutation({
+    mutationFn: ({ id, severity }: { id: string; severity: string }) => updateFinding(id, { severity }),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["findings"], exact: false });
     }
   });
 
@@ -127,7 +137,10 @@ export function FindingsPage() {
                   <Button
                     variant="outlined"
                     size="small"
-                    onClick={() => explainM.mutate(f.id)}
+                    onClick={() => {
+                      setExplainedFindingId(f.id);
+                      explainM.mutate(f.id);
+                    }}
                   >
                     Explain (AI)
                   </Button>
@@ -149,6 +162,25 @@ export function FindingsPage() {
           {explainM.isPending ? <Typography>Generating…</Typography> : null}
           {explainData ? (
             <Stack spacing={2} sx={{ mt: 1 }}>
+              {explainData.suggestedSeverity && explainedFindingId ? (
+                <Box sx={{ display: "flex", alignItems: "center", gap: 2 }}>
+                  <Alert severity="info" sx={{ flexGrow: 1 }}>
+                    Suggested severity: <b>{explainData.suggestedSeverity}</b>
+                  </Alert>
+                  <Button
+                    variant="contained"
+                    disabled={applySeverityM.isPending}
+                    onClick={() =>
+                      applySeverityM.mutate({
+                        id: explainedFindingId,
+                        severity: explainData.suggestedSeverity!
+                      })
+                    }
+                  >
+                    Apply
+                  </Button>
+                </Box>
+              ) : null}
               <Box>
                 <Typography variant="subtitle2">Summary</Typography>
                 <Typography variant="body2">{explainData.summary}</Typography>

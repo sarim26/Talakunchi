@@ -320,10 +320,22 @@ async function appendStepLog(stepId: string, text: string) {
   });
 }
 
-function deriveFindingsFromObserved(targetAddress: string, services: Array<{ port: number; protocol: string }>) {
-  // Deterministic policy findings based purely on observed exposure.
-  const seen = new Set(services.map((s) => `${s.protocol}/${s.port}`));
+function deriveFindingsFromObserved(
+  targetAddress: string,
+  services: Array<{ port: number; protocol: string; serviceName?: string; product?: string; version?: string }>
+) {
+  // Deterministic "service exposure" findings for every open port, plus special policy findings.
   const mk = (key: string) => `fp:${key}`;
+
+  const severityForPort = (port: number) => {
+    // Demo-friendly baseline (tune later / replace with AI suggestions).
+    if ([3389, 445].includes(port)) return "medium" as const;
+    if ([5985, 5986, 22].includes(port)) return "low" as const;
+    if ([80].includes(port)) return "low" as const;
+    if ([443].includes(port)) return "info" as const;
+    if ([21, 23, 25, 110, 139].includes(port)) return "medium" as const;
+    return "info" as const;
+  };
 
   const out: Array<{
     title: string;
@@ -333,9 +345,21 @@ function deriveFindingsFromObserved(targetAddress: string, services: Array<{ por
     fingerprint: string;
   }> = [];
 
-  if (seen.has("tcp/445")) {
+  for (const s of services) {
+    const label = [s.serviceName, s.product, s.version].filter(Boolean).join(" ").trim();
     out.push({
-      title: "SMB exposed on host (policy)",
+      title: `Open service exposure: ${s.port}/${s.protocol}${label ? ` (${label})` : ""}`,
+      severity: severityForPort(s.port),
+      servicePort: s.port,
+      evidenceRedacted: `Observed open port ${s.port}/${s.protocol} on ${targetAddress}. Service: ${label || "unknown"}.`,
+      fingerprint: mk(`${targetAddress}|${s.protocol}|${s.port}|exposure|${s.serviceName ?? ""}|${s.product ?? ""}|${s.version ?? ""}`)
+    });
+  }
+
+  // Keep explicit policy findings (these are the ones you'd pitch as "violations")
+  if (services.some((s) => s.protocol === "tcp" && s.port === 445)) {
+    out.push({
+      title: "Policy: SMB exposed on host",
       severity: "medium",
       servicePort: 445,
       evidenceRedacted: `Observed open port 445/tcp on ${targetAddress}. Restrict SMB to required subnets only.`,
@@ -343,9 +367,9 @@ function deriveFindingsFromObserved(targetAddress: string, services: Array<{ por
     });
   }
 
-  if (seen.has("tcp/3389")) {
+  if (services.some((s) => s.protocol === "tcp" && s.port === 3389)) {
     out.push({
-      title: "RDP exposed on host (policy)",
+      title: "Policy: RDP exposed on host",
       severity: "medium",
       servicePort: 3389,
       evidenceRedacted: `Observed open port 3389/tcp on ${targetAddress}. Restrict RDP to admin subnet/jumpbox and enforce MFA.`,
@@ -353,11 +377,11 @@ function deriveFindingsFromObserved(targetAddress: string, services: Array<{ por
     });
   }
 
-  if (seen.has("tcp/5985") || seen.has("tcp/5986")) {
+  if (services.some((s) => s.protocol === "tcp" && (s.port === 5985 || s.port === 5986))) {
     out.push({
-      title: "WinRM reachable (review access controls)",
+      title: "Policy: WinRM reachable (review access controls)",
       severity: "low",
-      servicePort: seen.has("tcp/5986") ? 5986 : 5985,
+      servicePort: services.some((s) => s.port === 5986) ? 5986 : 5985,
       evidenceRedacted: `Observed WinRM port open on ${targetAddress}. Ensure it is restricted and logged.`,
       fingerprint: mk(`${targetAddress}|tcp|5985-5986|policy:winrm-reachable`)
     });

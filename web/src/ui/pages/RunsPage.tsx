@@ -40,7 +40,7 @@ export function RunsPage() {
       <Card sx={{ mb: 2 }}>
         <CardContent>
           <Typography variant="subtitle1" gutterBottom>
-            Start a scan (mock mode for now)
+            Start a scan
           </Typography>
           {targetsQ.isError ? <Alert severity="error">Failed to load targets.</Alert> : null}
           <Stack direction={{ xs: "column", md: "row" }} spacing={2} alignItems="center">
