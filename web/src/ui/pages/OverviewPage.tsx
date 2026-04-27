@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Alert, Box, Card, CardContent, Chip, Grid, Stack, Typography } from "@mui/material";
+import { Alert, Box, Card, CardContent, Chip, Stack, Typography } from "@mui/material";
 import { listFindings, listScans, listTargets } from "../../lib/api";
 
 export function OverviewPage() {
@@ -23,33 +23,39 @@ export function OverviewPage() {
         Overview
       </Typography>
 
-      <Grid container spacing={2}>
-        <Grid item xs={12} md={4}>
+      <Box
+        sx={{
+          display: "grid",
+          gridTemplateColumns: { xs: "1fr", md: "repeat(3, 1fr)" },
+          gap: 2
+        }}
+      >
+        <Box>
           <Card>
             <CardContent>
               <Typography variant="overline">Targets</Typography>
               <Typography variant="h4">{targetsQ.data?.length ?? 0}</Typography>
             </CardContent>
           </Card>
-        </Grid>
-        <Grid item xs={12} md={4}>
+        </Box>
+        <Box>
           <Card>
             <CardContent>
               <Typography variant="overline">Recent runs</Typography>
               <Typography variant="h4">{runsQ.data?.length ?? 0}</Typography>
             </CardContent>
           </Card>
-        </Grid>
-        <Grid item xs={12} md={4}>
+        </Box>
+        <Box>
           <Card>
             <CardContent>
               <Typography variant="overline">Open findings</Typography>
               <Typography variant="h4">{findings.length}</Typography>
             </CardContent>
           </Card>
-        </Grid>
+        </Box>
 
-        <Grid item xs={12}>
+        <Box sx={{ gridColumn: { xs: "1 / -1", md: "1 / -1" } }}>
           <Card>
             <CardContent>
               <Typography variant="subtitle1" gutterBottom>
@@ -65,8 +71,8 @@ export function OverviewPage() {
               </Typography>
             </CardContent>
           </Card>
-        </Grid>
-      </Grid>
+        </Box>
+      </Box>
     </Box>
   );
 }

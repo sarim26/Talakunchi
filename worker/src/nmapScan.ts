@@ -23,6 +23,7 @@ function run(
   opts?: {
     onStdout?: (chunk: string) => void;
     onStderr?: (chunk: string) => void;
+    signal?: AbortSignal;
   }
 ) {
   return new Promise<{ stdout: string; stderr: string; exitCode: number | null }>((resolve, reject) => {
@@ -34,6 +35,15 @@ function run(
       child.kill("SIGKILL");
       reject(new Error(`Command timeout after ${timeoutMs}ms: ${cmd} ${args.join(" ")}`));
     }, timeoutMs);
+
+    const onAbort = () => {
+      child.kill("SIGKILL");
+      reject(new Error("aborted"));
+    };
+    if (opts?.signal) {
+      if (opts.signal.aborted) return onAbort();
+      opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
 
     child.stdout.on("data", (d) => {
       const s = d.toString("utf8");
@@ -51,6 +61,7 @@ function run(
     });
     child.on("close", (code) => {
       clearTimeout(t);
+      if (opts?.signal) opts.signal.removeEventListener("abort", onAbort);
       resolve({ stdout, stderr, exitCode: code });
     });
   });
@@ -61,6 +72,7 @@ export async function nmapScan(
   nmapArgs: string,
   opts?: {
     onOutput?: (line: string) => void;
+    signal?: AbortSignal;
   }
 ) {
   // Write XML to file (keeps stdout/stderr free for live logs).
@@ -69,7 +81,8 @@ export async function nmapScan(
 
   const { stderr, exitCode } = await run("nmap", args, 10 * 60 * 1000, {
     onStdout: (c) => opts?.onOutput?.(c),
-    onStderr: (c) => opts?.onOutput?.(c)
+    onStderr: (c) => opts?.onOutput?.(c),
+    signal: opts?.signal
   });
   if (exitCode !== 0) {
     throw new Error(`nmap failed (exit=${exitCode}). stderr=${stderr.slice(0, 2000)}`);

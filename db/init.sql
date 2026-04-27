@@ -21,6 +21,7 @@ create table if not exists scan_runs (
   target_id uuid not null references targets(id) on delete cascade,
   profile text not null default 'network_surface_safe',
   status scan_run_status not null default 'queued',
+  cancel_requested boolean not null default false,
   requested_by text,
   started_at timestamptz,
   finished_at timestamptz,

@@ -28,18 +28,34 @@ export function FindingsPage() {
     refetchInterval: 2000
   });
 
-  const [selected, setSelected] = useState<string | null>(null);
-
-  const explainQ = useQuery({
-    queryKey: ["explain", selected],
-    queryFn: () => explainFinding(selected!),
-    enabled: false
-  });
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [explainData, setExplainData] = useState<null | {
+    summary: string;
+    whyItMatters: string;
+    remediation: string[];
+    verification: string[];
+  }>(null);
+  const [explainError, setExplainError] = useState<string | null>(null);
 
   const statusM = useMutation({
     mutationFn: ({ id, status }: { id: string; status: string }) => updateFinding(id, { status }),
     onSuccess: async () => {
-      await qc.invalidateQueries({ queryKey: ["findings"] });
+      await qc.invalidateQueries({ queryKey: ["findings"], exact: false });
+    }
+  });
+
+  const explainM = useMutation({
+    mutationFn: (id: string) => explainFinding(id),
+    onMutate: async () => {
+      setExplainError(null);
+      setExplainData(null);
+      setDialogOpen(true);
+    },
+    onSuccess: (data) => {
+      setExplainData(data);
+    },
+    onError: (e) => {
+      setExplainError(String(e));
     }
   });
 
@@ -111,10 +127,7 @@ export function FindingsPage() {
                   <Button
                     variant="outlined"
                     size="small"
-                    onClick={async () => {
-                      setSelected(f.id);
-                      await explainQ.refetch();
-                    }}
+                    onClick={() => explainM.mutate(f.id)}
                   >
                     Explain (AI)
                   </Button>
@@ -129,25 +142,25 @@ export function FindingsPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={Boolean(selected)} onClose={() => setSelected(null)} maxWidth="md" fullWidth>
+      <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="md" fullWidth>
         <DialogTitle>AI explanation</DialogTitle>
         <DialogContent>
-          {explainQ.isError ? <Alert severity="error">Failed to generate explanation.</Alert> : null}
-          {explainQ.isFetching ? <Typography>Generating…</Typography> : null}
-          {explainQ.data ? (
+          {explainError ? <Alert severity="error">{explainError}</Alert> : null}
+          {explainM.isPending ? <Typography>Generating…</Typography> : null}
+          {explainData ? (
             <Stack spacing={2} sx={{ mt: 1 }}>
               <Box>
                 <Typography variant="subtitle2">Summary</Typography>
-                <Typography variant="body2">{explainQ.data.summary}</Typography>
+                <Typography variant="body2">{explainData.summary}</Typography>
               </Box>
               <Box>
                 <Typography variant="subtitle2">Why it matters</Typography>
-                <Typography variant="body2">{explainQ.data.whyItMatters}</Typography>
+                <Typography variant="body2">{explainData.whyItMatters}</Typography>
               </Box>
               <Box>
                 <Typography variant="subtitle2">Recommended remediation</Typography>
                 <ul>
-                  {explainQ.data.remediation.map((r, i) => (
+                  {explainData.remediation.map((r, i) => (
                     <li key={i}>
                       <Typography variant="body2">{r}</Typography>
                     </li>
@@ -157,7 +170,7 @@ export function FindingsPage() {
               <Box>
                 <Typography variant="subtitle2">Verification</Typography>
                 <ul>
-                  {explainQ.data.verification.map((r, i) => (
+                  {explainData.verification.map((r, i) => (
                     <li key={i}>
                       <Typography variant="body2">{r}</Typography>
                     </li>

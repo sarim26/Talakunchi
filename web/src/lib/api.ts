@@ -131,6 +131,14 @@ export async function explainFinding(id: string) {
   );
 }
 
+export async function cancelScan(scanRunId: string) {
+  return http(
+    `/api/scans/${scanRunId}/cancel`,
+    { method: "POST", body: "{}" },
+    z.object({ ok: z.boolean() })
+  );
+}
+
 export async function getGraphForTarget(targetId: string) {
   return http(
     `/api/graph/target/${targetId}`,

@@ -7,6 +7,15 @@ import { withSession } from "./neo4j.js";
 import { CreateScanSchema, CreateTargetSchema, UpdateFindingSchema } from "./schemas.js";
 import { explainWithGemini } from "./llm/gemini.js";
 const app = Fastify({ logger: true });
+// Minimal error helpers (avoid extra plugin in prototype)
+app.setErrorHandler((err, _req, reply) => {
+    if (err?.statusCode) {
+        reply.status(err.statusCode).send({ error: err.message });
+        return;
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    reply.status(500).send({ error: msg });
+});
 await app.register(cors, {
     origin: true
 });
@@ -75,6 +84,22 @@ app.post("/api/scans", async (req, reply) => {
         requestedBy: scanRun.requested_by,
         createdAt: scanRun.created_at
     });
+});
+async function ensureCancelColumn() {
+    await withClient(async (c) => {
+        await c.query(`alter table scan_runs add column if not exists cancel_requested boolean not null default false`);
+    });
+}
+await ensureCancelColumn();
+app.post("/api/scans/:id/cancel", async (req, reply) => {
+    const scanRunId = z.string().uuid().parse(req.params.id);
+    await withClient(async (c) => {
+        await c.query(`update scan_runs set cancel_requested = true where id = $1`, [scanRunId]);
+        // If the scan hasn't started yet, also mark queued job as failed so worker never starts it.
+        await c.query(`update jobs set status='failed', error='cancelled before start', updated_at=now()
+       where type='scan' and status='queued' and payload->>'scanRunId' = $1`, [scanRunId]);
+    });
+    return reply.send({ ok: true });
 });
 app.get("/api/scans", async () => {
     const rows = await withClient(async (c) => {
@@ -198,7 +223,7 @@ app.patch("/api/findings/:id", async (req) => {
     });
     return { id: updated.id, status: updated.status };
 });
-app.post("/api/findings/:id/explain", async (req) => {
+app.post("/api/findings/:id/explain", async (req, reply) => {
     const findingId = z.string().uuid().parse(req.params.id);
     const finding = await withClient(async (c) => {
         const res = await c.query(`select f.id, f.title, f.severity, f.evidence_redacted, t.name as target_name, t.address as target_address,
@@ -209,6 +234,8 @@ app.post("/api/findings/:id/explain", async (req) => {
        where f.id = $1`, [findingId]);
         return res.rows[0];
     });
+    if (!finding)
+        return reply.code(404).send({ error: "Finding not found" });
     const input = {
         title: finding.title,
         severity: finding.severity,

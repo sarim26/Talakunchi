@@ -4,6 +4,12 @@ import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 import { nmapScan } from "./nmapScan.js";
 
+async function ensureCancelColumn() {
+  await withClient(async (c) => {
+    await c.query(`alter table scan_runs add column if not exists cancel_requested boolean not null default false`);
+  });
+}
+
 async function claimNextJob() {
   return await withClient(async (c) => {
     await c.query("begin");
@@ -121,6 +127,7 @@ async function rebuildNeo4jForTarget(targetId: string) {
 }
 
 async function runScan(scanRunId: string) {
+  await ensureCancelColumn();
   const ctx = await withClient(async (c) => {
     const runRes = await c.query(
       `select sr.id, sr.target_id, sr.profile, t.name as target_name, t.address as target_address
@@ -160,6 +167,18 @@ async function runScan(scanRunId: string) {
   const nmapCmd = `nmap ${env.NMAP_ARGS} -oX /tmp/nmap.xml ${ctx.target_address}`;
   await appendStepLog(discoveryStepId, `Running: ${nmapCmd}\n`);
 
+  const ac = new AbortController();
+  const cancelPoll = setInterval(async () => {
+    const cancelRequested = await withClient(async (c) => {
+      const res = await c.query(`select cancel_requested from scan_runs where id=$1`, [scanRunId]);
+      return Boolean(res.rows?.[0]?.cancel_requested);
+    });
+    if (cancelRequested) {
+      await appendStepLog(discoveryStepId, "\nCancel requested. Stopping scan...\n");
+      ac.abort();
+    }
+  }, 1000);
+
   let buffer = "";
   let lastFlush = Date.now();
   const flushIfNeeded = async (force = false) => {
@@ -172,13 +191,33 @@ async function runScan(scanRunId: string) {
     await appendStepLog(discoveryStepId, out);
   };
 
-  const scanOut = await nmapScan(ctx.target_address, env.NMAP_ARGS, {
-    onOutput: (chunk) => {
-      buffer += chunk;
-    }
-  }).finally(async () => {
+  let scanOut: Awaited<ReturnType<typeof nmapScan>> | null = null;
+  try {
+    scanOut = await nmapScan(ctx.target_address, env.NMAP_ARGS, {
+      onOutput: (chunk) => {
+        buffer += chunk;
+      },
+      signal: ac.signal
+    });
+  } catch (e: any) {
     await flushIfNeeded(true);
-  });
+    clearInterval(cancelPoll);
+
+    const isCancelled = String(e?.message ?? "").toLowerCase().includes("aborted");
+    await withClient(async (c) => {
+      await c.query(`update scan_steps set status='failed', finished_at=now(), log=log || $2 where id=$1`, [
+        discoveryStepId,
+        isCancelled ? "\nScan cancelled.\n" : `\nScan failed: ${e?.message ?? String(e)}\n`
+      ]);
+      await c.query(`update scan_runs set status='failed', finished_at=now() where id=$1`, [scanRunId]);
+    });
+    throw e;
+  } finally {
+    clearInterval(cancelPoll);
+    await flushIfNeeded(true);
+  }
+
+  if (!scanOut) throw new Error("Scan produced no output");
 
   const services = scanOut.services.map((s: any) => ({
     port: s.port,

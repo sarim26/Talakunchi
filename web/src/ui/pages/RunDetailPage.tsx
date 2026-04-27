@@ -1,7 +1,7 @@
-import { useQuery } from "@tanstack/react-query";
-import { Alert, Box, Card, CardContent, Chip, Divider, Stack, Typography } from "@mui/material";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { Alert, Box, Button, Card, CardContent, Chip, Divider, Stack, Typography } from "@mui/material";
 import { useParams } from "react-router-dom";
-import { getScan } from "../../lib/api";
+import { cancelScan, getScan } from "../../lib/api";
 
 export function RunDetailPage() {
   const { id } = useParams();
@@ -16,6 +16,12 @@ export function RunDetailPage() {
   if (runQ.isError) return <Alert severity="error">Failed to load run.</Alert>;
 
   const run = runQ.data!;
+  const cancelM = useMutation({
+    mutationFn: () => cancelScan(run.id),
+    onSuccess: () => {
+      runQ.refetch();
+    }
+  });
 
   return (
     <Box>
@@ -31,7 +37,19 @@ export function RunDetailPage() {
           <Stack direction="row" spacing={1} sx={{ mt: 1 }} alignItems="center">
             <Chip label={`profile: ${run.profile}`} />
             <Chip label={`status: ${run.status}`} color={run.status === "succeeded" ? "success" : "default"} />
+            {run.status === "running" ? (
+              <Button
+                variant="contained"
+                color="error"
+                size="small"
+                disabled={cancelM.isPending}
+                onClick={() => cancelM.mutate()}
+              >
+                Stop scan
+              </Button>
+            ) : null}
           </Stack>
+          {cancelM.isError ? <Alert severity="error" sx={{ mt: 2 }}>{`${cancelM.error}`}</Alert> : null}
         </CardContent>
       </Card>
 
