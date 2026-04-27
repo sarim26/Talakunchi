@@ -5,6 +5,7 @@ import { env } from "./env.js";
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 import { CreateScanSchema, CreateTargetSchema, UpdateFindingSchema } from "./schemas.js";
+import { explainWithGemini } from "./llm/gemini.js";
 
 const app = Fastify({ logger: true });
 
@@ -259,30 +260,50 @@ app.post("/api/findings/:id/explain", async (req) => {
     return res.rows[0];
   });
 
-  // Prototype: always mock.
-  return {
-    mode: env.AI_MODE,
-    summary: `This finding indicates a potentially risky exposure on ${finding.target_name} (${finding.target_address}).`,
-    whyItMatters:
-      "Even in staging, these issues often mirror production misconfigurations and can lead to lateral movement or data exposure if not fixed early.",
-    remediation: [
-      "Confirm this service is required on the host.",
-      "Restrict access to trusted subnets only (firewall/NSG).",
-      "Patch/upgrade the component and enforce secure configuration baselines.",
-      "Re-run the scan to verify the issue no longer appears."
-    ],
-    verification: [
-      "Re-run the same scan profile.",
-      "Confirm the port/service exposure is reduced or the configuration is corrected.",
-      "Ensure monitoring/logging is enabled for the service."
-    ],
-    detailsUsed: {
-      title: finding.title,
-      severity: finding.severity,
-      service: finding.service_port
-        ? { port: finding.service_port, protocol: finding.service_protocol, name: finding.service_name ?? null }
-        : null
+  const input = {
+    title: finding.title as string,
+    severity: finding.severity as string,
+    targetName: finding.target_name as string,
+    targetAddress: finding.target_address as string,
+    service: finding.service_port
+      ? { port: Number(finding.service_port), protocol: String(finding.service_protocol), name: finding.service_name ?? null }
+      : null,
+    evidenceRedacted: String(finding.evidence_redacted ?? "")
+  };
+
+  if (env.AI_MODE === "gemini") {
+    if (!env.GEMINI_API_KEY) {
+      return {
+        mode: "gemini",
+        error: "GEMINI_API_KEY is not set",
+        summary: "Gemini is enabled but not configured.",
+        whyItMatters: "Set GEMINI_API_KEY in your environment (Docker Compose .env) and retry.",
+        remediation: ["Set GEMINI_API_KEY and restart the API container."],
+        verification: ["Click Explain (AI) again."]
+      };
     }
+
+    const out = await explainWithGemini({
+      apiKey: env.GEMINI_API_KEY,
+      model: env.GEMINI_MODEL,
+      input
+    });
+
+    return { mode: "gemini", ...out };
+  }
+
+  // Safe fallback.
+  return {
+    mode: "mock",
+    summary: `This finding indicates a potentially risky exposure on ${input.targetName} (${input.targetAddress}).`,
+    whyItMatters:
+      "Even in staging, these issues often mirror production misconfigurations and can lead to real incidents if carried into production.",
+    remediation: [
+      "Confirm the service is required for this host/environment.",
+      "Restrict access to trusted subnets only (firewall/NSG).",
+      "Patch/upgrade the component and enforce secure configuration baselines."
+    ],
+    verification: ["Re-run the scan profile and confirm the finding no longer appears."]
   };
 });
 
