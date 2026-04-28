@@ -2,6 +2,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import dns from "node:dns/promises";
 import net from "node:net";
 import { env } from "./env.js";
+import { runAgentScan } from "./agent.js";
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 import { nmapScan } from "./nmapScan.js";
@@ -662,6 +663,7 @@ function maskSecret(value: string) {
   return `${value[0]}${"*".repeat(Math.max(1, value.length - 2))}${value[value.length - 1]}`;
 }
 
+
 function deriveFindingsFromHydra(
   credentials: Array<{
     host: string;
@@ -694,6 +696,32 @@ function buildHydraCredSource(): HydraCredSource | null {
   return { ...usernameSource, ...passwordSource } as HydraCredSource;
 }
 
+function shouldUseAgentMode() {
+  return env.AGENT_ENABLED || env.SCAN_MODE === "agent";
+}
+
+function buildAgentOpts() {
+  if (!env.GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is required when AGENT_ENABLED=true or SCAN_MODE=agent");
+  }
+
+  return {
+    geminiApiKey: env.GEMINI_API_KEY,
+    geminiModel: env.GEMINI_MODEL,
+    maxSteps: env.AGENT_MAX_STEPS,
+    cmdTimeoutMs: env.AGENT_CMD_TIMEOUT_MS,
+    whitelist: [] as string[],
+    wordlistPath: env.HYDRA_PASSLIST
+  };
+}
+
+function buildAgentWhitelist(targetAddress: string) {
+  return [...new Set([
+    targetAddress,
+    ...env.AGENT_SCOPE.split(",").map((entry) => entry.trim()).filter(Boolean)
+  ])];
+}
+
 async function main() {
   await ensurePhase1Tables();
   await getPipelineConfig();
@@ -709,7 +737,23 @@ async function main() {
     try {
       if (job.type === "scan") {
         const scanRunId = job.payload.scanRunId as string;
-        await runScan(scanRunId);
+        if (shouldUseAgentMode()) {
+          const runCtx = await withClient(async (c) => {
+            const res = await c.query(
+              `select t.address as target_address
+               from scan_runs sr
+               join targets t on t.id = sr.target_id
+               where sr.id = $1`,
+              [scanRunId]
+            );
+            return res.rows[0] as { target_address: string };
+          });
+          const agentOpts = buildAgentOpts();
+          agentOpts.whitelist = buildAgentWhitelist(runCtx.target_address);
+          await runAgentScan(scanRunId, agentOpts);
+        } else {
+          await runScan(scanRunId);
+        }
       } else {
         throw new Error(`Unknown job type: ${job.type}`);
       }
