@@ -25,7 +25,6 @@ export const UpdateFindingSchema = z.object({
     severity: z.enum(["info", "low", "medium", "high", "critical"]).optional()
 });
 export const PipelineConfigSchema = z.object({
-    whitelist: z.array(z.string()).default([]),
     maxConcurrentScans: z.coerce.number().int().positive().max(100).default(2),
     requestRatePerMinute: z.coerce.number().int().positive().max(5000).default(120),
     safeMode: z.coerce.boolean().default(true),

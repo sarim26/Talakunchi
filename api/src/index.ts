@@ -12,7 +12,6 @@ const app = Fastify({ logger: true });
 type PipelineConfig = z.infer<typeof PipelineConfigSchema>;
 
 const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
-  whitelist: [],
   maxConcurrentScans: 2,
   requestRatePerMinute: 120,
   safeMode: true,
@@ -20,42 +19,6 @@ const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   auditEnabled: true,
   allowedWordlists: []
 };
-
-function isIPv4(addr: string) {
-  const parts = addr.split(".");
-  if (parts.length !== 4) return false;
-  return parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
-}
-
-function ipv4ToInt(addr: string) {
-  return addr
-    .split(".")
-    .map(Number)
-    .reduce((acc, octet) => (acc << 8) + octet, 0) >>> 0;
-}
-
-function isInCidr(ip: string, cidr: string) {
-  const [base, prefixRaw] = cidr.split("/");
-  if (!base || !prefixRaw || !isIPv4(base) || !isIPv4(ip)) return false;
-  const prefix = Number(prefixRaw);
-  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return false;
-  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
-  return (ipv4ToInt(ip) & mask) === (ipv4ToInt(base) & mask);
-}
-
-function isAddressAllowed(address: string, whitelist: string[]) {
-  const normalized = address.trim().toLowerCase();
-  for (const entryRaw of whitelist) {
-    const entry = entryRaw.trim().toLowerCase();
-    if (!entry) continue;
-    if (entry.includes("/")) {
-      if (isInCidr(normalized, entry)) return true;
-      continue;
-    }
-    if (entry === normalized) return true;
-  }
-  return false;
-}
 
 async function ensurePhase1Tables() {
   await withClient(async (c) => {
@@ -77,6 +40,21 @@ async function ensurePhase1Tables() {
       )
     `);
     await c.query(`create index if not exists idx_audit_events_created_at on audit_events(created_at desc)`);
+    await c.query(`
+      create table if not exists recon_assets (
+        id uuid primary key default uuid_generate_v4(),
+        target_id uuid not null references targets(id) on delete cascade,
+        asset_type text not null,
+        value text not null,
+        source text not null,
+        confidence int not null default 50,
+        metadata jsonb not null default '{}'::jsonb,
+        first_seen_at timestamptz not null default now(),
+        last_seen_at timestamptz not null default now(),
+        unique (target_id, asset_type, value, source)
+      )
+    `);
+    await c.query(`create index if not exists idx_recon_assets_target on recon_assets(target_id)`);
   });
 }
 
@@ -324,6 +302,34 @@ app.get("/api/services", async (req) => {
   }));
 });
 
+app.get("/api/recon-assets", async (req) => {
+  const q = req.query as any;
+  const targetId = q.targetId ? z.string().uuid().parse(q.targetId) : undefined;
+  if (!targetId) return [];
+
+  const rows = await withClient(async (c) => {
+    const res = await c.query(
+      `select id, target_id, asset_type, value, source, confidence, metadata, first_seen_at, last_seen_at
+       from recon_assets
+       where target_id = $1
+       order by last_seen_at desc`,
+      [targetId]
+    );
+    return res.rows;
+  });
+  return rows.map((r) => ({
+    id: r.id,
+    targetId: r.target_id,
+    assetType: r.asset_type,
+    value: r.value,
+    source: r.source,
+    confidence: r.confidence,
+    metadata: r.metadata ?? {},
+    firstSeenAt: r.first_seen_at,
+    lastSeenAt: r.last_seen_at
+  }));
+});
+
 app.post("/api/targets/:id/explain-surface", async (req, reply) => {
   const targetId = z.string().uuid().parse((req.params as any).id);
   const target = await withClient(async (c) => {
@@ -382,18 +388,6 @@ app.post("/api/scans", async (req, reply) => {
     return res.rows[0] as { id: string; address: string } | undefined;
   });
   if (!target) return reply.code(404).send({ error: "Target not found" });
-
-  const cfg = await getPipelineConfig();
-  const inScope = isAddressAllowed(target.address, cfg.whitelist);
-  if (!inScope) {
-    await writeAuditEvent(
-      "scan.blocked.out_of_scope",
-      { targetId: body.targetId, address: target.address, whitelist: cfg.whitelist },
-      target.address,
-      "scope-validator"
-    );
-    return reply.code(403).send({ error: `Target ${target.address} is out of scope for current whitelist.` });
-  }
 
   const scanRun = await withClient(async (c) => {
     await c.query("begin");

@@ -103,8 +103,22 @@ create table if not exists audit_events (
   created_at timestamptz not null default now()
 );
 
+create table if not exists recon_assets (
+  id uuid primary key default uuid_generate_v4(),
+  target_id uuid not null references targets(id) on delete cascade,
+  asset_type text not null,
+  value text not null,
+  source text not null,
+  confidence int not null default 50,
+  metadata jsonb not null default '{}'::jsonb,
+  first_seen_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  unique (target_id, asset_type, value, source)
+);
+
 create index if not exists idx_jobs_status on jobs(status);
 create index if not exists idx_scan_runs_target on scan_runs(target_id);
 create index if not exists idx_findings_target on findings(target_id);
 create index if not exists idx_audit_events_created_at on audit_events(created_at desc);
+create index if not exists idx_recon_assets_target on recon_assets(target_id);
 

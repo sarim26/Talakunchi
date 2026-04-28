@@ -58,6 +58,15 @@ services:
       NEO4J_USER: "neo4j"
       NEO4J_PASSWORD: "neo4jpassword"
       SCAN_MODE: "nmap"
+      # Phase 4 (Hydra) - enable only when wordlists + hydra are available in the container
+      HYDRA_ENABLED: "${HYDRA_ENABLED:-false}"
+      # Hydra reads wordlists inside the container from /wordlists.
+      # We mount ./.cache/wordlists -> /wordlists below.
+      HYDRA_USERLIST: "/wordlists/userlist.txt"
+      HYDRA_PASSLIST: "/wordlists/rockyou.txt"
+      HYDRA_THREADS: "${HYDRA_THREADS:-10}"
+      HYDRA_STOP_ON_FIRST_FIND: "${HYDRA_STOP_ON_FIRST_FIND:-false}"
+      HYDRA_TIMEOUT_MS: "${HYDRA_TIMEOUT_MS:-600000}"
       # Tune if needed (safe defaults):
       # -Pn: skip ping (works even if ICMP blocked)
       # -vv --stats-every: show progress in logs
@@ -65,6 +74,10 @@ services:
       # --top-ports 200: keep demo fast
       NMAP_ARGS: "-Pn -vv --reason --stats-every 5s -sV --version-light --top-ports 200"
       POLL_INTERVAL_MS: "1500"
+    volumes:
+      # Mount local wordlists into the container for Hydra attacks.
+      # Expected container paths: /wordlists/userlist.txt and /wordlists/rockyou.txt (or set envs to your filenames).
+      - ./.cache/wordlists:/wordlists:ro
     depends_on:
       postgres:
         condition: service_healthy

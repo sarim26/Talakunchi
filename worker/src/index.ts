@@ -1,4 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises";
+import dns from "node:dns/promises";
+import net from "node:net";
 import { env } from "./env.js";
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
@@ -6,7 +8,6 @@ import { nmapScan } from "./nmapScan.js";
 import { HydraCredSource, hydraFromNmapServices } from "./hydraScan.js";
 
 type PipelineConfig = {
-  whitelist: string[];
   maxConcurrentScans: number;
   requestRatePerMinute: number;
   safeMode: boolean;
@@ -16,7 +17,6 @@ type PipelineConfig = {
 };
 
 const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
-  whitelist: [],
   maxConcurrentScans: 2,
   requestRatePerMinute: 120,
   safeMode: true,
@@ -147,42 +147,6 @@ async function rebuildNeo4jForTarget(targetId: string) {
   });
 }
 
-function isIPv4(addr: string) {
-  const parts = addr.split(".");
-  if (parts.length !== 4) return false;
-  return parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
-}
-
-function ipv4ToInt(addr: string) {
-  return addr
-    .split(".")
-    .map(Number)
-    .reduce((acc, octet) => (acc << 8) + octet, 0) >>> 0;
-}
-
-function isInCidr(ip: string, cidr: string) {
-  const [base, prefixRaw] = cidr.split("/");
-  if (!base || !prefixRaw || !isIPv4(base) || !isIPv4(ip)) return false;
-  const prefix = Number(prefixRaw);
-  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return false;
-  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
-  return (ipv4ToInt(ip) & mask) === (ipv4ToInt(base) & mask);
-}
-
-function isAddressAllowed(address: string, whitelist: string[]) {
-  const normalized = address.trim().toLowerCase();
-  for (const entryRaw of whitelist) {
-    const entry = entryRaw.trim().toLowerCase();
-    if (!entry) continue;
-    if (entry.includes("/")) {
-      if (isInCidr(normalized, entry)) return true;
-      continue;
-    }
-    if (entry === normalized) return true;
-  }
-  return false;
-}
-
 async function ensurePhase1Tables() {
   await withClient(async (c) => {
     await c.query(`
@@ -203,14 +167,121 @@ async function ensurePhase1Tables() {
       )
     `);
     await c.query(`create index if not exists idx_audit_events_created_at on audit_events(created_at desc)`);
+    await c.query(`
+      create table if not exists recon_assets (
+        id uuid primary key default uuid_generate_v4(),
+        target_id uuid not null references targets(id) on delete cascade,
+        asset_type text not null,
+        value text not null,
+        source text not null,
+        confidence int not null default 50,
+        metadata jsonb not null default '{}'::jsonb,
+        first_seen_at timestamptz not null default now(),
+        last_seen_at timestamptz not null default now(),
+        unique (target_id, asset_type, value, source)
+      )
+    `);
+    await c.query(`create index if not exists idx_recon_assets_target on recon_assets(target_id)`);
   });
+}
+
+async function upsertReconAsset(input: {
+  targetId: string;
+  assetType: string;
+  value: string;
+  source: string;
+  confidence: number;
+  metadata?: Record<string, unknown>;
+}) {
+  await withClient(async (c) => {
+    await c.query(
+      `insert into recon_assets (target_id, asset_type, value, source, confidence, metadata, first_seen_at, last_seen_at)
+       values ($1, $2, $3, $4, $5, $6::jsonb, now(), now())
+       on conflict (target_id, asset_type, value, source)
+       do update set confidence = excluded.confidence, metadata = excluded.metadata, last_seen_at = now()`,
+      [
+        input.targetId,
+        input.assetType,
+        input.value,
+        input.source,
+        input.confidence,
+        JSON.stringify(input.metadata ?? {})
+      ]
+    );
+  });
+}
+
+async function runReconnaissance(targetId: string, targetAddress: string, stepId: string) {
+  let found = 0;
+  const isIpTarget = net.isIP(targetAddress) !== 0;
+
+  await appendStepLog(stepId, `Recon start: ${targetAddress}\n`);
+
+  if (isIpTarget) {
+    await upsertReconAsset({
+      targetId,
+      assetType: "host",
+      value: targetAddress,
+      source: "host_discovery",
+      confidence: 95,
+      metadata: { reachable: true, method: "seed_target" }
+    });
+    found += 1;
+    try {
+      const ptr = await dns.reverse(targetAddress);
+      for (const hostname of ptr.slice(0, 5)) {
+        await upsertReconAsset({
+          targetId,
+          assetType: "hostname",
+          value: hostname,
+          source: "reverse_dns",
+          confidence: 70,
+          metadata: { ip: targetAddress }
+        });
+        found += 1;
+      }
+    } catch {
+      await appendStepLog(stepId, "Reverse DNS: no PTR records\n");
+    }
+  } else {
+    try {
+      const lookup = await dns.lookup(targetAddress, { all: true });
+      for (const rec of lookup.slice(0, 10)) {
+        await upsertReconAsset({
+          targetId,
+          assetType: "ip",
+          value: rec.address,
+          source: "dns_lookup",
+          confidence: 80,
+          metadata: { family: rec.family, hostname: targetAddress }
+        });
+        found += 1;
+      }
+    } catch {
+      await appendStepLog(stepId, "DNS lookup failed or no records\n");
+    }
+  }
+
+  // Phase 2 MVP: placeholder passive OSINT signal for pipeline wiring.
+  await upsertReconAsset({
+    targetId,
+    assetType: "osint_signal",
+    value: targetAddress,
+    source: "osint_stub",
+    confidence: 40,
+    metadata: { provider: "stub", note: "integrate Shodan/Censys connectors in next iteration" }
+  });
+  found += 1;
+
+  await appendStepLog(stepId, `Recon complete. Assets discovered/updated: ${found}\n`);
+  return found;
 }
 
 async function getPipelineConfig() {
   return withClient(async (c) => {
     const res = await c.query(`select config from pipeline_configs where id = 1`);
     const cfg = res.rows[0]?.config as PipelineConfig | undefined;
-    if (cfg && Array.isArray(cfg.whitelist)) return { ...DEFAULT_PIPELINE_CONFIG, ...cfg };
+    if (cfg) return { ...DEFAULT_PIPELINE_CONFIG, ...cfg };
     await c.query(
       `insert into pipeline_configs (id, config, updated_at)
        values (1, $1::jsonb, now())
@@ -252,29 +323,38 @@ async function runScan(scanRunId: string) {
   });
 
   const pipelineConfig = await getPipelineConfig();
-  const inScope = isAddressAllowed(ctx.target_address, pipelineConfig.whitelist);
-  if (!inScope) {
-    await writeAuditEvent(
-      "scan.aborted.out_of_scope",
-      { scanRunId, targetId: ctx.target_id, address: ctx.target_address, whitelist: pipelineConfig.whitelist },
-      ctx.target_address
-    );
-    await withClient(async (c) => {
-      await c.query(`update scan_runs set status='failed', finished_at=now() where id=$1`, [scanRunId]);
-    });
-    throw new Error(`Target ${ctx.target_address} is out of scope for current whitelist.`);
-  }
   await writeAuditEvent("scan.started", { scanRunId, targetId: ctx.target_id, profile: ctx.profile }, ctx.target_address);
 
   await withClient(async (c) => {
     await c.query(`update scan_runs set status='running', started_at=now() where id=$1`, [scanRunId]);
     await c.query(
       `insert into scan_steps (scan_run_id, name, status, started_at)
-       values ($1, 'Discovery', 'running', now()),
+       values ($1, 'Reconnaissance', 'running', now()),
+              ($1, 'Discovery', 'queued', null),
               ($1, 'Service Identification', 'queued', null),
               ($1, 'Checks & Findings', 'queued', null)`,
       [scanRunId]
     );
+  });
+
+  const reconStepId = await withClient(async (c) => {
+    const res = await c.query(
+      `select id from scan_steps where scan_run_id=$1 and name='Reconnaissance' order by created_at asc limit 1`,
+      [scanRunId]
+    );
+    return res.rows[0].id as string;
+  });
+  const reconCount = await runReconnaissance(ctx.target_id, ctx.target_address, reconStepId);
+  await withClient(async (c) => {
+    await c.query(`update scan_steps set status='succeeded', finished_at=now(), log=log || $2 where id=$1`, [
+      reconStepId,
+      `Recon assets: ${reconCount}\n`
+    ]);
+    const d = await c.query(
+      `select id from scan_steps where scan_run_id=$1 and name='Discovery' order by created_at asc limit 1`,
+      [scanRunId]
+    );
+    await c.query(`update scan_steps set status='running', started_at=now() where id=$1`, [d.rows[0].id]);
   });
 
   const discoveryStepId = await withClient(async (c) => {

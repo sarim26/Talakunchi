@@ -86,7 +86,6 @@ export const ServiceSchema = z.object({
 export type Service = z.infer<typeof ServiceSchema>;
 
 export const PipelineConfigSchema = z.object({
-  whitelist: z.array(z.string()),
   maxConcurrentScans: z.number(),
   requestRatePerMinute: z.number(),
   safeMode: z.boolean(),
@@ -105,6 +104,19 @@ export const AuditEventSchema = z.object({
   createdAt: z.any()
 });
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
+
+export const ReconAssetSchema = z.object({
+  id: z.string().uuid(),
+  targetId: z.string().uuid(),
+  assetType: z.string(),
+  value: z.string(),
+  source: z.string(),
+  confidence: z.number(),
+  metadata: z.any(),
+  firstSeenAt: z.any(),
+  lastSeenAt: z.any()
+});
+export type ReconAsset = z.infer<typeof ReconAssetSchema>;
 
 export async function listTargets() {
   return http("/api/targets", undefined, z.array(TargetSchema));
@@ -249,5 +261,11 @@ export async function updatePipelineConfig(input: PipelineConfig) {
 
 export async function listAuditEvents(limit = 50) {
   return http(`/api/audit-events?limit=${limit}`, undefined, z.array(AuditEventSchema));
+}
+
+export async function listReconAssets(targetId: string) {
+  const qp = new URLSearchParams();
+  qp.set("targetId", targetId);
+  return http(`/api/recon-assets?${qp.toString()}`, undefined, z.array(ReconAssetSchema));
 }
 

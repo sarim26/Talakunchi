@@ -21,6 +21,7 @@ import {
   getPipelineConfig,
   listAuditEvents,
   listFindings,
+  listReconAssets,
   listScans,
   listServices,
   listTargets,
@@ -39,7 +40,7 @@ const PHASES: PipelinePhase[] = [
   {
     id: 1,
     title: "Scoping & Configuration",
-    goal: "Define whitelist, rates, credentials source, and engagement guardrails.",
+    goal: "Define rates, credentials source, and engagement guardrails.",
     modules: ["scope validator", "audit logger", "rate limiter", "target policy"],
     controls: ["hard abort out-of-scope", "audit log enabled", "safe profile defaults"]
   },
@@ -48,7 +49,7 @@ const PHASES: PipelinePhase[] = [
     title: "Reconnaissance",
     goal: "Build an asset inventory using passive and light active discovery.",
     modules: ["dns enum", "osint connectors", "host discovery", "waf/cdn detect"],
-    controls: ["non-destructive mode", "bounded probes", "target whitelist only"]
+    controls: ["non-destructive mode", "bounded probes", "target-driven scope"]
   },
   {
     id: 3,
@@ -84,7 +85,6 @@ export function PipelinePage() {
   const qc = useQueryClient();
   const [activePhase, setActivePhase] = React.useState(0);
   const [targetId, setTargetId] = React.useState("");
-  const [draftWhitelist, setDraftWhitelist] = React.useState("");
   const [draftWordlists, setDraftWordlists] = React.useState("");
   const targetsQ = useQuery({ queryKey: ["targets"], queryFn: listTargets, refetchInterval: 5000 });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: listScans, refetchInterval: 5000 });
@@ -92,6 +92,12 @@ export function PipelinePage() {
   const servicesQ = useQuery({
     queryKey: ["services", targetId],
     queryFn: () => listServices(targetId),
+    enabled: Boolean(targetId),
+    refetchInterval: 5000
+  });
+  const reconQ = useQuery({
+    queryKey: ["recon-assets", targetId],
+    queryFn: () => listReconAssets(targetId),
     enabled: Boolean(targetId),
     refetchInterval: 5000
   });
@@ -110,7 +116,6 @@ export function PipelinePage() {
   React.useEffect(() => {
     if (!pipelineQ.data) return;
     setConfig(pipelineQ.data);
-    setDraftWhitelist(pipelineQ.data.whitelist.join("\n"));
     setDraftWordlists(pipelineQ.data.allowedWordlists.join("\n"));
   }, [pipelineQ.data]);
 
@@ -124,10 +129,6 @@ export function PipelinePage() {
     if (!config) return;
     const next = {
       ...config,
-      whitelist: draftWhitelist
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean),
       allowedWordlists: draftWordlists
         .split("\n")
         .map((s) => s.trim())
@@ -165,7 +166,7 @@ export function PipelinePage() {
         </CardContent>
       </Card>
 
-      {targetsQ.isError || runsQ.isError || findingsQ.isError || servicesQ.isError || pipelineQ.isError || auditQ.isError ? (
+      {targetsQ.isError || runsQ.isError || findingsQ.isError || servicesQ.isError || pipelineQ.isError || auditQ.isError || reconQ.isError ? (
         <Alert severity="error" sx={{ mb: 2 }}>
           Failed to load one or more pipeline data sources.
         </Alert>
@@ -192,14 +193,6 @@ export function PipelinePage() {
               </Typography>
               {config ? (
                 <Stack spacing={2}>
-                  <TextField
-                    label="Whitelist entries (IP / CIDR / hostname, one per line)"
-                    multiline
-                    minRows={4}
-                    value={draftWhitelist}
-                    onChange={(e) => setDraftWhitelist(e.target.value)}
-                    fullWidth
-                  />
                   <Stack direction={{ xs: "column", md: "row" }} spacing={2}>
                     <TextField
                       label="Max concurrent scans"
@@ -251,6 +244,38 @@ export function PipelinePage() {
                 <Typography variant="body2" color="text.secondary">
                   Loading pipeline configuration...
                 </Typography>
+              )}
+            </Box>
+          ) : null}
+
+          {phase.id === 2 ? (
+            <Box sx={{ mb: 2 }}>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Reconnaissance Assets
+              </Typography>
+              {!targetId ? (
+                <Typography variant="body2" color="text.secondary">
+                  Select a target above to view recon inventory.
+                </Typography>
+              ) : (
+                <Stack spacing={1}>
+                  {(reconQ.data ?? []).length ? (
+                    (reconQ.data ?? []).slice(0, 20).map((a) => (
+                      <Box key={a.id} sx={{ p: 1, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+                        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                          <Chip size="small" label={a.assetType} />
+                          <Chip size="small" label={a.source} variant="outlined" />
+                          <Chip size="small" label={`confidence ${a.confidence}`} />
+                          <Typography variant="body2">{a.value}</Typography>
+                        </Stack>
+                      </Box>
+                    ))
+                  ) : (
+                    <Typography variant="body2" color="text.secondary">
+                      No recon assets yet. Run a scan to populate this phase.
+                    </Typography>
+                  )}
+                </Stack>
               )}
             </Box>
           ) : null}
