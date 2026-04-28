@@ -85,6 +85,27 @@ export const ServiceSchema = z.object({
 });
 export type Service = z.infer<typeof ServiceSchema>;
 
+export const PipelineConfigSchema = z.object({
+  whitelist: z.array(z.string()),
+  maxConcurrentScans: z.number(),
+  requestRatePerMinute: z.number(),
+  safeMode: z.boolean(),
+  requireHumanApproval: z.boolean(),
+  auditEnabled: z.boolean(),
+  allowedWordlists: z.array(z.string())
+});
+export type PipelineConfig = z.infer<typeof PipelineConfigSchema>;
+
+export const AuditEventSchema = z.object({
+  id: z.string().uuid(),
+  actor: z.string(),
+  action: z.string(),
+  target: z.string().nullable().optional(),
+  payload: z.any(),
+  createdAt: z.any()
+});
+export type AuditEvent = z.infer<typeof AuditEventSchema>;
+
 export async function listTargets() {
   return http("/api/targets", undefined, z.array(TargetSchema));
 }
@@ -216,5 +237,17 @@ export async function getGraphForTarget(targetId: string) {
       )
     })
   );
+}
+
+export async function getPipelineConfig() {
+  return http("/api/pipeline/config", undefined, PipelineConfigSchema);
+}
+
+export async function updatePipelineConfig(input: PipelineConfig) {
+  return http("/api/pipeline/config", { method: "PUT", body: JSON.stringify(input) }, PipelineConfigSchema);
+}
+
+export async function listAuditEvents(limit = 50) {
+  return http(`/api/audit-events?limit=${limit}`, undefined, z.array(AuditEventSchema));
 }
 

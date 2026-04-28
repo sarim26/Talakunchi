@@ -5,6 +5,26 @@ import { withSession } from "./neo4j.js";
 import { nmapScan } from "./nmapScan.js";
 import { HydraCredSource, hydraFromNmapServices } from "./hydraScan.js";
 
+type PipelineConfig = {
+  whitelist: string[];
+  maxConcurrentScans: number;
+  requestRatePerMinute: number;
+  safeMode: boolean;
+  requireHumanApproval: boolean;
+  auditEnabled: boolean;
+  allowedWordlists: string[];
+};
+
+const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
+  whitelist: [],
+  maxConcurrentScans: 2,
+  requestRatePerMinute: 120,
+  safeMode: true,
+  requireHumanApproval: false,
+  auditEnabled: true,
+  allowedWordlists: []
+};
+
 async function ensureCancelColumn() {
   await withClient(async (c) => {
     await c.query(`alter table scan_runs add column if not exists cancel_requested boolean not null default false`);
@@ -127,6 +147,91 @@ async function rebuildNeo4jForTarget(targetId: string) {
   });
 }
 
+function isIPv4(addr: string) {
+  const parts = addr.split(".");
+  if (parts.length !== 4) return false;
+  return parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
+}
+
+function ipv4ToInt(addr: string) {
+  return addr
+    .split(".")
+    .map(Number)
+    .reduce((acc, octet) => (acc << 8) + octet, 0) >>> 0;
+}
+
+function isInCidr(ip: string, cidr: string) {
+  const [base, prefixRaw] = cidr.split("/");
+  if (!base || !prefixRaw || !isIPv4(base) || !isIPv4(ip)) return false;
+  const prefix = Number(prefixRaw);
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return false;
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  return (ipv4ToInt(ip) & mask) === (ipv4ToInt(base) & mask);
+}
+
+function isAddressAllowed(address: string, whitelist: string[]) {
+  const normalized = address.trim().toLowerCase();
+  for (const entryRaw of whitelist) {
+    const entry = entryRaw.trim().toLowerCase();
+    if (!entry) continue;
+    if (entry.includes("/")) {
+      if (isInCidr(normalized, entry)) return true;
+      continue;
+    }
+    if (entry === normalized) return true;
+  }
+  return false;
+}
+
+async function ensurePhase1Tables() {
+  await withClient(async (c) => {
+    await c.query(`
+      create table if not exists pipeline_configs (
+        id int primary key,
+        config jsonb not null,
+        updated_at timestamptz not null default now()
+      )
+    `);
+    await c.query(`
+      create table if not exists audit_events (
+        id uuid primary key default uuid_generate_v4(),
+        actor text not null default 'system',
+        action text not null,
+        target text,
+        payload jsonb not null default '{}'::jsonb,
+        created_at timestamptz not null default now()
+      )
+    `);
+    await c.query(`create index if not exists idx_audit_events_created_at on audit_events(created_at desc)`);
+  });
+}
+
+async function getPipelineConfig() {
+  return withClient(async (c) => {
+    const res = await c.query(`select config from pipeline_configs where id = 1`);
+    const cfg = res.rows[0]?.config as PipelineConfig | undefined;
+    if (cfg && Array.isArray(cfg.whitelist)) return { ...DEFAULT_PIPELINE_CONFIG, ...cfg };
+    await c.query(
+      `insert into pipeline_configs (id, config, updated_at)
+       values (1, $1::jsonb, now())
+       on conflict (id) do update set config = excluded.config, updated_at = now()`,
+      [JSON.stringify(DEFAULT_PIPELINE_CONFIG)]
+    );
+    return DEFAULT_PIPELINE_CONFIG;
+  });
+}
+
+async function writeAuditEvent(action: string, payload: Record<string, unknown>, target?: string) {
+  const cfg = await getPipelineConfig();
+  if (!cfg.auditEnabled) return;
+  await withClient(async (c) => {
+    await c.query(
+      `insert into audit_events (actor, action, target, payload) values ($1, $2, $3, $4::jsonb)`,
+      ["worker", action, target ?? null, JSON.stringify(payload)]
+    );
+  });
+}
+
 async function runScan(scanRunId: string) {
   await ensureCancelColumn();
   const ctx = await withClient(async (c) => {
@@ -145,6 +250,21 @@ async function runScan(scanRunId: string) {
       target_address: string;
     };
   });
+
+  const pipelineConfig = await getPipelineConfig();
+  const inScope = isAddressAllowed(ctx.target_address, pipelineConfig.whitelist);
+  if (!inScope) {
+    await writeAuditEvent(
+      "scan.aborted.out_of_scope",
+      { scanRunId, targetId: ctx.target_id, address: ctx.target_address, whitelist: pipelineConfig.whitelist },
+      ctx.target_address
+    );
+    await withClient(async (c) => {
+      await c.query(`update scan_runs set status='failed', finished_at=now() where id=$1`, [scanRunId]);
+    });
+    throw new Error(`Target ${ctx.target_address} is out of scope for current whitelist.`);
+  }
+  await writeAuditEvent("scan.started", { scanRunId, targetId: ctx.target_id, profile: ctx.profile }, ctx.target_address);
 
   await withClient(async (c) => {
     await c.query(`update scan_runs set status='running', started_at=now() where id=$1`, [scanRunId]);
@@ -373,6 +493,7 @@ async function runScan(scanRunId: string) {
     );
     await c.query(`update scan_runs set status='succeeded', finished_at=now() where id=$1`, [scanRunId]);
   });
+  await writeAuditEvent("scan.completed", { scanRunId, findings: findings.length, services: services.length }, ctx.target_address);
 
   // Neo4j graph (demo wow)
   await upsertNeo4jTarget({ id: ctx.target_id, name: ctx.target_name, address: ctx.target_address });
@@ -494,6 +615,8 @@ function buildHydraCredSource(): HydraCredSource | null {
 }
 
 async function main() {
+  await ensurePhase1Tables();
+  await getPipelineConfig();
   console.log(`[worker] starting (mode=${env.SCAN_MODE})`);
   // eslint-disable-next-line no-constant-condition
   while (true) {

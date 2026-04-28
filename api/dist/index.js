@@ -4,9 +4,107 @@ import { z } from "zod";
 import { env } from "./env.js";
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
-import { CreateScanSchema, CreateTargetSchema, UpdateFindingSchema } from "./schemas.js";
+import { CreateScanSchema, CreateTargetSchema, PipelineConfigSchema, UpdateFindingSchema } from "./schemas.js";
 import { explainWithGemini, summarizeSurfaceWithGemini } from "./llm/gemini.js";
 const app = Fastify({ logger: true });
+const DEFAULT_PIPELINE_CONFIG = {
+    whitelist: [],
+    maxConcurrentScans: 2,
+    requestRatePerMinute: 120,
+    safeMode: true,
+    requireHumanApproval: false,
+    auditEnabled: true,
+    allowedWordlists: []
+};
+function isIPv4(addr) {
+    const parts = addr.split(".");
+    if (parts.length !== 4)
+        return false;
+    return parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
+}
+function ipv4ToInt(addr) {
+    return addr
+        .split(".")
+        .map(Number)
+        .reduce((acc, octet) => (acc << 8) + octet, 0) >>> 0;
+}
+function isInCidr(ip, cidr) {
+    const [base, prefixRaw] = cidr.split("/");
+    if (!base || !prefixRaw || !isIPv4(base) || !isIPv4(ip))
+        return false;
+    const prefix = Number(prefixRaw);
+    if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32)
+        return false;
+    const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+    return (ipv4ToInt(ip) & mask) === (ipv4ToInt(base) & mask);
+}
+function isAddressAllowed(address, whitelist) {
+    const normalized = address.trim().toLowerCase();
+    for (const entryRaw of whitelist) {
+        const entry = entryRaw.trim().toLowerCase();
+        if (!entry)
+            continue;
+        if (entry.includes("/")) {
+            if (isInCidr(normalized, entry))
+                return true;
+            continue;
+        }
+        if (entry === normalized)
+            return true;
+    }
+    return false;
+}
+async function ensurePhase1Tables() {
+    await withClient(async (c) => {
+        await c.query(`
+      create table if not exists pipeline_configs (
+        id int primary key,
+        config jsonb not null,
+        updated_at timestamptz not null default now()
+      )
+    `);
+        await c.query(`
+      create table if not exists audit_events (
+        id uuid primary key default uuid_generate_v4(),
+        actor text not null default 'system',
+        action text not null,
+        target text,
+        payload jsonb not null default '{}'::jsonb,
+        created_at timestamptz not null default now()
+      )
+    `);
+        await c.query(`create index if not exists idx_audit_events_created_at on audit_events(created_at desc)`);
+    });
+}
+async function getPipelineConfig() {
+    return withClient(async (c) => {
+        const res = await c.query(`select config from pipeline_configs where id = 1`);
+        const parsed = PipelineConfigSchema.safeParse(res.rows[0]?.config);
+        if (parsed.success)
+            return parsed.data;
+        await c.query(`insert into pipeline_configs (id, config, updated_at)
+       values (1, $1::jsonb, now())
+       on conflict (id) do update set config = excluded.config, updated_at = now()`, [JSON.stringify(DEFAULT_PIPELINE_CONFIG)]);
+        return DEFAULT_PIPELINE_CONFIG;
+    });
+}
+async function putPipelineConfig(input) {
+    const parsed = PipelineConfigSchema.parse(input);
+    await withClient(async (c) => {
+        await c.query(`insert into pipeline_configs (id, config, updated_at)
+       values (1, $1::jsonb, now())
+       on conflict (id) do update set config = excluded.config, updated_at = now()`, [JSON.stringify(parsed)]);
+    });
+    return parsed;
+}
+async function writeAuditEvent(action, payload, target, actor = "api") {
+    const cfg = await getPipelineConfig();
+    if (!cfg.auditEnabled)
+        return;
+    await withClient(async (c) => {
+        await c.query(`insert into audit_events (actor, action, target, payload) values ($1, $2, $3, $4::jsonb)`, [actor, action, target ?? null, JSON.stringify(payload)]);
+    });
+}
 // Minimal error helpers (avoid extra plugin in prototype)
 app.setErrorHandler((err, _req, reply) => {
     if (err?.statusCode) {
@@ -20,6 +118,34 @@ await app.register(cors, {
     origin: true
 });
 app.get("/health", async () => ({ ok: true }));
+app.get("/api/pipeline/config", async () => {
+    return getPipelineConfig();
+});
+app.put("/api/pipeline/config", async (req) => {
+    const body = PipelineConfigSchema.parse(req.body);
+    const config = await putPipelineConfig(body);
+    await writeAuditEvent("pipeline.config.updated", { config }, undefined, "operator");
+    return config;
+});
+app.get("/api/audit-events", async (req) => {
+    const q = req.query;
+    const limit = q.limit ? Math.min(500, Math.max(1, Number(q.limit))) : 100;
+    const rows = await withClient(async (c) => {
+        const res = await c.query(`select id, actor, action, target, payload, created_at
+       from audit_events
+       order by created_at desc
+       limit $1`, [limit]);
+        return res.rows;
+    });
+    return rows.map((r) => ({
+        id: r.id,
+        actor: r.actor,
+        action: r.action,
+        target: r.target,
+        payload: r.payload ?? {},
+        createdAt: r.created_at
+    }));
+});
 // --- Demo admin: reset database (two-step confirmation) ---
 const resetState = { code: null, expiresAt: 0 };
 function newResetCode() {
@@ -51,6 +177,7 @@ app.post("/api/admin/reset/confirm", async (req, reply) => {
             await c.query("truncate table scan_runs restart identity cascade");
             await c.query("truncate table jobs restart identity cascade");
             await c.query("truncate table targets restart identity cascade");
+            await c.query("truncate table audit_events restart identity cascade");
             await c.query("commit");
         }
         catch (e) {
@@ -99,6 +226,7 @@ app.post("/api/targets", async (req, reply) => {
        returning id, name, address, tags, owner, created_at`, [body.name, body.address, body.tags, body.owner ?? null]);
         return res.rows[0];
     });
+    await writeAuditEvent("target.created", { id: row.id, name: row.name, address: row.address, tags: row.tags }, row.address, "operator");
     return reply.code(201).send({
         id: row.id,
         name: row.name,
@@ -196,6 +324,18 @@ app.post("/api/targets/:id/explain-surface", async (req, reply) => {
 });
 app.post("/api/scans", async (req, reply) => {
     const body = CreateScanSchema.parse(req.body);
+    const target = await withClient(async (c) => {
+        const res = await c.query(`select id, address from targets where id = $1`, [body.targetId]);
+        return res.rows[0];
+    });
+    if (!target)
+        return reply.code(404).send({ error: "Target not found" });
+    const cfg = await getPipelineConfig();
+    const inScope = isAddressAllowed(target.address, cfg.whitelist);
+    if (!inScope) {
+        await writeAuditEvent("scan.blocked.out_of_scope", { targetId: body.targetId, address: target.address, whitelist: cfg.whitelist }, target.address, "scope-validator");
+        return reply.code(403).send({ error: `Target ${target.address} is out of scope for current whitelist.` });
+    }
     const scanRun = await withClient(async (c) => {
         await c.query("begin");
         try {
@@ -217,6 +357,7 @@ app.post("/api/scans", async (req, reply) => {
             throw e;
         }
     });
+    await writeAuditEvent("scan.queued", { scanRunId: scanRun.id, targetId: scanRun.target_id, profile: scanRun.profile }, target.address, "operator");
     return reply.code(202).send({
         id: scanRun.id,
         targetId: scanRun.target_id,
@@ -232,6 +373,8 @@ async function ensureCancelColumn() {
     });
 }
 await ensureCancelColumn();
+await ensurePhase1Tables();
+await getPipelineConfig();
 app.post("/api/scans/:id/cancel", async (req, reply) => {
     const scanRunId = z.string().uuid().parse(req.params.id);
     await withClient(async (c) => {
@@ -240,6 +383,7 @@ app.post("/api/scans/:id/cancel", async (req, reply) => {
         await c.query(`update jobs set status='failed', error='cancelled before start', updated_at=now()
        where type='scan' and status='queued' and payload->>'scanRunId' = $1`, [scanRunId]);
     });
+    await writeAuditEvent("scan.cancel_requested", { scanRunId }, undefined, "operator");
     return reply.send({ ok: true });
 });
 app.get("/api/scans", async () => {

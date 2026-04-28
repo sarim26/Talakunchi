@@ -6,6 +6,7 @@ import { RunsPage } from "./pages/RunsPage";
 import { RunDetailPage } from "./pages/RunDetailPage";
 import { FindingsPage } from "./pages/FindingsPage";
 import { GraphPage } from "./pages/GraphPage";
+import { PipelinePage } from "./pages/PipelinePage";
 
 function NavButton({ to, label }: { to: string; label: string }) {
   const loc = useLocation();
@@ -36,6 +37,7 @@ export function App() {
           <NavButton to="/targets" label="Targets" />
           <NavButton to="/runs" label="Runs" />
           <NavButton to="/findings" label="Findings" />
+          <NavButton to="/pipeline" label="Pipeline" />
           <NavButton to="/graph" label="Graph" />
         </Toolbar>
       </AppBar>
@@ -47,6 +49,7 @@ export function App() {
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/runs/:id" element={<RunDetailPage />} />
           <Route path="/findings" element={<FindingsPage />} />
+          <Route path="/pipeline" element={<PipelinePage />} />
           <Route path="/graph" element={<GraphPage />} />
         </Routes>
       </Container>

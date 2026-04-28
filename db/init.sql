@@ -88,7 +88,23 @@ create table if not exists jobs (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists pipeline_configs (
+  id int primary key,
+  config jsonb not null,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists audit_events (
+  id uuid primary key default uuid_generate_v4(),
+  actor text not null default 'system',
+  action text not null,
+  target text,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
 create index if not exists idx_jobs_status on jobs(status);
 create index if not exists idx_scan_runs_target on scan_runs(target_id);
 create index if not exists idx_findings_target on findings(target_id);
+create index if not exists idx_audit_events_created_at on audit_events(created_at desc);
 
