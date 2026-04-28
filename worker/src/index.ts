@@ -3,6 +3,7 @@ import { env } from "./env.js";
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 import { nmapScan } from "./nmapScan.js";
+import { HydraCredSource, hydraFromNmapServices } from "./hydraScan.js";
 
 async function ensureCancelColumn() {
   await withClient(async (c) => {
@@ -164,7 +165,7 @@ async function runScan(scanRunId: string) {
     return res.rows[0].id as string;
   });
 
-  const nmapCmd = `nmap ${env.NMAP_ARGS} -oX /tmp/nmap.xml ${ctx.target_address}`;
+  const nmapCmd = `nmap ${env.NMAP_ARGS} -oX <tempfile> ${ctx.target_address}`;
   await appendStepLog(discoveryStepId, `Running: ${nmapCmd}\n`);
 
   const ac = new AbortController();
@@ -219,17 +220,22 @@ async function runScan(scanRunId: string) {
 
   if (!scanOut) throw new Error("Scan produced no output");
 
-  const services = scanOut.services.map((s: any) => ({
+  const services = scanOut.services
+    .filter((s: any) => s.state === "open")
+    .map((s: any) => ({
     port: s.port,
     protocol: s.protocol,
     serviceName: s.serviceName,
     product: s.product,
     version: s.version,
     banner: s.banner
-  }));
+    }));
 
-  const findings =
-    deriveFindingsFromObserved(ctx.target_address, scanOut.services);
+  if (scanOut.status === "down") {
+    await appendStepLog(discoveryStepId, `Host appears down from Nmap output: ${scanOut.host}\n`);
+  }
+
+  let findings = deriveFindingsFromObserved(ctx.target_address, services);
 
   // Step 1 finish
   await withClient(async (c) => {
@@ -278,6 +284,65 @@ async function runScan(scanRunId: string) {
     );
     await c.query(`update scan_steps set status='running', started_at=now() where id=$1`, [step3.rows[0].id]);
   });
+
+  await sleep(500);
+
+  if (env.HYDRA_ENABLED) {
+    const hydraCredSource = buildHydraCredSource();
+    if (!hydraCredSource) {
+      const step3 = await withClient(async (c) => {
+        const res = await c.query(
+          `select id from scan_steps where scan_run_id=$1 and name='Checks & Findings' order by created_at asc limit 1`,
+          [scanRunId]
+        );
+        return res.rows[0]?.id as string;
+      });
+      if (step3) {
+        await appendStepLog(
+          step3,
+          "Hydra enabled but credential source is incomplete. Set HYDRA_USERNAME/HYDRA_USERLIST and HYDRA_PASSWORD/HYDRA_PASSLIST.\n"
+        );
+      }
+    } else {
+      const hydraOutput: string[] = [];
+      try {
+        const hydraResults = await hydraFromNmapServices(ctx.target_address, services, hydraCredSource, {
+          threads: env.HYDRA_THREADS,
+          stopOnFirstFind: env.HYDRA_STOP_ON_FIRST_FIND,
+          timeoutMs: env.HYDRA_TIMEOUT_MS,
+          signal: ac.signal,
+          onOutput: (line) => {
+            hydraOutput.push(line);
+          }
+        });
+
+        const step3 = await withClient(async (c) => {
+          const res = await c.query(
+            `select id from scan_steps where scan_run_id=$1 and name='Checks & Findings' order by created_at asc limit 1`,
+            [scanRunId]
+          );
+          return res.rows[0]?.id as string;
+        });
+        if (step3 && hydraOutput.length) {
+          await appendStepLog(step3, hydraOutput.join(""));
+        }
+
+        const hydraCreds = hydraResults.flatMap((r) => r.credentials);
+        findings = findings.concat(deriveFindingsFromHydra(hydraCreds));
+      } catch (e: any) {
+        const step3 = await withClient(async (c) => {
+          const res = await c.query(
+            `select id from scan_steps where scan_run_id=$1 and name='Checks & Findings' order by created_at asc limit 1`,
+            [scanRunId]
+          );
+          return res.rows[0]?.id as string;
+        });
+        if (step3) {
+          await appendStepLog(step3, `Hydra phase skipped due to error: ${e?.message ?? String(e)}\n`);
+        }
+      }
+    }
+  }
 
   await sleep(500);
 
@@ -388,6 +453,44 @@ function deriveFindingsFromObserved(
   }
 
   return out;
+}
+
+function maskSecret(value: string) {
+  if (!value) return "";
+  if (value.length <= 2) return "*".repeat(value.length);
+  return `${value[0]}${"*".repeat(Math.max(1, value.length - 2))}${value[value.length - 1]}`;
+}
+
+function deriveFindingsFromHydra(
+  credentials: Array<{
+    host: string;
+    port: number;
+    service: string;
+    username: string;
+    password: string;
+  }>
+) {
+  const mk = (key: string) => `fp:${key}`;
+  return credentials.map((cred) => ({
+    title: `Weak/default credentials accepted on ${cred.service} (${cred.port})`,
+    severity: "high" as const,
+    servicePort: cred.port,
+    evidenceRedacted: `Hydra reported valid login on ${cred.host}:${cred.port}/${cred.service} with username "${cred.username}" and password "${maskSecret(cred.password)}".`,
+    fingerprint: mk(`${cred.host}|${cred.port}|${cred.service}|hydra|${cred.username}`)
+  }));
+}
+
+function buildHydraCredSource(): HydraCredSource | null {
+  const username = env.HYDRA_USERNAME?.trim();
+  const password = env.HYDRA_PASSWORD?.trim();
+  const userList = env.HYDRA_USERLIST?.trim();
+  const passList = env.HYDRA_PASSLIST?.trim();
+
+  const usernameSource = username ? { username } : userList ? { userList } : null;
+  const passwordSource = password ? { password } : passList ? { passwordList: passList } : null;
+  if (!usernameSource || !passwordSource) return null;
+
+  return { ...usernameSource, ...passwordSource } as HydraCredSource;
 }
 
 async function main() {

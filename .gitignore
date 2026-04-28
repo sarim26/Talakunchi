@@ -2,7 +2,7 @@ node_modules
 dist
 .env
 .DS_Store
-
+.cache/wordlists/rockyou.txt
 # Local docker volumes / state (optional)
 pgdata
 neo4jdata

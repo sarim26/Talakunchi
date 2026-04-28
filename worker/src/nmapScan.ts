@@ -1,10 +1,13 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { XMLParser } from "fast-xml-parser";
 
 export type NmapService = {
   port: number;
   protocol: "tcp" | "udp";
+  state: string;
   serviceName?: string;
   product?: string;
   version?: string;
@@ -12,6 +15,8 @@ export type NmapService = {
 };
 
 export type NmapResult = {
+  host: string;
+  status: "up" | "down";
   services: NmapService[];
   rawXml: string;
 };
@@ -41,16 +46,16 @@ function run(
       reject(new Error("aborted"));
     };
     if (opts?.signal) {
-      if (opts.signal.aborted) return onAbort();
+      if (opts.signal.aborted) return void onAbort();
       opts.signal.addEventListener("abort", onAbort, { once: true });
     }
 
-    child.stdout.on("data", (d) => {
+    child.stdout.on("data", (d: Buffer) => {
       const s = d.toString("utf8");
       stdout += s;
       opts?.onStdout?.(s);
     });
-    child.stderr.on("data", (d) => {
+    child.stderr.on("data", (d: Buffer) => {
       const s = d.toString("utf8");
       stderr += s;
       opts?.onStderr?.(s);
@@ -75,20 +80,24 @@ export async function nmapScan(
     signal?: AbortSignal;
   }
 ) {
-  // Write XML to file (keeps stdout/stderr free for live logs).
-  const xmlPath = "/tmp/nmap.xml";
+  const xmlPath = path.join(os.tmpdir(), `nmap-${Date.now()}-${Math.random().toString(36).slice(2)}.xml`);
   const args = [...nmapArgs.split(/\s+/).filter(Boolean), "-oX", xmlPath, targetAddress];
 
-  const { stderr, exitCode } = await run("nmap", args, 10 * 60 * 1000, {
-    onStdout: (c) => opts?.onOutput?.(c),
-    onStderr: (c) => opts?.onOutput?.(c),
-    signal: opts?.signal
-  });
-  if (exitCode !== 0) {
-    throw new Error(`nmap failed (exit=${exitCode}). stderr=${stderr.slice(0, 2000)}`);
-  }
+  let rawXml = "";
+  try {
+    const { stderr, exitCode } = await run("nmap", args, 10 * 60 * 1000, {
+      onStdout: (c) => opts?.onOutput?.(c),
+      onStderr: (c) => opts?.onOutput?.(c),
+      signal: opts?.signal
+    });
+    if (exitCode !== 0) {
+      throw new Error(`nmap failed (exit=${exitCode}). stderr=${stderr.slice(0, 2000)}`);
+    }
 
-  const rawXml = await fs.readFile(xmlPath, "utf8");
+    rawXml = await fs.readFile(xmlPath, "utf8");
+  } finally {
+    await fs.unlink(xmlPath).catch(() => undefined);
+  }
 
   const parser = new XMLParser({
     ignoreAttributes: false,
@@ -98,19 +107,24 @@ export async function nmapScan(
   const doc: any = parser.parse(rawXml);
 
   const host = doc?.nmaprun?.host;
+  const hostStatus = host?.status?.state === "up" ? "up" : "down";
+  const hostAddresses = Array.isArray(host?.address) ? host.address : host?.address ? [host.address] : [];
+  const ipv4 = hostAddresses.find((a: any) => a?.addrtype === "ipv4")?.addr;
+  const firstAddress = hostAddresses[0]?.addr;
+  const resolvedHost = ipv4 ?? firstAddress ?? targetAddress;
   const ports = host?.ports?.port;
   const portList = Array.isArray(ports) ? ports : ports ? [ports] : [];
 
   const services: NmapService[] = [];
   for (const p of portList) {
     const state = p?.state?.state;
-    if (state !== "open") continue;
     const port = Number(p.portid);
     const protocol = (p.protocol as "tcp" | "udp") ?? "tcp";
     const svc = p?.service ?? {};
     services.push({
       port,
       protocol,
+      state: String(state ?? "unknown"),
       serviceName: svc.name,
       product: svc.product,
       version: svc.version,
@@ -118,6 +132,6 @@ export async function nmapScan(
     });
   }
 
-  return { services, rawXml } satisfies NmapResult;
+  return { host: resolvedHost, status: hostStatus, services, rawXml } satisfies NmapResult;
 }
 
