@@ -9,7 +9,7 @@ RUN rm -rf /var/lib/apt/lists/* \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json* ./
-RUN npm install
+RUN npm ci
 
 COPY tsconfig.json ./
 COPY src ./src
