@@ -2,215 +2,200 @@ FROM node:20-bookworm-slim
 
 WORKDIR /app
 
-# ── System deps + all apt-installable pentest tools ──────────────────────────
-#
-# Split into logical groups so a single failed package is easy to spot.
-# --no-install-recommends keeps the image lean.
-# --fix-missing lets apt skip packages that aren't in the mirror yet.
+# Prevent interactive apt prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── System deps + stable pentest core ────────────────────────────────────────
+# Keep only strong/stable tools here.
+# Fragile tools are installed separately with fallback logic.
 #
 RUN rm -rf /var/lib/apt/lists/* \
   && apt-get clean \
   && apt-get update \
-       -o Acquire::Retries=6 \
-       -o Acquire::http::Timeout=30 \
-       -o Acquire::https::Timeout=30 \
-  \
-  # ── Runtime essentials ────────────────────────────────────────────────────
+      -o Acquire::Retries=6 \
+      -o Acquire::http::Timeout=30 \
+      -o Acquire::https::Timeout=30 \
+\
+# ── Runtime essentials ───────────────────────────────────────────────────────
   && apt-get install -y --no-install-recommends --fix-missing \
-       ca-certificates \
-       curl wget git \
-       python3 python3-pip python3-venv \
-       ruby ruby-dev \
-       golang-go \
-       build-essential cmake \
-       net-tools iputils-ping traceroute \
-       bind9-dnsutils dnsutils \
-       openssl \
-       jq xxd file \
-       tar gzip zip unzip \
-       procps \
-  \
-  # ── Network scanning ──────────────────────────────────────────────────────
+      ca-certificates \
+      curl wget git \
+      python3 python3-pip python3-venv \
+      ruby ruby-dev \
+      golang-go \
+      build-essential cmake \
+      net-tools iputils-ping traceroute \
+      bind9-dnsutils dnsutils \
+      openssl \
+      jq xxd file \
+      tar gzip zip unzip \
+      procps \
+\
+# ── Core network tools ───────────────────────────────────────────────────────
   && apt-get install -y --no-install-recommends --fix-missing \
-       nmap nmap-common \
-       netcat-openbsd \
-       tcpdump \
-       tshark wireshark-common \
-       socat \
-       proxychains4 \
-       sshuttle \
-       stunnel4 \
-  \
-  # masscan is useful but mirror-fetch is occasionally flaky; don't fail whole build on it.
-  && apt-get install -y --no-install-recommends --fix-missing masscan \
-       -o Acquire::Retries=6 \
-       -o Acquire::http::Timeout=30 \
-       -o Acquire::https::Timeout=30 \
-     || echo "Skipping masscan for this build (mirror issue); install later via install_tool if needed." \
-  \
-  # ── Credential attacks ────────────────────────────────────────────────────
+      nmap \
+      netcat-openbsd \
+      tcpdump \
+      tshark \
+      socat \
+      proxychains4 \
+      sshuttle \
+      stunnel4 \
+\
+# ── Web exploitation (stable only) ───────────────────────────────────────────
   && apt-get install -y --no-install-recommends --fix-missing \
-       hydra \
-       medusa \
-       ncrack \
-       john john-data \
-       hashcat \
-       crunch \
-       cewl \
-  \
-   # ── Web exploitation ──────────────────────────────────────────────────────
-   && apt-get install -y --no-install-recommends --fix-missing \
-       sqlmap \
-       gobuster \
-       ffuf \
-       dirb \
-       wfuzz \
-       whatweb \
-  \
+      sqlmap \
+      gobuster \
+      ffuf \
+      dirb \
+      wfuzz \
+      whatweb \
+\
+# ── Credential attacks ───────────────────────────────────────────────────────
   && apt-get install -y --no-install-recommends --fix-missing \
-       -o Acquire::Retries=6 \
-       -o Acquire::http::Timeout=30 \
-       -o Acquire::https::Timeout=30 \
-       nikto \
-     || echo "Skipping nikto for this build (package not found / mirror issue)." \
-  \
-  # ── Enumeration / SMB / LDAP / SNMP ──────────────────────────────────────
+      hydra \
+      medusa \
+      ncrack \
+      john \
+      john-data \
+      hashcat \
+      crunch \
+      cewl \
+\
+# ── SMB / LDAP / Enumeration ────────────────────────────────────────────────
   && apt-get install -y --no-install-recommends --fix-missing \
-       smbclient \
-       smbmap \
-       enum4linux \
-       ldap-utils \
-       snmp \
-       onesixtyone \
-       dnsrecon \
-       dnsenum \
-       fierce \
-  \
-  # ── Exploitation support ──────────────────────────────────────────────────
+      smbclient \
+      enum4linux \
+      ldap-utils \
+      snmp \
+      dnsrecon \
+      dnsenum \
+\
+# ── Exploitation support ─────────────────────────────────────────────────────
   && apt-get install -y --no-install-recommends --fix-missing \
-       python3-impacket \
-       python3-scapy \
-       python3-requests \
-       python3-bs4 \
-       python3-paramiko \
-  \
-  # ── Post-exploitation / binary analysis ───────────────────────────────────
+      python3-impacket \
+      python3-scapy \
+      python3-requests \
+      python3-bs4 \
+      python3-paramiko \
+\
+# ── Post exploitation basics ────────────────────────────────────────────────
   && apt-get install -y --no-install-recommends --fix-missing \
-       gdb \
-       ltrace \
-       strace \
-       binutils \
-       binwalk \
-       upx-ucl \
-       fcrackzip \
-       steghide \
-       hashid \
-  \
-  # ── Wireless ──────────────────────────────────────────────────────────────
-  && apt-get install -y --no-install-recommends --fix-missing \
-       aircrack-ng \
-       reaver \
-  \
-  # ── MITM / sniffing ───────────────────────────────────────────────────────
-  && apt-get install -y --no-install-recommends --fix-missing \
-       ettercap-common \
-       bettercap \
-  \
+      gdb \
+      ltrace \
+      strace \
+      binutils \
+      fcrackzip \
+      steghide \
+\
+# ── Cleanup ─────────────────────────────────────────────────────────────────
   && rm -rf /var/lib/apt/lists/*
 
-# ── Python tools (pip) ────────────────────────────────────────────────────────
-#
-# Use --break-system-packages so pip works on bookworm without a venv.
-# Pin only where version matters for stability.
-#
+# ── Optional fragile packages (never break build) ───────────────────────────
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends masscan \
+ || echo "Skipping masscan"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends nikto \
+ || echo "Skipping nikto"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends smbmap \
+ || echo "Skipping smbmap"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends bettercap \
+ || echo "Skipping bettercap"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends reaver \
+ || echo "Skipping reaver"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends onesixtyone \
+ || echo "Skipping onesixtyone"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fierce \
+ || echo "Skipping fierce"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends binwalk \
+ || echo "Skipping binwalk"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends upx-ucl \
+ || echo "Skipping upx-ucl"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends aircrack-ng \
+ || echo "Skipping aircrack-ng"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ettercap-common \
+ || echo "Skipping ettercap"
+
+# ── Python tools ────────────────────────────────────────────────────────────
+
 RUN pip3 install --break-system-packages --no-cache-dir \
-      impacket \
-      crackmapexec \
-      bloodhound \
-      certipy-ad \
-      pypykatz \
-      ldapdomaindump \
-      coercer \
-      ldeep \
-      pwncat-cs \
-      mitmproxy \
-      scapy \
-      pwntools \
-      boofuzz \
-      jwt_tool \
-      arjun \
-  2>/dev/null || true
-# `|| true` — some packages may not be on PyPI under that exact name on all archs;
-# the LLM can call install_tool at runtime for anything that fails here.
+    impacket \
+    certipy-ad \
+    pypykatz \
+    ldapdomaindump \
+    mitmproxy \
+    scapy \
+    pwntools \
+    boofuzz \
+    arjun \
+ || true
 
-# ── Ruby gems ─────────────────────────────────────────────────────────────────
-RUN gem install \
-      wpscan \
-      evil-winrm \
-  2>/dev/null || true
+# crackmapexec often breaks depending on arch/version
+RUN pip3 install --break-system-packages --no-cache-dir crackmapexec \
+ || echo "Skipping crackmapexec"
 
-# ── Go-based tools ────────────────────────────────────────────────────────────
-#
-# go install puts binaries in /root/go/bin — add to PATH below.
-#
+# ── Ruby gems ───────────────────────────────────────────────────────────────
+
+RUN gem install wpscan evil-winrm || true
+
+# ── Go tools ────────────────────────────────────────────────────────────────
+
 ENV GOPATH=/root/go
 ENV PATH="${PATH}:/root/go/bin"
 
-RUN go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 2>/dev/null || true \
-  && go install github.com/projectdiscovery/httpx/cmd/httpx@latest          2>/dev/null || true \
-  && go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest     2>/dev/null || true \
-  && go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest       2>/dev/null || true \
-  && go install github.com/projectdiscovery/katana/cmd/katana@latest        2>/dev/null || true \
-  && go install github.com/hahwul/dalfox/v2@latest                          2>/dev/null || true \
-  && go install github.com/ropnop/kerbrute@latest                           2>/dev/null || true \
-  && go install github.com/jpillora/chisel@latest                           2>/dev/null || true \
-  && go install github.com/lc/gau/v2/cmd/gau@latest                        2>/dev/null || true \
-  && go install github.com/hakluke/hakrawler@latest                         2>/dev/null || true \
-  && go install github.com/tomnomnom/anew@latest                            2>/dev/null || true \
-  && go install github.com/OWASP/Amass/v3/...@latest                        2>/dev/null || true \
-  && go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest            2>/dev/null || true
+RUN go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || true
+RUN go install github.com/projectdiscovery/httpx/cmd/httpx@latest || true
+RUN go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
+RUN go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest || true
+RUN go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest || true
 
-# ── Metasploit Framework ──────────────────────────────────────────────────────
-#
-# Official installer script — the only reliable way to get MSF on Debian.
-# Runs curl | bash (acceptable here: controlled build environment, pinned source).
-# Takes ~3 min on first build; cached in layer afterwards.
-#
-RUN curl -fsSL https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfupdate.erb \
-      > /tmp/msfinstall \
-  && chmod +x /tmp/msfinstall \
-  && /tmp/msfinstall \
-  && rm /tmp/msfinstall \
-  2>/dev/null || true
-# MSF adds its own binaries to /usr/bin (msfconsole, msfvenom, etc.)
+# ── ExploitDB / searchsploit ────────────────────────────────────────────────
 
-# ── ExploitDB / searchsploit ──────────────────────────────────────────────────
 RUN git clone --depth=1 https://gitlab.com/exploit-database/exploitdb.git /opt/exploitdb \
-  && ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit \
-  2>/dev/null || true
+ && ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit \
+ || true
 
-# ── Wordlists ─────────────────────────────────────────────────────────────────
-#
-# rockyou.txt — the standard password list.
-# SecLists — mounted from .cache/wordlists at runtime (see docker-compose.yml).
-# We bake in rockyou so the agent always has something even without the mount.
-#
+# ── Wordlists ───────────────────────────────────────────────────────────────
+
 RUN mkdir -p /usr/share/wordlists \
-  && curl -fsSL \
-       "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt" \
-       -o /usr/share/wordlists/rockyou.txt \
-  2>/dev/null || true
+ && curl -fsSL \
+    "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt" \
+    -o /usr/share/wordlists/rockyou.txt \
+ || true
 
-# ── linpeas / winpeas (post-exploitation scripts) ─────────────────────────────
+# ── linpeas ─────────────────────────────────────────────────────────────────
+
 RUN mkdir -p /opt/privesc \
-  && curl -fsSL \
-       "https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh" \
-       -o /opt/privesc/linpeas.sh \
-  && chmod +x /opt/privesc/linpeas.sh \
-  && ln -sf /opt/privesc/linpeas.sh /usr/local/bin/linpeas \
-  2>/dev/null || true
+ && curl -fsSL \
+    "https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh" \
+    -o /opt/privesc/linpeas.sh \
+ && chmod +x /opt/privesc/linpeas.sh \
+ && ln -sf /opt/privesc/linpeas.sh /usr/local/bin/linpeas \
+ || true
 
-# ── Node deps ─────────────────────────────────────────────────────────────────
+# ── Node deps ───────────────────────────────────────────────────────────────
+
 COPY package.json package-lock.json* ./
 RUN npm ci
 
