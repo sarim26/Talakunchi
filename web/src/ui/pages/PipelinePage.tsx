@@ -18,6 +18,7 @@ import {
   Typography
 } from "@mui/material";
 import {
+  createExploitRun,
   getPipelineConfig,
   listAuditEvents,
   listFindings,
@@ -109,6 +110,14 @@ export function PipelinePage() {
       setConfig(updated);
       await qc.invalidateQueries({ queryKey: ["pipeline-config"] });
       await qc.invalidateQueries({ queryKey: ["audit-events"] });
+    }
+  });
+
+  const exploitM = useMutation({
+    mutationFn: (input: { scanRunId?: string; targetId?: string }) => createExploitRun(input),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["audit-events"] });
+      await qc.invalidateQueries({ queryKey: ["runs"] });
     }
   });
 
@@ -242,6 +251,102 @@ export function PipelinePage() {
               )}
             </Box>
           ) : null}
+
+          {phase.id === 4 ? (() => {
+            const targetRuns = runs.filter((r) => !targetId || r.targetId === targetId);
+            const succeeded = targetRuns.filter((r) => r.status === "succeeded");
+            const latestSucceeded = succeeded[0];
+            const exploitEvents = (auditQ.data ?? []).filter((e) =>
+              e.action.startsWith("agent.exploit.") || e.action.startsWith("exploit.")
+            );
+            return (
+              <Box sx={{ mb: 2 }}>
+                <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                  AI Exploitation Control
+                </Typography>
+                <Stack spacing={2}>
+                  <Stack direction={{ xs: "column", md: "row" }} spacing={2} alignItems={{ md: "center" }}>
+                    <Chip
+                      label={
+                        latestSucceeded
+                          ? `Latest scan: ${latestSucceeded.target.name} - ${new Date(
+                              (latestSucceeded.finishedAt ?? latestSucceeded.createdAt) as string
+                            ).toLocaleString()}`
+                          : targetId
+                          ? "No succeeded scans for this target yet"
+                          : "Pick a target above (or run any scan) to enable manual exploitation"
+                      }
+                      color={latestSucceeded ? "success" : "default"}
+                      variant="outlined"
+                    />
+                    <Button
+                      variant="contained"
+                      color="warning"
+                      disabled={(!latestSucceeded && !targetId) || exploitM.isPending}
+                      onClick={() =>
+                        exploitM.mutate(
+                          latestSucceeded ? { scanRunId: latestSucceeded.id } : { targetId: targetId || undefined }
+                        )
+                      }
+                    >
+                      {exploitM.isPending ? "Queueing..." : "Launch AI Exploitation"}
+                    </Button>
+                  </Stack>
+                  <Typography variant="caption" color="text.secondary">
+                    Auto-trigger after a successful scan is controlled by the worker env flag EXPLOIT_ENABLED. The
+                    AI agent will pick exploit/credential modules (hydra, medusa, ncrack, msfconsole, sqlmap...),
+                    install missing tools on demand, and stop after at most 15 commands. Reverse-shell payloads are
+                    pinned to the worker host - no external callbacks.
+                  </Typography>
+                  {exploitM.isError ? (
+                    <Alert severity="error">
+                      {exploitM.error instanceof Error ? exploitM.error.message : String(exploitM.error)}
+                    </Alert>
+                  ) : null}
+                  {exploitM.isSuccess ? (
+                    <Alert severity="success">
+                      Exploitation queued for scan {exploitM.data?.scanRunId.slice(0, 8)}... - watch the scan run
+                      page for the "AI Exploitation" step log.
+                    </Alert>
+                  ) : null}
+
+                  <Divider />
+                  <Typography variant="subtitle2">Recent Exploitation Audit Events</Typography>
+                  {exploitEvents.length === 0 ? (
+                    <Typography variant="body2" color="text.secondary">
+                      No exploitation activity yet. Launch a run above (or wait for the next scan to auto-trigger).
+                    </Typography>
+                  ) : (
+                    <Stack spacing={1}>
+                      {exploitEvents.slice(0, 10).map((e) => (
+                        <Box
+                          key={e.id}
+                          sx={{ p: 1, border: "1px solid", borderColor: "divider", borderRadius: 1 }}
+                        >
+                          <Typography variant="body2">
+                            {e.actor} - {e.action}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {new Date(e.createdAt).toLocaleString()} {e.target ? `- ${e.target}` : ""}
+                          </Typography>
+                          {e.payload && Object.keys(e.payload).length > 0 ? (
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              component="pre"
+                              sx={{ m: 0, mt: 0.5, whiteSpace: "pre-wrap", wordBreak: "break-all" }}
+                            >
+                              {JSON.stringify(e.payload, null, 2)}
+                            </Typography>
+                          ) : null}
+                        </Box>
+                      ))}
+                    </Stack>
+                  )}
+                </Stack>
+              </Box>
+            );
+          })() : null}
 
           {phase.id === 2 ? (
             <Box sx={{ mb: 2 }}>

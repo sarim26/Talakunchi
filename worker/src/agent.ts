@@ -8,7 +8,7 @@ import {
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 
-type Severity = "info" | "low" | "medium" | "high" | "critical";
+export type Severity = "info" | "low" | "medium" | "high" | "critical";
 
 type AgentFinding = {
   title: string;
@@ -45,7 +45,7 @@ export type AgentOpts = {
   wordlistPath?: string;
 };
 
-const ALLOWED_BINARIES = new Set([
+export const ALLOWED_BINARIES = new Set([
   "nmap", "masscan", "rustscan",
   "hydra", "medusa", "ncrack",
   "nikto", "gobuster", "dirb", "ffuf", "whatweb", "wpscan",
@@ -59,7 +59,7 @@ const ALLOWED_BINARIES = new Set([
   "head", "tail", "wc", "cut", "tr", "printf", "jq"
 ]);
 
-const BLOCKED_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+export const BLOCKED_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /rm\s+(-[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*r[a-zA-Z]*)\s/i, reason: "file deletion" },
   { pattern: />\s*\/etc\//, reason: "writing to /etc" },
   { pattern: />\s*\/usr\//, reason: "writing to /usr" },
@@ -78,7 +78,7 @@ const BLOCKED_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /iptables.*-F|iptables.*--flush/, reason: "flushing firewall rules" }
 ];
 
-function extractIPs(command: string): string[] {
+export function extractIPs(command: string): string[] {
   const re = /\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(\/\d{1,2})?\b/g;
   const out: string[] = [];
   let match: RegExpExecArray | null;
@@ -99,7 +99,7 @@ function isInCidr(ip: string, cidr: string): boolean {
   return (ipv4ToInt(ip) & mask) === (ipv4ToInt(base) & mask);
 }
 
-function isAddressAllowed(address: string, whitelist: string[]): boolean {
+export function isAddressAllowed(address: string, whitelist: string[]): boolean {
   const norm = address.trim().toLowerCase();
   for (const raw of whitelist) {
     const entry = raw.trim().toLowerCase();
@@ -113,36 +113,54 @@ function isAddressAllowed(address: string, whitelist: string[]): boolean {
   return false;
 }
 
-type ValidationResult = { allowed: true } | { allowed: false; reason: string };
+export type ValidationResult = { allowed: true } | { allowed: false; reason: string };
 
-function validateCommand(command: string, whitelist: string[]): ValidationResult {
+export type ValidateCommandOpts = {
+  whitelist: string[];
+  allowedBinaries?: Set<string>;
+  extraBlockedPatterns?: Array<{ pattern: RegExp; reason: string }>;
+  extraGuard?: (command: string) => string | null;
+};
+
+export function validateCommand(command: string, opts: ValidateCommandOpts): ValidationResult {
   const trimmed = command.trim();
   if (!trimmed) return { allowed: false, reason: "empty command" };
 
+  const allowed = opts.allowedBinaries ?? ALLOWED_BINARIES;
   const binary = (trimmed.split(/\s+/)[0] ?? "").split("/").pop() ?? "";
-  if (!ALLOWED_BINARIES.has(binary)) {
+  if (!allowed.has(binary)) {
     return {
       allowed: false,
-      reason: `"${binary}" is not in the allowed binary list. Allowed: ${[...ALLOWED_BINARIES].join(", ")}`
+      reason: `"${binary}" is not in the allowed binary list. Allowed: ${[...allowed].join(", ")}`
     };
   }
 
   for (const { pattern, reason } of BLOCKED_PATTERNS) {
     if (pattern.test(trimmed)) return { allowed: false, reason: `blocked: ${reason}` };
   }
+  if (opts.extraBlockedPatterns) {
+    for (const { pattern, reason } of opts.extraBlockedPatterns) {
+      if (pattern.test(trimmed)) return { allowed: false, reason: `blocked: ${reason}` };
+    }
+  }
 
   for (const ip of extractIPs(trimmed)) {
-    if (!isAddressAllowed(ip, whitelist)) {
+    if (!isAddressAllowed(ip, opts.whitelist)) {
       return { allowed: false, reason: `IP ${ip} is outside the authorised scope` };
     }
+  }
+
+  if (opts.extraGuard) {
+    const reason = opts.extraGuard(trimmed);
+    if (reason) return { allowed: false, reason };
   }
 
   return { allowed: true };
 }
 
-const MAX_OUTPUT_CHARS = 8_000;
+export const MAX_OUTPUT_CHARS = 8_000;
 
-type ExecResult = {
+export type ExecResult = {
   stdout: string;
   stderr: string;
   exitCode: number | null;
@@ -150,7 +168,7 @@ type ExecResult = {
   durationMs: number;
 };
 
-function execCommand(
+export function execCommand(
   command: string,
   timeoutMs: number,
   onChunk?: (s: string) => void,
@@ -376,7 +394,7 @@ async function runAgentLoop(
   const wordlist = opts.wordlistPath ?? "/usr/share/wordlists/rockyou.txt";
 
   const client = new GoogleGenerativeAI(opts.geminiApiKey);
-  const modelName = opts.geminiModel ?? "gemini-1.5-flash";
+  const modelName = opts.geminiModel ?? "gemini-2.5-flash-lite";
 
   const model = client.getGenerativeModel({
     model: modelName,
@@ -453,7 +471,7 @@ async function runAgentLoop(
 
           await onLog(`│\n│ 💭 ${reasoning}\n│ $ ${command}\n│\n`);
 
-          const validation = validateCommand(command, opts.whitelist);
+          const validation = validateCommand(command, { whitelist: opts.whitelist });
           if (!validation.allowed) {
             result = `BLOCKED: ${validation.reason}`;
             await onLog(`│ ⛔ ${result}\n`);
@@ -733,10 +751,14 @@ function deriveRiskLevel(findings: AgentFinding[]): Severity {
 }
 
 async function logAuditEvent(action: string, payload: Record<string, unknown>) {
+  await writeAuditEvent("agent", action, payload);
+}
+
+export async function writeAuditEvent(actor: string, action: string, payload: Record<string, unknown>) {
   await withClient(async (c) => {
     await c.query(
-      `insert into audit_events (actor, action, payload) values ('agent',$1,$2::jsonb) on conflict do nothing`,
-      [action, JSON.stringify(payload)]
+      `insert into audit_events (actor, action, payload) values ($1,$2,$3::jsonb) on conflict do nothing`,
+      [actor, action, JSON.stringify(payload)]
     );
   }).catch(() => {});
 }

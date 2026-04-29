@@ -3,6 +3,7 @@ import dns from "node:dns/promises";
 import net from "node:net";
 import { env } from "./env.js";
 import { runAgentScan } from "./agent.js";
+import { runExploitAgent } from "./exploit.js";
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 import { nmapScan } from "./nmapScan.js";
@@ -718,6 +719,66 @@ function buildAgentWhitelist(targetAddress: string) {
   ])];
 }
 
+function shouldAutoExploit() {
+  return env.EXPLOIT_ENABLED && Boolean(env.GEMINI_API_KEY);
+}
+
+function buildExploitOpts() {
+  if (!env.GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is required when EXPLOIT_ENABLED=true");
+  }
+  return {
+    geminiApiKey: env.GEMINI_API_KEY,
+    geminiModel: env.GEMINI_MODEL,
+    maxSteps: env.EXPLOIT_MAX_STEPS,
+    cmdTimeoutMs: env.EXPLOIT_CMD_TIMEOUT_MS,
+    installTimeoutMs: env.EXPLOIT_INSTALL_TIMEOUT_MS,
+    whitelist: [] as string[],
+    wordlistPath: env.HYDRA_PASSLIST,
+    lhostAllowList: env.EXPLOIT_LHOST_ALLOWLIST
+      ? env.EXPLOIT_LHOST_ALLOWLIST.split(",").map((s) => s.trim()).filter(Boolean)
+      : undefined
+  };
+}
+
+async function targetHasServices(scanRunId: string) {
+  return await withClient(async (c) => {
+    const res = await c.query(
+      `select 1
+       from services s
+       join scan_runs sr on sr.target_id = s.target_id
+       where sr.id = $1
+       limit 1`,
+      [scanRunId]
+    );
+    return res.rows.length > 0;
+  });
+}
+
+async function enqueueExploitJob(scanRunId: string) {
+  await withClient(async (c) => {
+    await c.query(
+      `insert into jobs (type, status, payload)
+       values ('exploit', 'queued', $1::jsonb)`,
+      [JSON.stringify({ scanRunId })]
+    );
+  });
+}
+
+async function maybeEnqueueExploit(scanRunId: string) {
+  if (!shouldAutoExploit()) return;
+  try {
+    if (!(await targetHasServices(scanRunId))) {
+      await writeAuditEvent("exploit.auto.skipped", { scanRunId, reason: "no services" });
+      return;
+    }
+    await enqueueExploitJob(scanRunId);
+    await writeAuditEvent("exploit.auto.queued", { scanRunId });
+  } catch (e: any) {
+    console.error("[worker] failed to enqueue exploit job", e?.message ?? e);
+  }
+}
+
 async function main() {
   await ensurePhase1Tables();
   await getPipelineConfig();
@@ -750,6 +811,23 @@ async function main() {
         } else {
           await runScan(scanRunId);
         }
+        await maybeEnqueueExploit(scanRunId);
+      } else if (job.type === "exploit") {
+        const scanRunId = job.payload.scanRunId as string;
+        const runCtx = await withClient(async (c) => {
+          const res = await c.query(
+            `select t.address as target_address
+             from scan_runs sr
+             join targets t on t.id = sr.target_id
+             where sr.id = $1`,
+            [scanRunId]
+          );
+          return res.rows[0] as { target_address: string } | undefined;
+        });
+        if (!runCtx) throw new Error(`exploit job: scan run ${scanRunId} not found`);
+        const exploitOpts = buildExploitOpts();
+        exploitOpts.whitelist = buildAgentWhitelist(runCtx.target_address);
+        await runExploitAgent(scanRunId, exploitOpts);
       } else {
         throw new Error(`Unknown job type: ${job.type}`);
       }

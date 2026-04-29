@@ -267,3 +267,11 @@ export async function listReconAssets(targetId: string) {
   return http(`/api/recon-assets?${qp.toString()}`, undefined, z.array(ReconAssetSchema));
 }
 
+export async function createExploitRun(input: { scanRunId?: string; targetId?: string; requestedBy?: string }) {
+  return http(
+    "/api/exploit-runs",
+    { method: "POST", body: JSON.stringify(input) },
+    z.object({ scanRunId: z.string().uuid(), status: z.string() })
+  );
+}
+

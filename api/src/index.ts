@@ -458,6 +458,67 @@ app.post("/api/scans/:id/cancel", async (req, reply) => {
   return reply.send({ ok: true });
 });
 
+app.post("/api/exploit-runs", async (req, reply) => {
+  const body = z
+    .object({
+      scanRunId: z.string().uuid().optional(),
+      targetId: z.string().uuid().optional(),
+      requestedBy: z.string().optional()
+    })
+    .parse(req.body ?? {});
+
+  if (!body.scanRunId && !body.targetId) {
+    return reply.code(400).send({ error: "Provide scanRunId or targetId" });
+  }
+
+  const scanRunId = await withClient(async (c) => {
+    if (body.scanRunId) {
+      const res = await c.query(`select id from scan_runs where id = $1`, [body.scanRunId]);
+      if (res.rows[0]) return res.rows[0].id as string;
+      return null;
+    }
+    const res = await c.query(
+      `select id from scan_runs
+       where target_id = $1 and status = 'succeeded'
+       order by finished_at desc nulls last, created_at desc
+       limit 1`,
+      [body.targetId]
+    );
+    return (res.rows[0]?.id as string | undefined) ?? null;
+  });
+
+  if (!scanRunId) {
+    return reply
+      .code(404)
+      .send({ error: "No matching succeeded scan run found. Run a scan first or pass an explicit scanRunId." });
+  }
+
+  const target = await withClient(async (c) => {
+    const res = await c.query(
+      `select t.address from scan_runs sr join targets t on t.id = sr.target_id where sr.id = $1`,
+      [scanRunId]
+    );
+    return res.rows[0] as { address: string } | undefined;
+  });
+
+  await withClient(async (c) => {
+    await c.query(
+      `insert into jobs (type, status, payload)
+       values ('exploit', 'queued', $1::jsonb)`,
+      [JSON.stringify({ scanRunId, requestedBy: body.requestedBy ?? "operator" })]
+    );
+  });
+
+  await writeAuditEvent(
+    "exploit.queued",
+    { scanRunId, requestedBy: body.requestedBy ?? "operator" },
+    target?.address,
+    "operator"
+  );
+
+  return reply.code(202).send({ scanRunId, status: "queued" });
+});
+
 app.get("/api/scans", async () => {
   const rows = await withClient(async (c) => {
     const res = await c.query(
