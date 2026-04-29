@@ -10,7 +10,10 @@ WORKDIR /app
 #
 RUN rm -rf /var/lib/apt/lists/* \
   && apt-get clean \
-  && apt-get update -o Acquire::Retries=3 \
+  && apt-get update \
+       -o Acquire::Retries=6 \
+       -o Acquire::http::Timeout=30 \
+       -o Acquire::https::Timeout=30 \
   \
   # ── Runtime essentials ────────────────────────────────────────────────────
   && apt-get install -y --no-install-recommends --fix-missing \
@@ -30,7 +33,6 @@ RUN rm -rf /var/lib/apt/lists/* \
   # ── Network scanning ──────────────────────────────────────────────────────
   && apt-get install -y --no-install-recommends --fix-missing \
        nmap nmap-common \
-       masscan \
        netcat-openbsd \
        tcpdump \
        tshark wireshark-common \
@@ -38,6 +40,13 @@ RUN rm -rf /var/lib/apt/lists/* \
        proxychains4 \
        sshuttle \
        stunnel4 \
+  \
+  # masscan is useful but mirror-fetch is occasionally flaky; don't fail whole build on it.
+  && apt-get install -y --no-install-recommends --fix-missing masscan \
+       -o Acquire::Retries=6 \
+       -o Acquire::http::Timeout=30 \
+       -o Acquire::https::Timeout=30 \
+     || echo "Skipping masscan for this build (mirror issue); install later via install_tool if needed." \
   \
   # ── Credential attacks ────────────────────────────────────────────────────
   && apt-get install -y --no-install-recommends --fix-missing \
