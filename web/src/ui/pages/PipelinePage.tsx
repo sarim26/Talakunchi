@@ -37,7 +37,7 @@ type PipelinePhase = {
   controls: string[];
 };
 
-const PHASES: PipelinePhase[] = [
+const WORKFLOW_STAGES: PipelinePhase[] = [
   {
     id: 1,
     title: "Scoping & Configuration",
@@ -128,7 +128,7 @@ export function PipelinePage() {
     setDraftWordlists(pipelineQ.data.allowedWordlists.join("\n"));
   }, [pipelineQ.data]);
 
-  const phase = PHASES[activePhase];
+  const stage = WORKFLOW_STAGES[activePhase];
   const findings = findingsQ.data ?? [];
   const services = servicesQ.data ?? [];
   const runs = runsQ.data ?? [];
@@ -152,7 +152,7 @@ export function PipelinePage() {
         Offensive Pipeline
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        Structured six-phase workflow for scoped recon, scanning, exploitation, post-exploitation, and reporting.
+        Six workflow stages for scoped recon, scanning, exploitation, post-exploitation, and reporting.
       </Typography>
 
       <Card sx={{ mb: 2 }}>
@@ -189,16 +189,16 @@ export function PipelinePage() {
             variant="scrollable"
             scrollButtons="auto"
           >
-            {PHASES.map((p) => (
-              <Tab key={p.id} label={`Phase ${p.id}`} />
+            {WORKFLOW_STAGES.map((p) => (
+              <Tab key={p.id} label={`Stage ${p.id}`} />
             ))}
           </Tabs>
           <Divider sx={{ my: 2 }} />
 
-          {phase.id === 1 ? (
+          {stage.id === 1 ? (
             <Box sx={{ mb: 2 }}>
               <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                Phase 1 Runtime Controls
+                Workflow Runtime Controls
               </Typography>
               {config ? (
                 <Stack spacing={2}>
@@ -240,7 +240,7 @@ export function PipelinePage() {
                   </Stack>
                   <Box>
                     <Button variant="contained" onClick={saveConfig} disabled={saveM.isPending}>
-                      Save Phase 1 Configuration
+                      Save Workflow Configuration
                     </Button>
                   </Box>
                 </Stack>
@@ -252,7 +252,7 @@ export function PipelinePage() {
             </Box>
           ) : null}
 
-          {phase.id === 4 ? (() => {
+          {stage.id === 4 ? (() => {
             const targetRuns = runs.filter((r) => !targetId || r.targetId === targetId);
             const succeeded = targetRuns.filter((r) => r.status === "succeeded");
             const latestSucceeded = succeeded[0];
@@ -348,7 +348,7 @@ export function PipelinePage() {
             );
           })() : null}
 
-          {phase.id === 2 ? (
+          {stage.id === 2 ? (
             <Box sx={{ mb: 2 }}>
               <Typography variant="subtitle2" sx={{ mb: 1 }}>
                 Reconnaissance Assets
@@ -372,7 +372,7 @@ export function PipelinePage() {
                     ))
                   ) : (
                     <Typography variant="body2" color="text.secondary">
-                      No recon assets yet. Run a scan to populate this phase.
+                      No recon assets yet. Run a scan to populate this stage.
                     </Typography>
                   )}
                 </Stack>
@@ -380,9 +380,9 @@ export function PipelinePage() {
             </Box>
           ) : null}
 
-          <Typography variant="h6">{`Phase ${phase.id} - ${phase.title}`}</Typography>
+          <Typography variant="h6">{`Stage ${stage.id} - ${stage.title}`}</Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, mb: 2 }}>
-            {phase.goal}
+            {stage.goal}
           </Typography>
 
           <Box
@@ -398,7 +398,7 @@ export function PipelinePage() {
                   Modules
                 </Typography>
                 <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-                  {phase.modules.map((m) => (
+                  {stage.modules.map((m) => (
                     <Chip key={m} label={m} size="small" />
                   ))}
                 </Stack>
@@ -411,7 +411,7 @@ export function PipelinePage() {
                   Controls & Gates
                 </Typography>
                 <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-                  {phase.controls.map((c) => (
+                  {stage.controls.map((c) => (
                     <Chip key={c} label={c} size="small" color="primary" variant="outlined" />
                   ))}
                 </Stack>
@@ -419,19 +419,7 @@ export function PipelinePage() {
             </Card>
           </Box>
 
-          <Divider sx={{ my: 2 }} />
-          <Typography variant="subtitle2" sx={{ mb: 1 }}>
-            Phase Segment View
-          </Typography>
-          <Stack direction={{ xs: "column", md: "row" }} spacing={1}>
-            <Chip label="Open Ports" variant="outlined" />
-            <Chip label="Weak Passwords" variant="outlined" />
-            <Chip label="Exploit Suggestions" variant="outlined" />
-            <Chip label="Post-Exploitation Intel" variant="outlined" />
-            <Chip label="Reporting & Ticket Sync" variant="outlined" />
-          </Stack>
-
-          {phase.id === 1 ? (
+          {stage.id === 1 ? (
             <>
               <Divider sx={{ my: 2 }} />
               <Typography variant="subtitle2" sx={{ mb: 1 }}>

@@ -160,28 +160,6 @@ export async function listServices(targetId: string) {
   return http(`/api/services?${qp.toString()}`, undefined, z.array(ServiceSchema));
 }
 
-export async function explainSurface(targetId: string) {
-  return http(
-    `/api/targets/${targetId}/explain-surface`,
-    { method: "POST", body: "{}" },
-    z.object({
-      mode: z.string(),
-      summary: z.string(),
-      keyRisks: z.array(z.string()),
-      topExposures: z.array(
-        z.object({
-          port: z.number(),
-          protocol: z.string(),
-          risk: z.enum(["low", "medium", "high", "critical"]),
-          reason: z.string()
-        })
-      ),
-      remediation: z.array(z.string()),
-      verification: z.array(z.string())
-    })
-  );
-}
-
 export async function updateFinding(id: string, input: { status?: string; severity?: string }) {
   return http(
     `/api/findings/${id}`,

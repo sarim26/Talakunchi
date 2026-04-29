@@ -64,12 +64,12 @@ services:
       AGENT_MAX_STEPS: "${AGENT_MAX_STEPS:-25}"
       AGENT_CMD_TIMEOUT_MS: "${AGENT_CMD_TIMEOUT_MS:-120000}"
       AGENT_SCOPE: "${AGENT_SCOPE:-}"
-      # Phase 4 (Hydra) - enable only when wordlists + hydra are available in the container
+      # Optional deterministic credential checks during scan stage (separate from AI exploitation stage)
       HYDRA_ENABLED: "${HYDRA_ENABLED:-false}"
       # Hydra reads wordlists inside the container from /wordlists.
       # We mount ./.cache/wordlists -> /wordlists below.
-      HYDRA_USERLIST: "/wordlists/userlist.txt"
-      HYDRA_PASSLIST: "/wordlists/rockyou.txt"
+      HYDRA_USERLIST: "${HYDRA_USERLIST:-/wordlists/cirt-default-usernames.txt}"
+      HYDRA_PASSLIST: "${HYDRA_PASSLIST:-/wordlists/rockyou.txt}"
       HYDRA_THREADS: "${HYDRA_THREADS:-10}"
       HYDRA_STOP_ON_FIRST_FIND: "${HYDRA_STOP_ON_FIRST_FIND:-false}"
       HYDRA_TIMEOUT_MS: "${HYDRA_TIMEOUT_MS:-600000}"

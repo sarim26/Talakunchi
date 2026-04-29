@@ -5,7 +5,7 @@ import { env } from "./env.js";
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 import { CreateScanSchema, CreateTargetSchema, PipelineConfigSchema, UpdateFindingSchema } from "./schemas.js";
-import { explainWithGemini, summarizeSurfaceWithGemini } from "./llm/gemini.js";
+import { explainWithGemini } from "./llm/gemini.js";
 
 const app = Fastify({ logger: true });
 
@@ -18,7 +18,7 @@ const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   allowedWordlists: []
 };
 
-async function ensurePhase1Tables() {
+async function ensureWorkflowTables() {
   await withClient(async (c) => {
     await c.query(`
       create table if not exists pipeline_configs (
@@ -328,57 +328,6 @@ app.get("/api/recon-assets", async (req) => {
   }));
 });
 
-app.post("/api/targets/:id/explain-surface", async (req, reply) => {
-  const targetId = z.string().uuid().parse((req.params as any).id);
-  const target = await withClient(async (c) => {
-    const tRes = await c.query(`select id, name, address from targets where id=$1`, [targetId]);
-    return tRes.rows[0];
-  });
-  if (!target) return reply.code(404).send({ error: "Target not found" });
-
-  const services = await withClient(async (c) => {
-    const sRes = await c.query(
-      `select port, protocol, service_name, product, version
-       from services
-       where target_id=$1
-       order by port asc`,
-      [targetId]
-    );
-    return sRes.rows;
-  });
-
-  const input = {
-    targetName: target.name as string,
-    targetAddress: target.address as string,
-    services: services.map((s: any) => ({
-      port: Number(s.port),
-      protocol: String(s.protocol),
-      serviceName: s.service_name ?? null,
-      product: s.product ?? null,
-      version: s.version ?? null
-    }))
-  };
-
-  if (env.AI_MODE !== "gemini") {
-    return reply.send({
-      mode: env.AI_MODE,
-      summary: `Found ${input.services.length} open services on ${input.targetName} (${input.targetAddress}).`,
-      keyRisks: [],
-      topExposures: [],
-      remediation: ["Restrict exposure to required subnets only.", "Patch/harden services."],
-      verification: ["Re-run the scan and confirm exposure is reduced."]
-    });
-  }
-  if (!env.GEMINI_API_KEY) return reply.code(400).send({ error: "GEMINI_API_KEY is not set" });
-
-  const out = await summarizeSurfaceWithGemini({
-    apiKey: env.GEMINI_API_KEY,
-    model: env.GEMINI_MODEL,
-    input
-  });
-  return reply.send({ mode: "gemini", ...out });
-});
-
 app.post("/api/scans", async (req, reply) => {
   const body = CreateScanSchema.parse(req.body);
   const target = await withClient(async (c) => {
@@ -440,7 +389,7 @@ async function ensureCancelColumn() {
 }
 
 await ensureCancelColumn();
-await ensurePhase1Tables();
+await ensureWorkflowTables();
 await getPipelineConfig();
 
 app.post("/api/scans/:id/cancel", async (req, reply) => {

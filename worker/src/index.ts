@@ -29,19 +29,30 @@ async function ensureCancelColumn() {
   });
 }
 
-async function claimNextJob() {
+async function claimNextJob(config: PipelineConfig) {
   return await withClient(async (c) => {
     await c.query("begin");
     try {
+      const limit = Math.max(1, Number(config.maxConcurrentScans) || 1);
+      const runningScansRes = await c.query(
+        `select count(*)::int as n
+         from scan_runs
+         where status = 'running'`
+      );
+      const runningScans = Number(runningScansRes.rows[0]?.n ?? 0);
+      const canStartScan = runningScans < limit;
+
       const res = await c.query(
         `
         select id, type, payload
         from jobs
         where status = 'queued'
+          and ($1::boolean or type <> 'scan')
         order by created_at asc
         for update skip locked
         limit 1
-        `
+        `,
+        [canStartScan]
       );
       const job = res.rows[0];
       if (!job) {
@@ -145,7 +156,7 @@ async function rebuildNeo4jForTarget(targetId: string) {
   });
 }
 
-async function ensurePhase1Tables() {
+async function ensureWorkflowTables() {
   await withClient(async (c) => {
     await c.query(`
       create table if not exists pipeline_configs (
@@ -694,13 +705,15 @@ function buildHydraCredSource(): HydraCredSource | null {
 }
 
 function shouldUseAgentMode() {
+  if (!env.GEMINI_API_KEY) return false;
   return env.AGENT_ENABLED || env.SCAN_MODE === "agent";
 }
 
-function buildAgentOpts() {
+function buildAgentOpts(config: PipelineConfig) {
   if (!env.GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY is required when AGENT_ENABLED=true or SCAN_MODE=agent");
   }
+  const preferredWordlist = config.allowedWordlists.find((w) => w.trim().length > 0);
 
   return {
     geminiApiKey: env.GEMINI_API_KEY,
@@ -708,7 +721,7 @@ function buildAgentOpts() {
     maxSteps: env.AGENT_MAX_STEPS,
     cmdTimeoutMs: env.AGENT_CMD_TIMEOUT_MS,
     whitelist: [] as string[],
-    wordlistPath: env.HYDRA_PASSLIST
+    wordlistPath: preferredWordlist ?? env.HYDRA_PASSLIST
   };
 }
 
@@ -723,10 +736,11 @@ function shouldAutoExploit() {
   return env.EXPLOIT_ENABLED && Boolean(env.GEMINI_API_KEY);
 }
 
-function buildExploitOpts() {
+function buildExploitOpts(config: PipelineConfig) {
   if (!env.GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY is required when EXPLOIT_ENABLED=true");
   }
+  const preferredWordlist = config.allowedWordlists.find((w) => w.trim().length > 0);
   return {
     geminiApiKey: env.GEMINI_API_KEY,
     geminiModel: env.GEMINI_MODEL,
@@ -734,7 +748,7 @@ function buildExploitOpts() {
     cmdTimeoutMs: env.EXPLOIT_CMD_TIMEOUT_MS,
     installTimeoutMs: env.EXPLOIT_INSTALL_TIMEOUT_MS,
     whitelist: [] as string[],
-    wordlistPath: env.HYDRA_PASSLIST,
+    wordlistPath: preferredWordlist ?? env.HYDRA_PASSLIST,
     lhostAllowList: env.EXPLOIT_LHOST_ALLOWLIST
       ? env.EXPLOIT_LHOST_ALLOWLIST.split(",").map((s) => s.trim()).filter(Boolean)
       : undefined
@@ -779,13 +793,26 @@ async function maybeEnqueueExploit(scanRunId: string) {
   }
 }
 
+let lastScanStartAtMs = 0;
+async function enforceScanRate(config: PipelineConfig) {
+  const rpm = Math.max(1, Number(config.requestRatePerMinute) || 1);
+  const minGapMs = Math.ceil(60_000 / rpm);
+  const waitMs = minGapMs - (Date.now() - lastScanStartAtMs);
+  if (waitMs > 0) await sleep(waitMs);
+  lastScanStartAtMs = Date.now();
+}
+
 async function main() {
-  await ensurePhase1Tables();
+  await ensureWorkflowTables();
   await getPipelineConfig();
   console.log(`[worker] starting (mode=${env.SCAN_MODE})`);
+  if ((env.AGENT_ENABLED || env.SCAN_MODE === "agent") && !env.GEMINI_API_KEY) {
+    console.warn("[worker] AGENT mode requested but GEMINI_API_KEY is missing; falling back to deterministic scan mode.");
+  }
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const job = await claimNextJob();
+    const pipelineConfig = await getPipelineConfig();
+    const job = await claimNextJob(pipelineConfig);
     if (!job) {
       await sleep(env.POLL_INTERVAL_MS);
       continue;
@@ -794,6 +821,7 @@ async function main() {
     try {
       if (job.type === "scan") {
         const scanRunId = job.payload.scanRunId as string;
+        await enforceScanRate(pipelineConfig);
         if (shouldUseAgentMode()) {
           const runCtx = await withClient(async (c) => {
             const res = await c.query(
@@ -805,7 +833,7 @@ async function main() {
             );
             return res.rows[0] as { target_address: string };
           });
-          const agentOpts = buildAgentOpts();
+          const agentOpts = buildAgentOpts(pipelineConfig);
           agentOpts.whitelist = buildAgentWhitelist(runCtx.target_address);
           await runAgentScan(scanRunId, agentOpts);
         } else {
@@ -825,7 +853,7 @@ async function main() {
           return res.rows[0] as { target_address: string } | undefined;
         });
         if (!runCtx) throw new Error(`exploit job: scan run ${scanRunId} not found`);
-        const exploitOpts = buildExploitOpts();
+        const exploitOpts = buildExploitOpts(pipelineConfig);
         exploitOpts.whitelist = buildAgentWhitelist(runCtx.target_address);
         await runExploitAgent(scanRunId, exploitOpts);
       } else {
