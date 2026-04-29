@@ -88,8 +88,6 @@ export type Service = z.infer<typeof ServiceSchema>;
 export const PipelineConfigSchema = z.object({
   maxConcurrentScans: z.number(),
   requestRatePerMinute: z.number(),
-  safeMode: z.boolean(),
-  requireHumanApproval: z.boolean(),
   auditEnabled: z.boolean(),
   allowedWordlists: z.array(z.string())
 });

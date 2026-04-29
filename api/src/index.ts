@@ -14,8 +14,6 @@ type PipelineConfig = z.infer<typeof PipelineConfigSchema>;
 const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   maxConcurrentScans: 2,
   requestRatePerMinute: 120,
-  safeMode: true,
-  requireHumanApproval: false,
   auditEnabled: true,
   allowedWordlists: []
 };

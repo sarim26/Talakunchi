@@ -42,7 +42,7 @@ const PHASES: PipelinePhase[] = [
     title: "Scoping & Configuration",
     goal: "Define rates, credentials source, and engagement guardrails.",
     modules: ["scope validator", "audit logger", "rate limiter", "target policy"],
-    controls: ["hard abort out-of-scope", "audit log enabled", "safe profile defaults"]
+    controls: ["hard abort out-of-scope", "audit log enabled"]
   },
   {
     id: 2,
@@ -217,18 +217,13 @@ export function PipelinePage() {
                     onChange={(e) => setDraftWordlists(e.target.value)}
                     fullWidth
                   />
+
                   <Stack direction={{ xs: "column", md: "row" }} spacing={2}>
                     <Stack direction="row" spacing={1} alignItems="center">
-                      <Switch checked={config.safeMode} onChange={(_e, checked) => setConfig({ ...config, safeMode: checked })} />
-                      <Typography variant="body2">Safe mode</Typography>
                     </Stack>
                     <Stack direction="row" spacing={1} alignItems="center">
-                      <Switch
-                        checked={config.requireHumanApproval}
-                        onChange={(_e, checked) => setConfig({ ...config, requireHumanApproval: checked })}
-                      />
-                      <Typography variant="body2">Require human approval</Typography>
                     </Stack>
+
                     <Stack direction="row" spacing={1} alignItems="center">
                       <Switch checked={config.auditEnabled} onChange={(_e, checked) => setConfig({ ...config, auditEnabled: checked })} />
                       <Typography variant="body2">Audit logging</Typography>

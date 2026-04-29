@@ -32,8 +32,6 @@ export const UpdateFindingSchema = z.object({
 export const PipelineConfigSchema = z.object({
   maxConcurrentScans: z.coerce.number().int().positive().max(100).default(2),
   requestRatePerMinute: z.coerce.number().int().positive().max(5000).default(120),
-  safeMode: z.coerce.boolean().default(true),
-  requireHumanApproval: z.coerce.boolean().default(false),
   auditEnabled: z.coerce.boolean().default(true),
   allowedWordlists: z.array(z.string()).default([])
 });
