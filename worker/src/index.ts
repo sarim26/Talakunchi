@@ -191,6 +191,22 @@ async function ensureWorkflowTables() {
       )
     `);
     await c.query(`create index if not exists idx_recon_assets_target on recon_assets(target_id)`);
+
+    await c.query(`
+      create table if not exists command_approvals (
+        id uuid primary key default uuid_generate_v4(),
+        scan_run_id uuid not null references scan_runs(id) on delete cascade,
+        command text not null,
+        reasoning text,
+        impact text not null default 'low',
+        status text not null default 'pending', -- pending | approved | rejected
+        decided_by text,
+        created_at timestamptz not null default now(),
+        decided_at timestamptz
+      )
+    `);
+    await c.query(`create index if not exists idx_command_approvals_scan_run_id on command_approvals(scan_run_id)`);
+    await c.query(`create index if not exists idx_command_approvals_status on command_approvals(status)`);
   });
 }
 

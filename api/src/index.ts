@@ -53,6 +53,22 @@ async function ensureWorkflowTables() {
       )
     `);
     await c.query(`create index if not exists idx_recon_assets_target on recon_assets(target_id)`);
+
+    await c.query(`
+      create table if not exists command_approvals (
+        id uuid primary key default uuid_generate_v4(),
+        scan_run_id uuid not null references scan_runs(id) on delete cascade,
+        command text not null,
+        reasoning text,
+        impact text not null default 'low',
+        status text not null default 'pending', -- pending | approved | rejected
+        decided_by text,
+        created_at timestamptz not null default now(),
+        decided_at timestamptz
+      )
+    `);
+    await c.query(`create index if not exists idx_command_approvals_scan_run_id on command_approvals(scan_run_id)`);
+    await c.query(`create index if not exists idx_command_approvals_status on command_approvals(status)`);
   });
 }
 
@@ -466,6 +482,78 @@ app.post("/api/exploit-runs", async (req, reply) => {
   );
 
   return reply.code(202).send({ scanRunId, status: "queued" });
+});
+
+app.get("/api/command-approvals", async (req, reply) => {
+  const q = req.query as any;
+  const scanRunId = q.scanRunId ? z.string().uuid().parse(q.scanRunId) : undefined;
+  if (!scanRunId) return [];
+
+  const rows = await withClient(async (c) => {
+    const res = await c.query(
+      `
+      select id,
+             scan_run_id,
+             command,
+             reasoning,
+             impact,
+             status,
+             created_at,
+             decided_at,
+             decided_by
+        from command_approvals
+       where scan_run_id = $1
+         and status = 'pending'
+       order by created_at asc
+       limit 50
+      `,
+      [scanRunId]
+    );
+    return res.rows;
+  });
+
+  return rows.map((r) => ({
+    id: r.id,
+    scanRunId: r.scan_run_id,
+    command: r.command,
+    reasoning: r.reasoning ?? "",
+    impact: r.impact ?? "low",
+    status: r.status,
+    createdAt: r.created_at,
+    decidedAt: r.decided_at ?? null,
+    decidedBy: r.decided_by ?? null
+  }));
+});
+
+app.patch("/api/command-approvals/:id", async (req, reply) => {
+  const approvalId = z.string().uuid().parse((req.params as any).id);
+  const body = z.object({ decision: z.enum(["approved", "rejected"]), note: z.string().optional() }).parse(req.body ?? {});
+
+  const updated = await withClient(async (c) => {
+    const res = await c.query(
+      `
+      update command_approvals
+         set status = $2,
+             decided_by = $3,
+             decided_at = now()
+       where id = $1
+      returning id, status
+      `,
+      [approvalId, body.decision, "operator"]
+    );
+    return res.rows[0] as { id: string; status: string } | undefined;
+  });
+
+  if (!updated) return reply.code(404).send({ error: "Approval not found" });
+
+  await writeAuditEvent(
+    "approval.decision",
+    { approvalId, decision: body.decision, note: body.note ?? null },
+    undefined,
+    "operator"
+  );
+
+  return reply.send({ id: updated.id, status: updated.status });
 });
 
 app.get("/api/scans", async () => {

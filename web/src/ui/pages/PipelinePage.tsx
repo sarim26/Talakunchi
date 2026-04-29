@@ -21,11 +21,13 @@ import {
   createExploitRun,
   getPipelineConfig,
   listAuditEvents,
+  listCommandApprovals,
   listFindings,
   listReconAssets,
   listScans,
   listServices,
   listTargets,
+  decideCommandApproval,
   updatePipelineConfig
 } from "../../lib/api";
 
@@ -104,6 +106,20 @@ export function PipelinePage() {
   });
   const pipelineQ = useQuery({ queryKey: ["pipeline-config"], queryFn: getPipelineConfig, refetchInterval: 5000 });
   const auditQ = useQuery({ queryKey: ["audit-events"], queryFn: () => listAuditEvents(12), refetchInterval: 5000 });
+
+  const latestSucceededId = (() => {
+    const rs = runsQ.data ?? [];
+    const targetRuns = rs.filter((r) => !targetId || r.targetId === targetId);
+    const succeeded = targetRuns.filter((r) => r.status === "succeeded");
+    return succeeded[0]?.id ?? null;
+  })();
+
+  const approvalsQ = useQuery({
+    queryKey: ["command-approvals", latestSucceededId ?? ""],
+    queryFn: () => listCommandApprovals(latestSucceededId as string),
+    enabled: Boolean(latestSucceededId),
+    refetchInterval: 2000
+  });
   const saveM = useMutation({
     mutationFn: updatePipelineConfig,
     onSuccess: async (updated) => {
@@ -118,6 +134,14 @@ export function PipelinePage() {
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ["audit-events"] });
       await qc.invalidateQueries({ queryKey: ["runs"] });
+    }
+  });
+
+  const decideApprovalM = useMutation({
+    mutationFn: (input: { approvalId: string; decision: "approved" | "rejected" }) =>
+      decideCommandApproval(input.approvalId, { decision: input.decision }),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["command-approvals"] });
     }
   });
 
@@ -259,6 +283,7 @@ export function PipelinePage() {
             const exploitEvents = (auditQ.data ?? []).filter((e) =>
               e.action.startsWith("agent.exploit.") || e.action.startsWith("exploit.")
             );
+            const pendingApprovals = approvalsQ.data ?? [];
             return (
               <Box sx={{ mb: 2 }}>
                 <Typography variant="subtitle2" sx={{ mb: 1 }}>
@@ -309,6 +334,60 @@ export function PipelinePage() {
                       page for the "AI Exploitation" step log.
                     </Alert>
                   ) : null}
+
+                  <Divider />
+                  <Typography variant="subtitle2">Pending High-Impact Exploit Commands</Typography>
+                  {approvalsQ.isError ? (
+                    <Alert severity="error">Failed to load pending approvals.</Alert>
+                  ) : pendingApprovals.length === 0 ? (
+                    <Typography variant="body2" color="text.secondary">
+                      No high-impact msfconsole exploit commands pending approval.
+                    </Typography>
+                  ) : (
+                    <Stack spacing={1}>
+                      {pendingApprovals.slice(0, 10).map((a) => (
+                        <Box
+                          key={a.id}
+                          sx={{ p: 1, border: "1px solid", borderColor: "divider", borderRadius: 1 }}
+                        >
+                          <Typography variant="body2" sx={{ mb: 0.5 }}>
+                            {a.impact.toUpperCase()} • {a.status}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                            Command:
+                          </Typography>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            component="pre"
+                            sx={{ m: 0, mt: 0.5, whiteSpace: "pre-wrap", wordBreak: "break-all" }}
+                          >
+                            {a.command}
+                          </Typography>
+                          <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
+                            <Button
+                              size="small"
+                              variant="contained"
+                              color="success"
+                              disabled={decideApprovalM.isPending}
+                              onClick={() => decideApprovalM.mutate({ approvalId: a.id, decision: "approved" })}
+                            >
+                              Approve
+                            </Button>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              color="error"
+                              disabled={decideApprovalM.isPending}
+                              onClick={() => decideApprovalM.mutate({ approvalId: a.id, decision: "rejected" })}
+                            >
+                              Reject
+                            </Button>
+                          </Stack>
+                        </Box>
+                      ))}
+                    </Stack>
+                  )}
 
                   <Divider />
                   <Typography variant="subtitle2">Recent Exploitation Audit Events</Typography>

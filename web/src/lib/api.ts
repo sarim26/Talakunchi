@@ -103,6 +103,19 @@ export const AuditEventSchema = z.object({
 });
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
 
+export const CommandApprovalSchema = z.object({
+  id: z.string().uuid(),
+  scanRunId: z.string().uuid(),
+  command: z.string(),
+  reasoning: z.string(),
+  impact: z.string(),
+  status: z.string(),
+  createdAt: z.any(),
+  decidedAt: z.any().nullable().optional(),
+  decidedBy: z.string().nullable().optional()
+});
+export type CommandApproval = z.infer<typeof CommandApprovalSchema>;
+
 export const ReconAssetSchema = z.object({
   id: z.string().uuid(),
   targetId: z.string().uuid(),
@@ -237,6 +250,20 @@ export async function updatePipelineConfig(input: PipelineConfig) {
 
 export async function listAuditEvents(limit = 50) {
   return http(`/api/audit-events?limit=${limit}`, undefined, z.array(AuditEventSchema));
+}
+
+export async function listCommandApprovals(scanRunId: string) {
+  const qp = new URLSearchParams();
+  qp.set("scanRunId", scanRunId);
+  return http(`/api/command-approvals?${qp.toString()}`, undefined, z.array(CommandApprovalSchema));
+}
+
+export async function decideCommandApproval(approvalId: string, input: { decision: "approved" | "rejected"; note?: string }) {
+  return http(
+    `/api/command-approvals/${approvalId}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+    z.object({ id: z.string().uuid(), status: z.string() })
+  );
 }
 
 export async function listReconAssets(targetId: string) {

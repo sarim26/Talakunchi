@@ -58,15 +58,21 @@ RUN rm -rf /var/lib/apt/lists/* \
        crunch \
        cewl \
   \
-  # ── Web exploitation ──────────────────────────────────────────────────────
-  && apt-get install -y --no-install-recommends --fix-missing \
-       nikto \
+   # ── Web exploitation ──────────────────────────────────────────────────────
+   && apt-get install -y --no-install-recommends --fix-missing \
        sqlmap \
        gobuster \
        ffuf \
        dirb \
        wfuzz \
        whatweb \
+  \
+  && apt-get install -y --no-install-recommends --fix-missing \
+       -o Acquire::Retries=6 \
+       -o Acquire::http::Timeout=30 \
+       -o Acquire::https::Timeout=30 \
+       nikto \
+     || echo "Skipping nikto for this build (package not found / mirror issue)." \
   \
   # ── Enumeration / SMB / LDAP / SNMP ──────────────────────────────────────
   && apt-get install -y --no-install-recommends --fix-missing \

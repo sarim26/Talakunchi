@@ -122,3 +122,18 @@ create index if not exists idx_findings_target on findings(target_id);
 create index if not exists idx_audit_events_created_at on audit_events(created_at desc);
 create index if not exists idx_recon_assets_target on recon_assets(target_id);
 
+-- High-impact command approvals (operator gate for dangerous exploit steps)
+create table if not exists command_approvals (
+  id uuid primary key default uuid_generate_v4(),
+  scan_run_id uuid not null references scan_runs(id) on delete cascade,
+  command text not null,
+  reasoning text,
+  impact text not null default 'low',
+  status text not null default 'pending', -- pending | approved | rejected
+  decided_by text,
+  created_at timestamptz not null default now(),
+  decided_at timestamptz
+);
+create index if not exists idx_command_approvals_scan_run_id on command_approvals(scan_run_id);
+create index if not exists idx_command_approvals_status on command_approvals(status);
+
