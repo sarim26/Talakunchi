@@ -2,22 +2,31 @@ FROM node:20-bookworm-slim
 
 WORKDIR /app
 
-# Prevent interactive apt prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
-# ── System deps + stable pentest core ────────────────────────────────────────
-# Keep only strong/stable tools here.
-# Fragile tools are installed separately with fallback logic.
+# ── Switch to a stable mirror BEFORE anything else ───────────────────────────
+# The default deb.debian.org is a CDN redirect that can serve mid-sync mirrors.
+# ftp.us.debian.org is a direct, stable mirror — avoids hash mismatch errors.
 #
-RUN rm -rf /var/lib/apt/lists/* \
-  && apt-get clean \
-  && apt-get update \
-      -o Acquire::Retries=6 \
-      -o Acquire::http::Timeout=30 \
-      -o Acquire::https::Timeout=30 \
-\
-# ── Runtime essentials ───────────────────────────────────────────────────────
-  && apt-get install -y --no-install-recommends --fix-missing \
+RUN echo "deb http://ftp.us.debian.org/debian bookworm main" > /etc/apt/sources.list \
+ && echo "deb http://security.debian.org/debian-security bookworm-security main" >> /etc/apt/sources.list \
+ && echo "deb http://ftp.us.debian.org/debian bookworm-updates main" >> /etc/apt/sources.list
+
+# ── Install perl FIRST and alone ─────────────────────────────────────────────
+# perl + libperl5.36 are the most commonly corrupted packages on bookworm
+# because they're large and frequently updated.
+# Isolating them means a retry here costs seconds, not 30 minutes.
+#
+RUN apt-get clean \
+ && rm -rf /var/lib/apt/lists/* \
+ && apt-get update -o Acquire::Retries=10 \
+ && apt-get install -y --no-install-recommends \
+      perl \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── Runtime essentials ────────────────────────────────────────────────────────
+RUN apt-get update -o Acquire::Retries=6 \
+ && apt-get install -y --no-install-recommends --fix-missing \
       ca-certificates \
       curl wget git \
       python3 python3-pip python3-venv \
@@ -30,9 +39,11 @@ RUN rm -rf /var/lib/apt/lists/* \
       jq xxd file \
       tar gzip zip unzip \
       procps \
-\
-# ── Core network tools ───────────────────────────────────────────────────────
-  && apt-get install -y --no-install-recommends --fix-missing \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── Core network tools ────────────────────────────────────────────────────────
+RUN apt-get update -o Acquire::Retries=6 \
+ && apt-get install -y --no-install-recommends --fix-missing \
       nmap \
       netcat-openbsd \
       tcpdump \
@@ -41,18 +52,22 @@ RUN rm -rf /var/lib/apt/lists/* \
       proxychains4 \
       sshuttle \
       stunnel4 \
-\
-# ── Web exploitation (stable only) ───────────────────────────────────────────
-  && apt-get install -y --no-install-recommends --fix-missing \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── Web exploitation ──────────────────────────────────────────────────────────
+RUN apt-get update -o Acquire::Retries=6 \
+ && apt-get install -y --no-install-recommends --fix-missing \
       sqlmap \
       gobuster \
       ffuf \
       dirb \
       wfuzz \
       whatweb \
-\
-# ── Credential attacks ───────────────────────────────────────────────────────
-  && apt-get install -y --no-install-recommends --fix-missing \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── Credential attacks ────────────────────────────────────────────────────────
+RUN apt-get update -o Acquire::Retries=6 \
+ && apt-get install -y --no-install-recommends --fix-missing \
       hydra \
       medusa \
       ncrack \
@@ -61,141 +76,114 @@ RUN rm -rf /var/lib/apt/lists/* \
       hashcat \
       crunch \
       cewl \
-\
-# ── SMB / LDAP / Enumeration ────────────────────────────────────────────────
-  && apt-get install -y --no-install-recommends --fix-missing \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── SMB / LDAP / Enumeration ──────────────────────────────────────────────────
+RUN apt-get update -o Acquire::Retries=6 \
+ && apt-get install -y --no-install-recommends --fix-missing \
       smbclient \
       enum4linux \
       ldap-utils \
       snmp \
       dnsrecon \
       dnsenum \
-\
-# ── Exploitation support ─────────────────────────────────────────────────────
-  && apt-get install -y --no-install-recommends --fix-missing \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── Exploitation support ──────────────────────────────────────────────────────
+RUN apt-get update -o Acquire::Retries=6 \
+ && apt-get install -y --no-install-recommends --fix-missing \
       python3-impacket \
       python3-scapy \
       python3-requests \
       python3-bs4 \
       python3-paramiko \
-\
-# ── Post exploitation basics ────────────────────────────────────────────────
-  && apt-get install -y --no-install-recommends --fix-missing \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── Post-exploitation basics ──────────────────────────────────────────────────
+RUN apt-get update -o Acquire::Retries=6 \
+ && apt-get install -y --no-install-recommends --fix-missing \
       gdb \
       ltrace \
       strace \
       binutils \
       fcrackzip \
       steghide \
-\
-# ── Cleanup ─────────────────────────────────────────────────────────────────
-  && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
-# ── Optional fragile packages (never break build) ───────────────────────────
+# ── Optional / fragile packages (never break the build) ──────────────────────
+# Each in its own RUN so a failure only invalidates that one layer on retry.
+#
+RUN apt-get update && apt-get install -y --no-install-recommends masscan      && rm -rf /var/lib/apt/lists/* || echo "[skip] masscan"
+RUN apt-get update && apt-get install -y --no-install-recommends nikto        && rm -rf /var/lib/apt/lists/* || echo "[skip] nikto"
+RUN apt-get update && apt-get install -y --no-install-recommends smbmap       && rm -rf /var/lib/apt/lists/* || echo "[skip] smbmap"
+RUN apt-get update && apt-get install -y --no-install-recommends bettercap    && rm -rf /var/lib/apt/lists/* || echo "[skip] bettercap"
+RUN apt-get update && apt-get install -y --no-install-recommends reaver       && rm -rf /var/lib/apt/lists/* || echo "[skip] reaver"
+RUN apt-get update && apt-get install -y --no-install-recommends onesixtyone  && rm -rf /var/lib/apt/lists/* || echo "[skip] onesixtyone"
+RUN apt-get update && apt-get install -y --no-install-recommends fierce       && rm -rf /var/lib/apt/lists/* || echo "[skip] fierce"
+RUN apt-get update && apt-get install -y --no-install-recommends binwalk      && rm -rf /var/lib/apt/lists/* || echo "[skip] binwalk"
+RUN apt-get update && apt-get install -y --no-install-recommends upx-ucl      && rm -rf /var/lib/apt/lists/* || echo "[skip] upx-ucl"
+RUN apt-get update && apt-get install -y --no-install-recommends aircrack-ng  && rm -rf /var/lib/apt/lists/* || echo "[skip] aircrack-ng"
+RUN apt-get update && apt-get install -y --no-install-recommends ettercap-common && rm -rf /var/lib/apt/lists/* || echo "[skip] ettercap"
+RUN apt-get update && apt-get install -y --no-install-recommends hashid       && rm -rf /var/lib/apt/lists/* || echo "[skip] hashid"
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends masscan \
- || echo "Skipping masscan"
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends nikto \
- || echo "Skipping nikto"
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends smbmap \
- || echo "Skipping smbmap"
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends bettercap \
- || echo "Skipping bettercap"
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends reaver \
- || echo "Skipping reaver"
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends onesixtyone \
- || echo "Skipping onesixtyone"
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends fierce \
- || echo "Skipping fierce"
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends binwalk \
- || echo "Skipping binwalk"
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends upx-ucl \
- || echo "Skipping upx-ucl"
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends aircrack-ng \
- || echo "Skipping aircrack-ng"
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ettercap-common \
- || echo "Skipping ettercap"
-
-# ── Python tools ────────────────────────────────────────────────────────────
-
+# ── Python tools ──────────────────────────────────────────────────────────────
 RUN pip3 install --break-system-packages --no-cache-dir \
-    impacket \
-    certipy-ad \
-    pypykatz \
-    ldapdomaindump \
-    mitmproxy \
-    scapy \
-    pwntools \
-    boofuzz \
-    arjun \
+      impacket \
+      certipy-ad \
+      pypykatz \
+      ldapdomaindump \
+      mitmproxy \
+      scapy \
+      pwntools \
+      boofuzz \
+      arjun \
  || true
 
-# crackmapexec often breaks depending on arch/version
-RUN pip3 install --break-system-packages --no-cache-dir crackmapexec \
- || echo "Skipping crackmapexec"
+RUN pip3 install --break-system-packages --no-cache-dir crackmapexec || echo "[skip] crackmapexec"
+RUN pip3 install --break-system-packages --no-cache-dir bloodhound   || echo "[skip] bloodhound"
+RUN pip3 install --break-system-packages --no-cache-dir coercer      || echo "[skip] coercer"
+RUN pip3 install --break-system-packages --no-cache-dir ldeep        || echo "[skip] ldeep"
+RUN pip3 install --break-system-packages --no-cache-dir pwncat-cs    || echo "[skip] pwncat-cs"
 
-# ── Ruby gems ───────────────────────────────────────────────────────────────
+# ── Ruby gems ─────────────────────────────────────────────────────────────────
+RUN gem install wpscan     || echo "[skip] wpscan"
+RUN gem install evil-winrm || echo "[skip] evil-winrm"
 
-RUN gem install wpscan evil-winrm || true
-
-# ── Go tools ────────────────────────────────────────────────────────────────
-
+# ── Go tools ──────────────────────────────────────────────────────────────────
 ENV GOPATH=/root/go
 ENV PATH="${PATH}:/root/go/bin"
 
-RUN go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || true
-RUN go install github.com/projectdiscovery/httpx/cmd/httpx@latest || true
-RUN go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
-RUN go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest || true
-RUN go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest || true
+RUN go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || echo "[skip] subfinder"
+RUN go install github.com/projectdiscovery/httpx/cmd/httpx@latest            || echo "[skip] httpx"
+RUN go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest       || echo "[skip] nuclei"
+RUN go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest         || echo "[skip] naabu"
+RUN go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest              || echo "[skip] dnsx"
+RUN go install github.com/hahwul/dalfox/v2@latest                            || echo "[skip] dalfox"
+RUN go install github.com/ropnop/kerbrute@latest                             || echo "[skip] kerbrute"
+RUN go install github.com/jpillora/chisel@latest                             || echo "[skip] chisel"
 
-# ── ExploitDB / searchsploit ────────────────────────────────────────────────
-
+# ── ExploitDB / searchsploit ──────────────────────────────────────────────────
 RUN git clone --depth=1 https://gitlab.com/exploit-database/exploitdb.git /opt/exploitdb \
  && ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit \
- || true
+ || echo "[skip] exploitdb"
 
-# ── Wordlists ───────────────────────────────────────────────────────────────
-
+# ── Wordlists ─────────────────────────────────────────────────────────────────
 RUN mkdir -p /usr/share/wordlists \
  && curl -fsSL \
-    "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt" \
-    -o /usr/share/wordlists/rockyou.txt \
- || true
+      "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt" \
+      -o /usr/share/wordlists/rockyou.txt \
+ || echo "[skip] rockyou"
 
-# ── linpeas ─────────────────────────────────────────────────────────────────
-
+# ── linpeas ───────────────────────────────────────────────────────────────────
 RUN mkdir -p /opt/privesc \
  && curl -fsSL \
-    "https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh" \
-    -o /opt/privesc/linpeas.sh \
+      "https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh" \
+      -o /opt/privesc/linpeas.sh \
  && chmod +x /opt/privesc/linpeas.sh \
  && ln -sf /opt/privesc/linpeas.sh /usr/local/bin/linpeas \
- || true
+ || echo "[skip] linpeas"
 
-# ── Node deps ───────────────────────────────────────────────────────────────
-
+# ── Node deps ─────────────────────────────────────────────────────────────────
 COPY package.json package-lock.json* ./
 RUN npm ci
 
