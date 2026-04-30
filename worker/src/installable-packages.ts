@@ -38,6 +38,7 @@ export const INSTALLABLE_PACKAGES = new Set([
   "enum4linux-ng",
   "smbmap",
   "smbclient",
+  "samba-client",
   "rpcclient",
   "ldap-utils",
   "snmp",

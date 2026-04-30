@@ -4,10 +4,12 @@ WORKDIR /app
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Minimal deps for the worker itself.
-# Core recon tooling is baked in to avoid flaky runtime apt mirrors (hash sum mismatch).
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
+# Minimal deps for the worker + core recon tooling.
+# Baked in to avoid flaky runtime apt installs during scans.
+RUN apt-get clean \
+  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial/* \
+  && apt-get -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true update \
+  && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true install -y --no-install-recommends --fix-missing \
        ca-certificates \
        curl \
        git \
@@ -16,6 +18,7 @@ RUN apt-get update \
        g++ \
        nmap \
        netcat-openbsd \
+       samba-client \
   && rm -rf /var/lib/apt/lists/*
 
 # ── Node deps ─────────────────────────────────────────────────────────────────
