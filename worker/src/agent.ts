@@ -7,6 +7,7 @@ import {
 } from "@google/generative-ai";
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
+import { INSTALLABLE_PACKAGES } from "./installable-packages.js";
 
 export type Severity = "info" | "low" | "medium" | "high" | "critical";
 
@@ -41,6 +42,7 @@ export type AgentOpts = {
   geminiModel?: string;
   maxSteps?: number;
   cmdTimeoutMs?: number;
+  installTimeoutMs?: number;
   whitelist: string[];
   wordlistPath?: string;
 };
@@ -267,6 +269,27 @@ const TOOL_DECLARATIONS: FunctionDeclaration[] = [
     }
   },
   {
+    name: "install_tool",
+    description:
+      "Install a missing tool via apt on this worker image. Only a curated whitelist is allowed. " +
+      "Use when execute_command fails with 'not found', exit 127, or similar.",
+    parameters: {
+      type: "object" as any,
+      properties: {
+        package: {
+          type: "string" as any,
+          description:
+            "Debian package name, e.g. nmap, netcat-openbsd (provides nc), masscan, seclists, hydra."
+        },
+        reasoning: {
+          type: "string" as any,
+          description: "Why this install is needed."
+        }
+      },
+      required: ["package", "reasoning"]
+    }
+  },
+  {
     name: "add_finding",
     description:
       "Record a confirmed security finding based on command output you have observed. " +
@@ -361,6 +384,10 @@ YOUR APPROACH
   6. Do a full port scan (-p-) if the initial one looked sparse
   7. Call finish_engagement when you have a thorough picture
 
+MISSING BINARIES / exit 127
+  - Run install_tool with the correct Debian package (e.g. nmap → package "nmap", nc → often "netcat-openbsd").
+  - Then repeat the intended execute_command.
+
 RULES
   - Only target IPs in scope: ${whitelist.join(", ")}
   - Do NOT run exploits, bind shells, or destructive commands
@@ -368,6 +395,7 @@ RULES
   - Read output carefully before deciding the next command
   - Be methodical and do not repeat the same scan twice
   - Every execute_command call must have clear reasoning
+  - Prefer install_tool over ad-hoc apt-get commands (those are blocked)
 
 You are thorough, methodical, and evidence-based. Call finish_engagement when done.`;
 }
@@ -391,6 +419,7 @@ async function runAgentLoop(
 
   const maxSteps = opts.maxSteps ?? 25;
   const cmdTimeout = opts.cmdTimeoutMs ?? 120_000;
+  const installTimeout = opts.installTimeoutMs ?? 600_000;
   const wordlist = opts.wordlistPath ?? "/usr/share/wordlists/rockyou.txt";
 
   const client = new GoogleGenerativeAI(opts.geminiApiKey);
@@ -411,7 +440,9 @@ async function runAgentLoop(
   await onLog(`  target  : ${targetAddress} (${targetName})\n`);
   await onLog(`  model   : ${modelName}\n`);
   await onLog(`  steps   : max ${maxSteps}\n`);
-  await onLog(`  timeout : ${cmdTimeout / 1000}s per command\n\n`);
+  await onLog(
+    `  timeout : ${cmdTimeout / 1000}s per command (${installTimeout / 1000}s for installs)\n\n`
+  );
 
   history.push({
     role: "user",
@@ -529,6 +560,50 @@ async function runAgentLoop(
 
             await onLog(`│\n│ ✓ exit=${exec.exitCode}  ${exec.durationMs}ms${exec.truncated ? "  [truncated]" : ""}\n`);
           }
+        } else if (name === "install_tool") {
+          const pkg = (toolArgs.package as string | undefined)?.trim() ?? "";
+          const reasoning = (toolArgs.reasoning as string | undefined)?.trim() ?? "";
+
+          if (!INSTALLABLE_PACKAGES.has(pkg)) {
+            result = `BLOCKED: package "${pkg}" is not in the installable allow-list`;
+            await onLog(`│ ⛔ ${result}\n`);
+            await logAuditEvent("agent.tool.install.blocked", {
+              step: state.stepsTaken,
+              package: pkg,
+              reason: "not in allow-list"
+            });
+          } else {
+            const installCmd = `apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${pkg}`;
+            await onLog(`│\n│ 📦 install ${pkg} — ${reasoning}\n│ $ ${installCmd}\n│\n`);
+            await logAuditEvent("agent.tool.install.start", {
+              step: state.stepsTaken,
+              package: pkg,
+              reasoning
+            });
+            let exec: ExecResult;
+            try {
+              exec = await execCommand(
+                installCmd,
+                installTimeout,
+                (chunk) => onLog(`│ ${chunk.replace(/\n(?!$)/g, "\n│ ")}`),
+                signal
+              );
+            } catch (err: any) {
+              result = `install failed: ${err?.message ?? String(err)}`;
+              await onLog(`│ ✗ ${result}\n`);
+              toolResultParts.push({ functionResponse: { name, response: { result } } });
+              continue;
+            }
+            if (exec.exitCode === 0) {
+              result = `installed ${pkg}`;
+              await onLog(`│ ✓ installed ${pkg} (${exec.durationMs}ms)\n`);
+              await logAuditEvent("agent.tool.install.done", { step: state.stepsTaken, package: pkg });
+            } else {
+              const tail = (exec.stderr || exec.stdout).slice(-1500);
+              result = `install exit=${exec.exitCode}\n${tail}`;
+              await onLog(`│ ✗ install ${pkg} exit=${exec.exitCode}\n`);
+            }
+          }
         } else if (name === "add_finding") {
           const title = toolArgs.title as string;
           const severity = toolArgs.severity as Severity;
@@ -569,14 +644,16 @@ async function runAgentLoop(
     }
 
     if (toolResultParts.length > 0) {
-      history.push({ role: "user", parts: toolResultParts });
+      history.push({ role: "function", parts: toolResultParts });
     }
 
     if (!hadToolCall && !state.done) {
       await onLog("│ ↩ no tool call - nudging\n");
       history.push({
         role: "user",
-        parts: [{ text: "You must call a tool. Run execute_command, add_finding, or finish_engagement." }]
+        parts: [{
+          text: "You must call a tool. Run execute_command, install_tool (when a binary is missing), add_finding, or finish_engagement."
+        }]
       });
     }
   }

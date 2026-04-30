@@ -11,6 +11,7 @@ const EnvSchema = z.object({
   GEMINI_MODEL: z.string().optional().default("gemini-2.5-flash-lite"),
   AGENT_MAX_STEPS: z.coerce.number().default(30),
   AGENT_CMD_TIMEOUT_MS: z.coerce.number().default(120000),
+  AGENT_INSTALL_TIMEOUT_MS: z.coerce.number().default(600000),
   AGENT_SCOPE: z.string().optional().default(""),
   HYDRA_ENABLED: z.coerce.boolean().default(true),
   HYDRA_USERNAME: z.string().optional(),

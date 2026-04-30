@@ -736,6 +736,7 @@ function buildAgentOpts(config: PipelineConfig) {
     geminiModel: env.GEMINI_MODEL,
     maxSteps: env.AGENT_MAX_STEPS,
     cmdTimeoutMs: env.AGENT_CMD_TIMEOUT_MS,
+    installTimeoutMs: env.AGENT_INSTALL_TIMEOUT_MS,
     whitelist: [] as string[],
     wordlistPath: preferredWordlist ?? env.HYDRA_PASSLIST
   };
