@@ -407,6 +407,14 @@ async function runAgentLoop(
   onLog: (text: string) => Promise<void>,
   signal?: AbortSignal
 ): Promise<AgentState> {
+  const parseRetryDelayMs = (msg: string): number | null => {
+    const fromJson = /"retryDelay"\s*:\s*"(\d+)s"/i.exec(msg);
+    if (fromJson?.[1]) return Math.max(0, Number(fromJson[1])) * 1000;
+    const fromText = /retry in ([0-9.]+)s/i.exec(msg);
+    if (fromText?.[1]) return Math.max(0, Math.ceil(Number(fromText[1]) * 1000));
+    return null;
+  };
+
   const state: AgentState = {
     findings: [],
     commandHistory: [],
@@ -449,33 +457,60 @@ async function runAgentLoop(
     parts: [{ text: `Begin the security assessment of ${targetAddress}. Think step by step and run your first command.` }]
   });
 
-  while (!state.done && state.stepsTaken < maxSteps) {
-    state.stepsTaken++;
-    await onLog(`\n┌─ step ${state.stepsTaken}/${maxSteps} ${"─".repeat(46 - String(state.stepsTaken).length)}\n`);
+  let stoppedEarlyReason: string | null = null;
 
+  while (!state.done && state.stepsTaken < maxSteps) {
     let response: any;
-    try {
-      const chat = model.startChat({ history: history.slice(0, -1) });
-      const result = await chat.sendMessage(history[history.length - 1].parts);
-      response = result.response;
-    } catch (err: any) {
-      await onLog(`[agent] Gemini API error: ${err?.message ?? String(err)}\n`);
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-      try {
-        const fallback = client.getGenerativeModel({
-          model: `models/${modelName}`,
-          tools: GEMINI_TOOLS,
-          generationConfig: { temperature: 0.1, maxOutputTokens: 2048 },
-          systemInstruction: buildSystemPrompt(targetAddress, targetName, opts.whitelist, wordlist)
-        });
-        const chat = fallback.startChat({ history: history.slice(0, -1) });
-        const result = await chat.sendMessage(history[history.length - 1].parts);
-        response = result.response;
-      } catch {
-        await onLog("[agent] retry failed - stopping loop\n");
+    while (true) {
+      if (signal?.aborted) {
+        stoppedEarlyReason = "aborted";
         break;
       }
+      try {
+        const chat = model.startChat({ history: history.slice(0, -1) });
+        const result = await chat.sendMessage(history[history.length - 1].parts);
+        response = result.response;
+        break;
+      } catch (err: any) {
+        const msg = err?.message ?? String(err);
+        await onLog(`[agent] Gemini API error: ${msg}\n`);
+
+        // Don't burn a step on transient 429s — wait, then try again.
+        if (/\b429\b/.test(msg) || /Too Many Requests/i.test(msg)) {
+          const retryMs = parseRetryDelayMs(msg) ?? 10_000;
+          const capped = Math.min(Math.max(retryMs, 1000), 120_000);
+          await new Promise((resolve) => setTimeout(resolve, capped + 250));
+          continue;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        try {
+          const fallback = client.getGenerativeModel({
+            model: `models/${modelName}`,
+            tools: GEMINI_TOOLS,
+            generationConfig: { temperature: 0.1, maxOutputTokens: 2048 },
+            systemInstruction: buildSystemPrompt(targetAddress, targetName, opts.whitelist, wordlist)
+          });
+          const chat = fallback.startChat({ history: history.slice(0, -1) });
+          const result = await chat.sendMessage(history[history.length - 1].parts);
+          response = result.response;
+          break;
+        } catch (err2: any) {
+          const msg2 = err2?.message ?? String(err2);
+          stoppedEarlyReason = `Gemini API error: ${msg2}`;
+          await onLog("[agent] retry failed - stopping loop\n");
+          break;
+        }
+      }
     }
+
+    if (!response) {
+      if (!stoppedEarlyReason) stoppedEarlyReason = "Gemini API returned no response";
+      break;
+    }
+
+    state.stepsTaken++;
+    await onLog(`\n┌─ step ${state.stepsTaken}/${maxSteps} ${"─".repeat(46 - String(state.stepsTaken).length)}\n`);
 
     const parts: any[] = response.candidates?.[0]?.content?.parts ?? [];
     history.push({ role: "model", parts });
@@ -662,13 +697,20 @@ async function runAgentLoop(
     }
   }
 
-  if (!state.done) {
+  if (!state.done && state.stepsTaken >= maxSteps) {
     await onLog(`\n⚠ step limit (${maxSteps}) reached\n`);
     state.done = true;
     state.summary =
       state.summary ||
       `Assessment reached step limit after ${state.stepsTaken} steps. Found ${state.findings.length} finding(s).`;
     if (state.findings.length > 0) state.riskLevel = deriveRiskLevel(state.findings);
+  } else if (!state.done && stoppedEarlyReason) {
+    state.done = true;
+    state.riskLevel = state.findings.length > 0 ? deriveRiskLevel(state.findings) : "info";
+    state.summary =
+      state.summary ||
+      `Assessment stopped early after ${state.stepsTaken} step(s): ${stoppedEarlyReason}. Found ${state.findings.length} finding(s).`;
+    await onLog(`\n⚠ stopped early: ${stoppedEarlyReason}\n`);
   }
 
   return state;
