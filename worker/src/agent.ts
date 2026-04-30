@@ -573,7 +573,11 @@ async function runAgentLoop(
               reason: "not in allow-list"
             });
           } else {
-            const installCmd = `apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${pkg}`;
+            const installCmd =
+              "apt-get clean && " +
+              "rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial/* && " +
+              "apt-get -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true update && " +
+              `DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true install -y --no-install-recommends --fix-missing ${pkg}`;
             await onLog(`│\n│ 📦 install ${pkg} — ${reasoning}\n│ $ ${installCmd}\n│\n`);
             await logAuditEvent("agent.tool.install.start", {
               step: state.stepsTaken,

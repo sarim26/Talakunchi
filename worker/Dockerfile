@@ -5,7 +5,7 @@ WORKDIR /app
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Minimal deps for the worker itself.
-# All offensive tooling will be installed at runtime via your tool installation function.
+# Core recon tooling is baked in to avoid flaky runtime apt mirrors (hash sum mismatch).
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
        ca-certificates \
@@ -14,6 +14,8 @@ RUN apt-get update \
        python3 \
        make \
        g++ \
+       nmap \
+       netcat-openbsd \
   && rm -rf /var/lib/apt/lists/*
 
 # ── Node deps ─────────────────────────────────────────────────────────────────
