@@ -40,7 +40,7 @@ services:
       NEO4J_PASSWORD: "neo4jpassword"
       AI_MODE: "${AI_MODE:-mock}"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
-      GEMINI_MODEL: "${GEMINI_MODEL:-gemini-2.5-flash-lite}"
+      GEMINI_MODEL: "${GEMINI_MODEL:-gemini-3.1-flash-lite-preview}"
     ports:
       - "8080:8080"
     depends_on:

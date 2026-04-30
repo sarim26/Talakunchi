@@ -34,6 +34,7 @@ export const INSTALLABLE_PACKAGES = new Set([
   "commix",
 
   // ── Enumeration ───────────────────────────────────────────────
+  "netexec",
   "enum4linux",
   "enum4linux-ng",
   "smbmap",
@@ -57,6 +58,7 @@ export const INSTALLABLE_PACKAGES = new Set([
   "nmap",
   "masscan",
   "rustscan",
+  "postgresql-client",
   "netcat-openbsd",
   "netcat-traditional",
   "ncat",
@@ -77,6 +79,7 @@ export const INSTALLABLE_PACKAGES = new Set([
   "ldapdomaindump",
   "windapsearch",
   "evil-winrm",
+  "apt-utils",
 
   // ── Exploitation frameworks ────────────────────────────────────
   "beef-xss",
@@ -165,6 +168,8 @@ export const INSTALLABLE_PACKAGES = new Set([
 
   // ── Python tooling (pip packages) ────────────────────────────
   "impacket",
+  "pip:impacket",
+  "pip:smbmap",
   "bloodhound",
   "certipy-ad",
   "coercer",

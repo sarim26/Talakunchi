@@ -14,6 +14,8 @@ RUN apt-get clean \
        curl \
        git \
        python3 \
+       python3-pip \
+       python3-venv \
        make \
        g++ \
        nmap \

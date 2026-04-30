@@ -48,10 +48,27 @@ export type AgentOpts = {
 };
 
 export const ALLOWED_BINARIES = new Set([
-  "nmap", "masscan", "rustscan",
+  "nmap", "masscan", "rustscan", "apt-get", 
+  "ls", "apt", "dpkg", "dpkg-query", "gem", 
+  "pip3", 
+  "pip", "npm", "cargo", "go", "make", 
+  "cmake", 
+  "git", "bash", "sh", "sudo", 
+  "which", "command", "test", 
+  "env", 
+  "xargs", "tee", "timeout", 
+  "stdbuf", "script", "screen", 
+  "tmux", "netexec",
+  "ping", "ping6", "traceroute", 
+  "tracepath", "arping", "arp-scan", 
+  "netstat", "ss", "ip", "ifconfig", 
+  "route", 
+  "nslookup", "fierce", "amass",
   "hydra", "medusa", "ncrack",
   "nikto", "gobuster", "dirb", "ffuf", "whatweb", "wpscan",
   "enum4linux", "enum4linux-ng", "smbclient", "smbmap", "rpcclient",
+  "psql",
+  "apt-cache",
   "ldapsearch", "onesixtyone", "snmpwalk",
   "dig", "host", "whois", "dnsenum", "dnsrecon",
   "curl", "wget", "nc", "netcat", "openssl",
@@ -169,6 +186,16 @@ export type ExecResult = {
   truncated: boolean;
   durationMs: number;
 };
+
+function parseNmapOpenPortLines(output: string): string[] {
+  const lines = output.split(/\r?\n/);
+  const out: string[] = [];
+  for (const line of lines) {
+    // Typical: "445/tcp open microsoft-ds? syn-ack ttl 63"
+    if (/^\d+\/(tcp|udp)\s+open\s+/i.test(line.trim())) out.push(line.trim());
+  }
+  return out;
+}
 
 export function execCommand(
   command: string,
@@ -431,7 +458,7 @@ async function runAgentLoop(
   const wordlist = opts.wordlistPath ?? "/usr/share/wordlists/rockyou.txt";
 
   const client = new GoogleGenerativeAI(opts.geminiApiKey);
-  const modelName = opts.geminiModel ?? "gemini-2.5-flash-lite";
+  const modelName = opts.geminiModel ?? "gemini-3.1-flash-lite-preview";
 
   const model = client.getGenerativeModel({
     model: modelName,
@@ -454,7 +481,7 @@ async function runAgentLoop(
 
   history.push({
     role: "user",
-    parts: [{ text: `Begin the security assessment of ${targetAddress}. Think step by step and run your first command.` }]
+    parts: [{ text: `Begin the security assessment of ${targetAddress}. Think step by step and run your first command` }]
   });
 
   let stoppedEarlyReason: string | null = null;
@@ -594,10 +621,37 @@ async function runAgentLoop(
             }
 
             await onLog(`│\n│ ✓ exit=${exec.exitCode}  ${exec.durationMs}ms${exec.truncated ? "  [truncated]" : ""}\n`);
+
+            // If the model gets rate-limited after the scan, we still want a durable record of what we observed.
+            const binary = (command.split(/\s+/)[0] ?? "").split("/").pop()?.toLowerCase() ?? "";
+            if (binary === "nmap" && exec.exitCode === 0) {
+              const ports = parseNmapOpenPortLines(combined);
+              if (ports.length > 0) {
+                const fingerprint = `fp:agent|${targetAddress}|nmap-open-ports`;
+                if (!state.findings.some((f) => f.fingerprint === fingerprint)) {
+                  const evidence = [`Command: ${command}`, "", ...ports.slice(0, 50)].join("\n");
+                  state.findings.push({
+                    title: `Open ports/services discovered via Nmap (${ports.length})`,
+                    severity: "info",
+                    evidence,
+                    fingerprint
+                  });
+                  await onLog(`│ 📋 [INFO] Open ports/services discovered via Nmap (${ports.length})\n`);
+                  await logAuditEvent("agent.finding.auto.nmap_ports", {
+                    ports: ports.slice(0, 50),
+                    total: ports.length
+                  });
+                }
+              }
+            }
           }
         } else if (name === "install_tool") {
-          const pkg = (toolArgs.package as string | undefined)?.trim() ?? "";
+          let pkg = (toolArgs.package as string | undefined)?.trim() ?? "";
           const reasoning = (toolArgs.reasoning as string | undefined)?.trim() ?? "";
+
+          // Aliases for Debian: prefer pip installs for tools that are unreliable/unavailable via apt.
+          if (pkg === "smbmap") pkg = "pip:smbmap";
+          if (pkg === "python3-impacket" || pkg === "impacket") pkg = "pip:impacket";
 
           if (!INSTALLABLE_PACKAGES.has(pkg)) {
             result = `BLOCKED: package "${pkg}" is not in the installable allow-list`;
@@ -608,11 +662,25 @@ async function runAgentLoop(
               reason: "not in allow-list"
             });
           } else {
-            const installCmd =
-              "apt-get clean && " +
-              "rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial/* && " +
-              "apt-get -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true update && " +
-              `DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true install -y --no-install-recommends --fix-missing ${pkg}`;
+            const aptEnv =
+              "DEBIAN_FRONTEND=noninteractive " +
+              "apt-get -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confnew ";
+            const installCmd = pkg.startsWith("pip:")
+              ? [
+                  "python3 -m venv /opt/talakunchi-venv",
+                  "/opt/talakunchi-venv/bin/python -m pip install --no-cache-dir --upgrade pip",
+                  `/opt/talakunchi-venv/bin/python -m pip install --no-cache-dir --upgrade ${pkg.slice("pip:".length)}`,
+                  // expose common entrypoints on PATH (best-effort)
+                  `for b in smbmap crackmapexec netexec nxc secretsdump.py psexec.py wmiexec.py; do ` +
+                    `if [ -f "/opt/talakunchi-venv/bin/$b" ]; then ln -sf "/opt/talakunchi-venv/bin/$b" "/usr/local/bin/$b"; fi; ` +
+                  "done"
+                ].join(" && ")
+              : "apt-get clean && " +
+                "rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial/* && " +
+                `apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true update && ` +
+                // if a prior attempt left dpkg/apt in a broken state, recover before installing more
+                `${aptEnv}-y --no-install-recommends --fix-broken install || true && ` +
+                `${aptEnv}-o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true install -y --no-install-recommends --fix-missing ${pkg}`;
             await onLog(`│\n│ 📦 install ${pkg} — ${reasoning}\n│ $ ${installCmd}\n│\n`);
             await logAuditEvent("agent.tool.install.start", {
               step: state.stepsTaken,

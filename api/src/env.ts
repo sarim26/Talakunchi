@@ -9,7 +9,7 @@ const EnvSchema = z.object({
   AI_MODE: z.enum(["mock", "gemini"]).default("mock"),
   GEMINI_API_KEY: z.string().optional(),
   // Default to a commonly-available alias; can be overridden via .env
-  GEMINI_MODEL: z.string().optional().default("gemini-2.5-flash-lite")
+  GEMINI_MODEL: z.string().optional().default("gemini-3.1-flash-lite-preview")
 });
 
 export type Env = z.infer<typeof EnvSchema>;
