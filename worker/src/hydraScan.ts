@@ -39,7 +39,6 @@ type HydraBaseOpts = {
   extraArgs?: string[];
   onOutput?: (line: string) => void;
   signal?: AbortSignal;
-  timeoutMs?: number;
 };
 
 type HydraUsernameSource =
@@ -61,7 +60,6 @@ export type HydraHttpFormOpts = HydraBaseOpts & {
 function run(
   cmd: string,
   args: string[],
-  timeoutMs: number,
   opts?: {
     onStdout?: (chunk: string) => void;
     onStderr?: (chunk: string) => void;
@@ -72,11 +70,6 @@ function run(
     const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
-
-    const t = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error(`Timeout after ${timeoutMs}ms: ${cmd} ${args.join(" ")}`));
-    }, timeoutMs);
 
     const onAbort = () => {
       child.kill("SIGKILL");
@@ -98,11 +91,9 @@ function run(
       opts?.onStderr?.(s);
     });
     child.on("error", (e) => {
-      clearTimeout(t);
       reject(e);
     });
     child.on("close", (code) => {
-      clearTimeout(t);
       opts?.signal?.removeEventListener("abort", onAbort);
       resolve({ stdout, stderr, exitCode: code });
     });
@@ -141,6 +132,7 @@ function buildBaseArgs(credSource: HydraCredSource, opts: HydraBaseOpts): string
   }
 
   args.push("-t", String(opts.threads ?? 16));
+  // -V: show each login attempt (verbose). Avoid -d (debug) — very noisy.
   args.push("-V");
   if (opts.stopOnFirstFind) args.push("-f");
   if (opts.outputFile) args.push("-o", opts.outputFile);
@@ -156,13 +148,11 @@ export async function hydraScan(
   credSource: HydraCredSource,
   opts: HydraBaseOpts = {}
 ): Promise<HydraResult> {
-  const timeoutMs = opts.timeoutMs ?? 10 * 60 * 1000;
-
   const safeThreads = opts.threads ?? (service === "rdp" || service === "smb" ? 4 : 16);
   const args = buildBaseArgs(credSource, { ...opts, threads: safeThreads });
   args.push(`${service}://${targetAddress}`);
 
-  const { stdout, stderr, exitCode } = await run("hydra", args, timeoutMs, {
+  const { stdout, stderr, exitCode } = await run("hydra", args, {
     onStdout: (c) => opts.onOutput?.(c),
     onStderr: (c) => opts.onOutput?.(c),
     signal: opts.signal
@@ -183,12 +173,11 @@ export async function hydraHttpForm(
   credSource: HydraCredSource,
   opts: HydraHttpFormOpts
 ): Promise<HydraResult> {
-  const timeoutMs = opts.timeoutMs ?? 10 * 60 * 1000;
   const args = buildBaseArgs(credSource, opts);
   const formSpec = `${opts.formPath}:${opts.formBody}:${opts.failureString}`;
   args.push(targetAddress, service, formSpec);
 
-  const { stdout, stderr, exitCode } = await run("hydra", args, timeoutMs, {
+  const { stdout, stderr, exitCode } = await run("hydra", args, {
     onStdout: (c) => opts.onOutput?.(c),
     onStderr: (c) => opts.onOutput?.(c),
     signal: opts.signal

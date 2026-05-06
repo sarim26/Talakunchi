@@ -8,6 +8,7 @@ import {
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 import { INSTALLABLE_PACKAGES } from "./installable-packages.js";
+import { wrapOutputStripNmapNoise } from "./nmapScan.js";
 
 export type Severity = "info" | "low" | "medium" | "high" | "critical";
 
@@ -41,16 +42,15 @@ export type AgentOpts = {
   geminiApiKey: string;
   geminiModel?: string;
   maxSteps?: number;
-  cmdTimeoutMs?: number;
-  installTimeoutMs?: number;
   whitelist: string[];
   wordlistPath?: string;
 };
 
 export const ALLOWED_BINARIES = new Set([
-  "nmap", "masscan", "rustscan", "apt-get", 
+  "nmap", "masscan", "rustscan", "apt-get", "samba",
   "ls", "apt", "dpkg", "dpkg-query", "gem", 
-  "pip3", 
+  "pip3", "ftp", "telnet", "nc", "netcat",
+  "openssl", "ssh", "scp", "sftp", "rsync",
   "pip", "npm", "cargo", "go", "make", 
   "cmake", 
   "git", "bash", "sh", "sudo", 
@@ -199,16 +199,21 @@ function parseNmapOpenPortLines(output: string): string[] {
 
 export function execCommand(
   command: string,
-  timeoutMs: number,
   onChunk?: (s: string) => void,
   signal?: AbortSignal
 ): Promise<ExecResult> {
   const start = Date.now();
 
   return new Promise((resolve, reject) => {
-    const child = spawn("sh", ["-c", command], {
+    // Bash xtrace + verbose: print expanded commands and script lines before execution.
+    const child = spawn("/bin/bash", ["-o", "xtrace", "-o", "verbose", "-c", command], {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, DEBIAN_FRONTEND: "noninteractive", TERM: "dumb" }
+      env: {
+        ...process.env,
+        DEBIAN_FRONTEND: "noninteractive",
+        TERM: "dumb",
+        PS4: "+ [${LINENO}] "
+      }
     });
 
     let stdout = "";
@@ -230,10 +235,9 @@ export function execCommand(
       if (chunk.length < s.length || storedChars >= MAX_OUTPUT_CHARS) truncated = true;
     };
 
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error(`timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
+    const commandRunsNmap = /\bnmap\s/.test(command);
+    const stdoutNsock = commandRunsNmap ? wrapOutputStripNmapNoise((s) => absorb(s, "out")) : null;
+    const stderrNsock = commandRunsNmap ? wrapOutputStripNmapNoise((s) => absorb(s, "err")) : null;
 
     const onAbort = () => {
       child.kill("SIGKILL");
@@ -242,21 +246,28 @@ export function execCommand(
 
     if (signal) {
       if (signal.aborted) {
-        clearTimeout(timer);
         return void onAbort();
       }
       signal.addEventListener("abort", onAbort, { once: true });
     }
 
-    child.stdout.on("data", (d: Buffer) => absorb(d.toString("utf8"), "out"));
-    child.stderr.on("data", (d: Buffer) => absorb(d.toString("utf8"), "err"));
+    child.stdout.on("data", (d: Buffer) => {
+      const s = d.toString("utf8");
+      if (stdoutNsock) stdoutNsock.push(s);
+      else absorb(s, "out");
+    });
+    child.stderr.on("data", (d: Buffer) => {
+      const s = d.toString("utf8");
+      if (stderrNsock) stderrNsock.push(s);
+      else absorb(s, "err");
+    });
     child.on("error", (e) => {
-      clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       reject(e);
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
+      stdoutNsock?.flush();
+      stderrNsock?.flush();
       signal?.removeEventListener("abort", onAbort);
       resolve({ stdout, stderr, exitCode: code, truncated, durationMs: Date.now() - start });
     });
@@ -269,7 +280,9 @@ const TOOL_DECLARATIONS: FunctionDeclaration[] = [
     description:
       "Execute a real shell command on the assessment machine and receive the full output. " +
       "Use this to run nmap, hydra, nikto, enum4linux, gobuster, sqlmap, dig, curl, etc. " +
-      "Write the exact command with all flags. You are at a real terminal.",
+      "Write the exact command with all flags. You are at a real terminal. " +
+      "Use verbose flags on scanning tools (nmap -vv/-vvv, hydra -V, gobuster -v, sqlmap -v 2). " +
+      "Do not use nmap -d/--debug (socket trace noise).",
     parameters: {
       type: "object" as any,
       properties: {
@@ -278,14 +291,14 @@ const TOOL_DECLARATIONS: FunctionDeclaration[] = [
           description:
             "The exact shell command to execute. Write it exactly as you would at a terminal.\n" +
             "Examples:\n" +
-            "  nmap -sV -sC -O --top-ports 200 192.168.1.10\n" +
-            "  hydra -l root -P /wordlists/rockyou.txt ssh://192.168.1.10 -t 8 -f\n" +
+            "  nmap -vv -sV -sC -O --reason --top-ports 200 192.168.1.10\n" +
+            "  hydra -V -l root -P /wordlists/rockyou.txt ssh://192.168.1.10 -t 8 -f\n" +
             "  nikto -h http://192.168.1.10 -C all\n" +
             "  enum4linux -a 192.168.1.10\n" +
-            "  gobuster dir -u http://192.168.1.10 -w /usr/share/wordlists/dirb/common.txt\n" +
+            "  gobuster dir -v -u http://192.168.1.10 -w /usr/share/wordlists/dirb/common.txt\n" +
             "  dig axfr @192.168.1.10 target.local\n" +
             "  smbmap -H 192.168.1.10\n" +
-            "  sqlmap -u 'http://192.168.1.10/login?id=1' --batch --level 2"
+            "  sqlmap -v 2 -u 'http://192.168.1.10/login?id=1' --batch --level 2"
         },
         reasoning: {
           type: "string" as any,
@@ -397,9 +410,9 @@ AVAILABLE WORDLISTS
   Users   : /usr/share/seclists/Usernames/top-usernames-shortlist.txt
 
 YOUR APPROACH
-  1. Start with nmap -sV -sC to find open ports and service versions
+  1. Start with nmap -vv (or -vvv) -sV -sC to find open ports and service versions (avoid nmap -d debug)
   2. Look up service versions and note anything outdated or known-vulnerable
-  3. Run service-specific tools:
+  3. Run service-specific tools (use verbose: hydra -V, gobuster -v):
        HTTP/HTTPS  -> nikto, gobuster
        SMB/445     -> enum4linux, smbmap
        SSH/FTP/RDP -> hydra for weak credentials
@@ -452,9 +465,7 @@ async function runAgentLoop(
     reasoning: []
   };
 
-  const maxSteps = opts.maxSteps ?? 25;
-  const cmdTimeout = opts.cmdTimeoutMs ?? 120_000;
-  const installTimeout = opts.installTimeoutMs ?? 600_000;
+  const maxSteps = opts.maxSteps ?? 50;
   const wordlist = opts.wordlistPath ?? "/usr/share/wordlists/rockyou.txt";
 
   const client = new GoogleGenerativeAI(opts.geminiApiKey);
@@ -475,9 +486,7 @@ async function runAgentLoop(
   await onLog(`  target  : ${targetAddress} (${targetName})\n`);
   await onLog(`  model   : ${modelName}\n`);
   await onLog(`  steps   : max ${maxSteps}\n`);
-  await onLog(
-    `  timeout : ${cmdTimeout / 1000}s per command (${installTimeout / 1000}s for installs)\n\n`
-  );
+  await onLog("  shell     : bash xtrace+verbose (no wall-clock kill)\n\n");
 
   history.push({
     role: "user",
@@ -588,12 +597,7 @@ async function runAgentLoop(
             });
             let exec: ExecResult;
             try {
-              exec = await execCommand(
-                command,
-                cmdTimeout,
-                (chunk) => onLog(`│ ${chunk.replace(/\n(?!$)/g, "\n│ ")}`),
-                signal
-              );
+              exec = await execCommand(command, (chunk) => onLog(`│ ${chunk.replace(/\n(?!$)/g, "\n│ ")}`), signal);
             } catch (err: any) {
               result = `execution failed: ${err?.message ?? String(err)}`;
               await onLog(`│ ✗ ${result}\n`);
@@ -662,14 +666,12 @@ async function runAgentLoop(
               reason: "not in allow-list"
             });
           } else {
-            const aptEnv =
-              "DEBIAN_FRONTEND=noninteractive " +
-              "apt-get -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confnew ";
+            const aptEnv = "DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew ";
             const installCmd = pkg.startsWith("pip:")
               ? [
                   "python3 -m venv /opt/talakunchi-venv",
-                  "/opt/talakunchi-venv/bin/python -m pip install --no-cache-dir --upgrade pip",
-                  `/opt/talakunchi-venv/bin/python -m pip install --no-cache-dir --upgrade ${pkg.slice("pip:".length)}`,
+                  "/opt/talakunchi-venv/bin/python -m pip install -v --no-cache-dir --upgrade pip",
+                  `/opt/talakunchi-venv/bin/python -m pip install -v --no-cache-dir --upgrade ${pkg.slice("pip:".length)}`,
                   // expose common entrypoints on PATH (best-effort)
                   `for b in smbmap crackmapexec netexec nxc secretsdump.py psexec.py wmiexec.py; do ` +
                     `if [ -f "/opt/talakunchi-venv/bin/$b" ]; then ln -sf "/opt/talakunchi-venv/bin/$b" "/usr/local/bin/$b"; fi; ` +
@@ -677,10 +679,10 @@ async function runAgentLoop(
                 ].join(" && ")
               : "apt-get clean && " +
                 "rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial/* && " +
-                `apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true update && ` +
+                `apt-get -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true update && ` +
                 // if a prior attempt left dpkg/apt in a broken state, recover before installing more
                 `${aptEnv}-y --no-install-recommends --fix-broken install || true && ` +
-                `${aptEnv}-o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true install -y --no-install-recommends --fix-missing ${pkg}`;
+                `${aptEnv}-o Debug::pkgProblemResolver=yes -o Debug::Acquire::http=true -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true install -y --no-install-recommends --fix-missing ${pkg}`;
             await onLog(`│\n│ 📦 install ${pkg} — ${reasoning}\n│ $ ${installCmd}\n│\n`);
             await logAuditEvent("agent.tool.install.start", {
               step: state.stepsTaken,
@@ -689,12 +691,7 @@ async function runAgentLoop(
             });
             let exec: ExecResult;
             try {
-              exec = await execCommand(
-                installCmd,
-                installTimeout,
-                (chunk) => onLog(`│ ${chunk.replace(/\n(?!$)/g, "\n│ ")}`),
-                signal
-              );
+              exec = await execCommand(installCmd, (chunk) => onLog(`│ ${chunk.replace(/\n(?!$)/g, "\n│ ")}`), signal);
             } catch (err: any) {
               result = `install failed: ${err?.message ?? String(err)}`;
               await onLog(`│ ✗ ${result}\n`);

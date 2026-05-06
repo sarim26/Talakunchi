@@ -21,10 +21,42 @@ export type NmapResult = {
   rawXml: string;
 };
 
+/** Live nmap stderr often includes NSOCK socket-trace lines when -d/--debug is used; drop those from logs. */
+function isNmapNoiseLine(line: string): boolean {
+  return /^\s*NSOCK\b/i.test(line);
+}
+
+/** Line-buffered sink that drops NSOCK debug lines (for agent-mode `execute_command` nmap as well). */
+export function wrapOutputStripNmapNoise(onOutput?: (line: string) => void) {
+  let buf = "";
+  return {
+    push(chunk: string) {
+      if (!onOutput) return;
+      buf += chunk;
+      const parts = buf.split(/\r?\n/);
+      buf = parts.pop() ?? "";
+      for (const line of parts) {
+        if (isNmapNoiseLine(line)) continue;
+        onOutput(line + "\n");
+      }
+    },
+    flush() {
+      if (!onOutput || !buf) return;
+      if (!isNmapNoiseLine(buf)) onOutput(buf.endsWith("\n") ? buf : buf + "\n");
+      buf = "";
+    }
+  };
+}
+
+function ensureNmapVerboseFlags(argv: string[]): string[] {
+  const hasV = argv.some((a) => /^-v+$/i.test(a));
+  if (hasV) return argv;
+  return ["-vv", ...argv];
+}
+
 function run(
   cmd: string,
   args: string[],
-  timeoutMs: number,
   opts?: {
     onStdout?: (chunk: string) => void;
     onStderr?: (chunk: string) => void;
@@ -35,11 +67,6 @@ function run(
     const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
-
-    const t = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error(`Command timeout after ${timeoutMs}ms: ${cmd} ${args.join(" ")}`));
-    }, timeoutMs);
 
     const onAbort = () => {
       child.kill("SIGKILL");
@@ -61,11 +88,9 @@ function run(
       opts?.onStderr?.(s);
     });
     child.on("error", (e) => {
-      clearTimeout(t);
       reject(e);
     });
     child.on("close", (code) => {
-      clearTimeout(t);
       if (opts?.signal) opts.signal.removeEventListener("abort", onAbort);
       resolve({ stdout, stderr, exitCode: code });
     });
@@ -81,20 +106,25 @@ export async function nmapScan(
   }
 ) {
   const xmlPath = path.join(os.tmpdir(), `nmap-${Date.now()}-${Math.random().toString(36).slice(2)}.xml`);
-  const args = [...nmapArgs.split(/\s+/).filter(Boolean), "-oX", xmlPath, targetAddress];
+  const baseArgs = ensureNmapVerboseFlags(nmapArgs.split(/\s+/).filter(Boolean));
+  const args = [...baseArgs, "-oX", xmlPath, targetAddress];
+  const noise = wrapOutputStripNmapNoise(opts?.onOutput);
 
   let rawXml = "";
   try {
-    const { stderr, exitCode } = await run("nmap", args, 10 * 60 * 1000, {
-      onStdout: (c) => opts?.onOutput?.(c),
-      onStderr: (c) => opts?.onOutput?.(c),
-      signal: opts?.signal
-    });
-    if (exitCode !== 0) {
-      throw new Error(`nmap failed (exit=${exitCode}). stderr=${stderr.slice(0, 2000)}`);
+    try {
+      const { stderr, exitCode } = await run("nmap", args, {
+        onStdout: (c) => noise.push(c),
+        onStderr: (c) => noise.push(c),
+        signal: opts?.signal
+      });
+      if (exitCode !== 0) {
+        throw new Error(`nmap failed (exit=${exitCode}). stderr=${stderr.slice(0, 2000)}`);
+      }
+      rawXml = await fs.readFile(xmlPath, "utf8");
+    } finally {
+      noise.flush();
     }
-
-    rawXml = await fs.readFile(xmlPath, "utf8");
   } finally {
     await fs.unlink(xmlPath).catch(() => undefined);
   }

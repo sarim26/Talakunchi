@@ -62,7 +62,6 @@ services:
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       GEMINI_MODEL: "${GEMINI_MODEL:-gemini-1.5-flash}"
       AGENT_MAX_STEPS: "${AGENT_MAX_STEPS:-25}"
-      AGENT_CMD_TIMEOUT_MS: "${AGENT_CMD_TIMEOUT_MS:-120000}"
       AGENT_SCOPE: "${AGENT_SCOPE:-}"
       # Optional deterministic credential checks during scan stage (separate from AI exploitation stage)
       HYDRA_ENABLED: "${HYDRA_ENABLED:-false}"
@@ -72,13 +71,12 @@ services:
       HYDRA_PASSLIST: "${HYDRA_PASSLIST:-/wordlists/rockyou.txt}"
       HYDRA_THREADS: "${HYDRA_THREADS:-10}"
       HYDRA_STOP_ON_FIRST_FIND: "${HYDRA_STOP_ON_FIRST_FIND:-false}"
-      HYDRA_TIMEOUT_MS: "${HYDRA_TIMEOUT_MS:-600000}"
       # Tune if needed (safe defaults):
       # -Pn: skip ping (works even if ICMP blocked)
-      # -vv --stats-every: show progress in logs
+      # -vvv -d2: very verbose nmap + debug
       # -sV --version-light: light service detection
       # --top-ports 200: keep demo fast
-      NMAP_ARGS: "-Pn -vv --reason --stats-every 5s -sV --version-light --top-ports 200"
+      NMAP_ARGS: "-Pn -vvv -d2 --reason --stats-every 5s -sV --version-light --top-ports 200"
       POLL_INTERVAL_MS: "1500"
     volumes:
       # Mount local wordlists into the container for Hydra attacks.

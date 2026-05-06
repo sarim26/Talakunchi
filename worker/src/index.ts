@@ -534,7 +534,6 @@ async function runScan(scanRunId: string) {
         const hydraResults = await hydraFromNmapServices(ctx.target_address, services, hydraCredSource, {
           threads: env.HYDRA_THREADS,
           stopOnFirstFind: env.HYDRA_STOP_ON_FIRST_FIND,
-          timeoutMs: env.HYDRA_TIMEOUT_MS,
           signal: ac.signal,
           onOutput: (line) => {
             hydraOutput.push(line);
@@ -735,8 +734,6 @@ function buildAgentOpts(config: PipelineConfig) {
     geminiApiKey: env.GEMINI_API_KEY,
     geminiModel: env.GEMINI_MODEL,
     maxSteps: env.AGENT_MAX_STEPS,
-    cmdTimeoutMs: env.AGENT_CMD_TIMEOUT_MS,
-    installTimeoutMs: env.AGENT_INSTALL_TIMEOUT_MS,
     whitelist: [] as string[],
     wordlistPath: preferredWordlist ?? env.HYDRA_PASSLIST
   };
@@ -762,8 +759,6 @@ function buildExploitOpts(config: PipelineConfig) {
     geminiApiKey: env.GEMINI_API_KEY,
     geminiModel: env.GEMINI_MODEL,
     maxSteps: env.EXPLOIT_MAX_STEPS,
-    cmdTimeoutMs: env.EXPLOIT_CMD_TIMEOUT_MS,
-    installTimeoutMs: env.EXPLOIT_INSTALL_TIMEOUT_MS,
     whitelist: [] as string[],
     wordlistPath: preferredWordlist ?? env.HYDRA_PASSLIST,
     lhostAllowList: env.EXPLOIT_LHOST_ALLOWLIST
