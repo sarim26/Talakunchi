@@ -1,6 +1,6 @@
 /**
  * Allow-list for install_tool across recon (agent) and exploit phases.
- * Used with apt-get on Debian-based worker images.
+ * Used with apt-get on the SSH target (typically Kali), not inside the slim worker container.
  */
 export const INSTALLABLE_PACKAGES = new Set([
   // ── Metasploit ────────────────────────────────────────────────
@@ -92,7 +92,6 @@ export const INSTALLABLE_PACKAGES = new Set([
   // ── Wordlists & SecLists ──────────────────────────────────────
   "seclists",
   "wordlists",
-  "rockyou",
 
   // ── Post-exploitation / privesc ───────────────────────────────
   "pspy",

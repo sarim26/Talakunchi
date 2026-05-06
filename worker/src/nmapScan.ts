@@ -1,8 +1,5 @@
-import { spawn } from "node:child_process";
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { XMLParser } from "fast-xml-parser";
+import { spawnWithRemotePolicy } from "./remoteExec.js";
 
 export type NmapService = {
   port: number;
@@ -54,49 +51,7 @@ function ensureNmapVerboseFlags(argv: string[]): string[] {
   return ["-vv", ...argv];
 }
 
-function run(
-  cmd: string,
-  args: string[],
-  opts?: {
-    onStdout?: (chunk: string) => void;
-    onStderr?: (chunk: string) => void;
-    signal?: AbortSignal;
-  }
-) {
-  return new Promise<{ stdout: string; stderr: string; exitCode: number | null }>((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-
-    const onAbort = () => {
-      child.kill("SIGKILL");
-      reject(new Error("aborted"));
-    };
-    if (opts?.signal) {
-      if (opts.signal.aborted) return void onAbort();
-      opts.signal.addEventListener("abort", onAbort, { once: true });
-    }
-
-    child.stdout.on("data", (d: Buffer) => {
-      const s = d.toString("utf8");
-      stdout += s;
-      opts?.onStdout?.(s);
-    });
-    child.stderr.on("data", (d: Buffer) => {
-      const s = d.toString("utf8");
-      stderr += s;
-      opts?.onStderr?.(s);
-    });
-    child.on("error", (e) => {
-      reject(e);
-    });
-    child.on("close", (code) => {
-      if (opts?.signal) opts.signal.removeEventListener("abort", onAbort);
-      resolve({ stdout, stderr, exitCode: code });
-    });
-  });
-}
-
+/** With `-oX -`, XML goes to stdout; human/progress output goes to stderr. */
 export async function nmapScan(
   targetAddress: string,
   nmapArgs: string,
@@ -105,29 +60,32 @@ export async function nmapScan(
     signal?: AbortSignal;
   }
 ) {
-  const xmlPath = path.join(os.tmpdir(), `nmap-${Date.now()}-${Math.random().toString(36).slice(2)}.xml`);
   const baseArgs = ensureNmapVerboseFlags(nmapArgs.split(/\s+/).filter(Boolean));
-  const args = [...baseArgs, "-oX", xmlPath, targetAddress];
+  const args = [...baseArgs, "-oX", "-", targetAddress];
   const noise = wrapOutputStripNmapNoise(opts?.onOutput);
 
-  let rawXml = "";
+  let stdout = "";
+  let stderr = "";
+
   try {
-    try {
-      const { stderr, exitCode } = await run("nmap", args, {
-        onStdout: (c) => noise.push(c),
-        onStderr: (c) => noise.push(c),
-        signal: opts?.signal
-      });
-      if (exitCode !== 0) {
-        throw new Error(`nmap failed (exit=${exitCode}). stderr=${stderr.slice(0, 2000)}`);
-      }
-      rawXml = await fs.readFile(xmlPath, "utf8");
-    } finally {
-      noise.flush();
+    const result = await spawnWithRemotePolicy("nmap", args, {
+      onStdout: (c) => {
+        stdout += c;
+      },
+      onStderr: (c) => {
+        stderr += c;
+        noise.push(c);
+      },
+      signal: opts?.signal
+    });
+    if (result.exitCode !== 0) {
+      throw new Error(`nmap failed (exit=${result.exitCode}). stderr=${stderr.slice(0, 2000)}`);
     }
   } finally {
-    await fs.unlink(xmlPath).catch(() => undefined);
+    noise.flush();
   }
+
+  const rawXml = stdout;
 
   const parser = new XMLParser({
     ignoreAttributes: false,
@@ -164,4 +122,3 @@ export async function nmapScan(
 
   return { host: resolvedHost, status: hostStatus, services, rawXml } satisfies NmapResult;
 }
-

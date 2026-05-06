@@ -52,6 +52,7 @@ services:
   worker:
     build:
       context: ./worker
+    restart: unless-stopped
     environment:
       DATABASE_URL: "postgresql://talakunchi:talakunchi@postgres:5432/talakunchi"
       NEO4J_URI: "bolt://neo4j:7687"
@@ -65,22 +66,22 @@ services:
       AGENT_SCOPE: "${AGENT_SCOPE:-}"
       # Optional deterministic credential checks during scan stage (separate from AI exploitation stage)
       HYDRA_ENABLED: "${HYDRA_ENABLED:-false}"
-      # Hydra reads wordlists inside the container from /wordlists.
-      # We mount ./.cache/wordlists -> /wordlists below.
-      HYDRA_USERLIST: "${HYDRA_USERLIST:-/wordlists/cirt-default-usernames.txt}"
-      HYDRA_PASSLIST: "${HYDRA_PASSLIST:-/wordlists/rockyou.txt}"
+      # Hydra runs on the SSH host; these paths must exist there (container /wordlists mount is optional).
+      HYDRA_USERLIST: "${HYDRA_USERLIST:-/usr/share/seclists/Usernames/cirt-default-usernames.txt}"
+      HYDRA_PASSLIST: "${HYDRA_PASSLIST:-/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-10000.txt}"
       HYDRA_THREADS: "${HYDRA_THREADS:-10}"
       HYDRA_STOP_ON_FIRST_FIND: "${HYDRA_STOP_ON_FIRST_FIND:-false}"
-      # Tune if needed (safe defaults):
-      # -Pn: skip ping (works even if ICMP blocked)
-      # -vvv -d2: very verbose nmap + debug
-      # -sV --version-light: light service detection
-      # --top-ports 200: keep demo fast
-      NMAP_ARGS: "-Pn -vvv -d2 --reason --stats-every 5s -sV --version-light --top-ports 200"
+      # Required: all tools execute on this host over SSH (worker only runs Node + ssh).
+      REMOTE_SSH_HOST: "${REMOTE_SSH_HOST}"
+      REMOTE_SSH_USER: "${REMOTE_SSH_USER}"
+      REMOTE_SSH_PORT: "${REMOTE_SSH_PORT:-22}"
+      REMOTE_SSH_PASSWORD: "${REMOTE_SSH_PASSWORD:-}"
+      REMOTE_SSH_IDENTITY_FILE: "${REMOTE_SSH_IDENTITY_FILE:-}"
+      REMOTE_SSH_STRICT_HOST_KEY_CHECKING: "${REMOTE_SSH_STRICT_HOST_KEY_CHECKING:-accept-new}"
+      NMAP_ARGS: ${NMAP_ARGS:-"-Pn -vvv --reason --stats-every 5s -sV --version-light --top-ports 200"}
       POLL_INTERVAL_MS: "1500"
     volumes:
-      # Mount local wordlists into the container for Hydra attacks.
-      # Expected container paths: /wordlists/userlist.txt and /wordlists/rockyou.txt (or set envs to your filenames).
+      # Optional: only if HYDRA_* paths point at /wordlists/... on the container side; with SSH-Kali you usually use paths on Kali only.
       - ./.cache/wordlists:/wordlists:ro
     depends_on:
       postgres:

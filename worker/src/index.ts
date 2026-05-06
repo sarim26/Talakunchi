@@ -390,7 +390,7 @@ async function runScan(scanRunId: string) {
     return res.rows[0].id as string;
   });
 
-  const nmapCmd = `nmap ${env.NMAP_ARGS} -oX <tempfile> ${ctx.target_address}`;
+  const nmapCmd = `nmap ${env.NMAP_ARGS} -oX - ${ctx.target_address}`;
   await appendStepLog(discoveryStepId, `Running: ${nmapCmd}\n`);
 
   const ac = new AbortController();
@@ -817,7 +817,9 @@ async function enforceScanRate(config: PipelineConfig) {
 async function main() {
   await ensureWorkflowTables();
   await getPipelineConfig();
-  console.log(`[worker] starting (mode=${env.SCAN_MODE})`);
+  console.log(
+    `[worker] starting (mode=${env.SCAN_MODE}, tools_ssh=${env.REMOTE_SSH_USER}@${env.REMOTE_SSH_HOST}:${env.REMOTE_SSH_PORT})`
+  );
   if ((env.AGENT_ENABLED || env.SCAN_MODE === "agent") && !env.GEMINI_API_KEY) {
     console.warn("[worker] AGENT mode requested but GEMINI_API_KEY is missing; falling back to deterministic scan mode.");
   }

@@ -129,6 +129,14 @@ export const ReconAssetSchema = z.object({
 });
 export type ReconAsset = z.infer<typeof ReconAssetSchema>;
 
+export const ScanMessageSchema = z.object({
+  id: z.string().uuid(),
+  role: z.enum(["user", "assistant", "system"]),
+  content: z.string(),
+  createdAt: z.any()
+});
+export type ScanMessage = z.infer<typeof ScanMessageSchema>;
+
 export async function listTargets() {
   return http("/api/targets", undefined, z.array(TargetSchema));
 }
@@ -200,6 +208,26 @@ export async function cancelScan(scanRunId: string) {
   return http(
     `/api/scans/${scanRunId}/cancel`,
     { method: "POST", body: "{}" },
+    z.object({ ok: z.boolean() })
+  );
+}
+
+export async function listScanMessages(scanRunId: string) {
+  return http(`/api/scans/${scanRunId}/messages`, undefined, z.array(ScanMessageSchema));
+}
+
+export async function postScanMessage(input: { scanRunId: string; content: string; resume?: boolean }) {
+  return http(
+    `/api/scans/${input.scanRunId}/messages`,
+    { method: "POST", body: JSON.stringify({ role: "user", content: input.content, resume: input.resume ?? false }) },
+    ScanMessageSchema
+  );
+}
+
+export async function resumeScan(scanRunId: string, note?: string) {
+  return http(
+    `/api/scans/${scanRunId}/resume`,
+    { method: "POST", body: JSON.stringify({ note: note?.trim() || undefined }) },
     z.object({ ok: z.boolean() })
   );
 }

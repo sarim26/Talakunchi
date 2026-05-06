@@ -9,6 +9,7 @@ import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 import { INSTALLABLE_PACKAGES } from "./installable-packages.js";
 import { wrapOutputStripNmapNoise } from "./nmapScan.js";
+import { spawnBashScriptOverSsh } from "./remoteExec.js";
 
 export type Severity = "info" | "low" | "medium" | "high" | "critical";
 
@@ -205,17 +206,6 @@ export function execCommand(
   const start = Date.now();
 
   return new Promise((resolve, reject) => {
-    // Bash xtrace + verbose: print expanded commands and script lines before execution.
-    const child = spawn("/bin/bash", ["-o", "xtrace", "-o", "verbose", "-c", command], {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        DEBIAN_FRONTEND: "noninteractive",
-        TERM: "dumb",
-        PS4: "+ [${LINENO}] "
-      }
-    });
-
     let stdout = "";
     let stderr = "";
     let storedChars = 0;
@@ -239,38 +229,23 @@ export function execCommand(
     const stdoutNsock = commandRunsNmap ? wrapOutputStripNmapNoise((s) => absorb(s, "out")) : null;
     const stderrNsock = commandRunsNmap ? wrapOutputStripNmapNoise((s) => absorb(s, "err")) : null;
 
-    const onAbort = () => {
-      child.kill("SIGKILL");
-      reject(new Error("aborted"));
-    };
-
-    if (signal) {
-      if (signal.aborted) {
-        return void onAbort();
-      }
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
-
-    child.stdout.on("data", (d: Buffer) => {
-      const s = d.toString("utf8");
-      if (stdoutNsock) stdoutNsock.push(s);
-      else absorb(s, "out");
-    });
-    child.stderr.on("data", (d: Buffer) => {
-      const s = d.toString("utf8");
-      if (stderrNsock) stderrNsock.push(s);
-      else absorb(s, "err");
-    });
-    child.on("error", (e) => {
-      signal?.removeEventListener("abort", onAbort);
-      reject(e);
-    });
-    child.on("close", (code) => {
-      stdoutNsock?.flush();
-      stderrNsock?.flush();
-      signal?.removeEventListener("abort", onAbort);
-      resolve({ stdout, stderr, exitCode: code, truncated, durationMs: Date.now() - start });
-    });
+    spawnBashScriptOverSsh(command, {
+      onStdout: (s) => {
+        if (stdoutNsock) stdoutNsock.push(s);
+        else absorb(s, "out");
+      },
+      onStderr: (s) => {
+        if (stderrNsock) stderrNsock.push(s);
+        else absorb(s, "err");
+      },
+      signal
+    })
+      .then(({ exitCode }) => {
+        stdoutNsock?.flush();
+        stderrNsock?.flush();
+        resolve({ stdout, stderr, exitCode, truncated, durationMs: Date.now() - start });
+      })
+      .catch(reject);
   });
 }
 
@@ -292,7 +267,7 @@ const TOOL_DECLARATIONS: FunctionDeclaration[] = [
             "The exact shell command to execute. Write it exactly as you would at a terminal.\n" +
             "Examples:\n" +
             "  nmap -vv -sV -sC -O --reason --top-ports 200 192.168.1.10\n" +
-            "  hydra -V -l root -P /wordlists/rockyou.txt ssh://192.168.1.10 -t 8 -f\n" +
+            "  hydra -V -l root -P /usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-10000.txt ssh://192.168.1.10 -t 8 -f\n" +
             "  nikto -h http://192.168.1.10 -C all\n" +
             "  enum4linux -a 192.168.1.10\n" +
             "  gobuster dir -v -u http://192.168.1.10 -w /usr/share/wordlists/dirb/common.txt\n" +
@@ -415,7 +390,7 @@ YOUR APPROACH
   3. Run service-specific tools (use verbose: hydra -V, gobuster -v):
        HTTP/HTTPS  -> nikto, gobuster
        SMB/445     -> enum4linux, smbmap
-       SSH/FTP/RDP -> hydra for weak credentials
+       SSH/FTP/RDP -> hydra for weak credentials (use a short password list; default is SecLists top-10k)
        DNS/53      -> dig axfr for zone transfers
        SNMP/161    -> snmpwalk with community strings
        SQL ports   -> sqlmap on any web forms
@@ -445,7 +420,8 @@ async function runAgentLoop(
   targetName: string,
   opts: AgentOpts,
   onLog: (text: string) => Promise<void>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  initialUserInstruction?: string
 ): Promise<AgentState> {
   const parseRetryDelayMs = (msg: string): number | null => {
     const fromJson = /"retryDelay"\s*:\s*"(\d+)s"/i.exec(msg);
@@ -466,7 +442,8 @@ async function runAgentLoop(
   };
 
   const maxSteps = opts.maxSteps ?? 50;
-  const wordlist = opts.wordlistPath ?? "/usr/share/wordlists/rockyou.txt";
+  const wordlist =
+    opts.wordlistPath ?? "/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-10000.txt";
 
   const client = new GoogleGenerativeAI(opts.geminiApiKey);
   const modelName = opts.geminiModel ?? "gemini-3.1-flash-lite-preview";
@@ -490,7 +467,13 @@ async function runAgentLoop(
 
   history.push({
     role: "user",
-    parts: [{ text: `Begin the security assessment of ${targetAddress}. Think step by step and run your first command` }]
+    parts: [
+      {
+        text:
+          initialUserInstruction?.trim() ||
+          `Begin the security assessment of ${targetAddress}. Think step by step and run your first command`
+      }
+    ]
   });
 
   let stoppedEarlyReason: string | null = null;
@@ -796,6 +779,23 @@ export async function runAgentScan(scanRunId: string, opts: AgentOpts) {
     };
   });
 
+  const priorMessages = await withClient(async (c) => {
+    const res = await c.query(
+      `select role, content
+       from scan_messages
+       where scan_run_id = $1
+       order by created_at asc
+       limit 50`,
+      [scanRunId]
+    );
+    return res.rows as Array<{ role: string; content: string }>;
+  }).catch(() => []);
+
+  const lastUserMsg = [...priorMessages].reverse().find((m) => m.role === "user")?.content?.trim();
+  const resumeHint = lastUserMsg
+    ? `Continue the assessment from where you left off. Operator message: ${lastUserMsg}`
+    : undefined;
+
   if (!isAddressAllowed(ctx.target_address, opts.whitelist)) {
     await withClient(async (c) => {
       await c.query(`update scan_runs set status='failed', finished_at=now() where id=$1`, [scanRunId]);
@@ -805,15 +805,13 @@ export async function runAgentScan(scanRunId: string, opts: AgentOpts) {
 
   const stepId = await withClient(async (c) => {
     await c.query(`update scan_runs set status='running', started_at=now() where id=$1`, [scanRunId]);
-    await c.query(
-      `insert into scan_steps (scan_run_id, name, status, started_at) values ($1,'AI Agent','running',now())`,
+    const ins = await c.query(
+      `insert into scan_steps (scan_run_id, name, status, started_at)
+       values ($1,'AI Agent','running',now())
+       returning id`,
       [scanRunId]
     );
-    const result = await c.query(
-      `select id from scan_steps where scan_run_id=$1 and name='AI Agent' limit 1`,
-      [scanRunId]
-    );
-    return result.rows[0].id as string;
+    return ins.rows[0].id as string;
   });
 
   let logBuf = "";
@@ -848,7 +846,14 @@ export async function runAgentScan(scanRunId: string, opts: AgentOpts) {
 
   let state: AgentState;
   try {
-    state = await runAgentLoop(ctx.target_address, ctx.target_name, opts, onLog, abortController.signal);
+    state = await runAgentLoop(
+      ctx.target_address,
+      ctx.target_name,
+      opts,
+      onLog,
+      abortController.signal,
+      resumeHint
+    );
   } catch (err: any) {
     clearInterval(cancelPoll);
     await flush(true);

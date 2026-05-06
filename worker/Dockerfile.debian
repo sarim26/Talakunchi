@@ -1,28 +1,22 @@
+# Same as main Dockerfile — slim orchestrator only (SSH to Kali for tools).
 FROM node:20-bookworm-slim
 
 WORKDIR /app
-
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Debian-based worker image (fallback if Kali mirrors misbehave).
-RUN apt-get clean \
-  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial/* \
-  && apt-get -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true update \
-  && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true install -y --no-install-recommends --fix-missing \
-       ca-certificates \
-       curl \
-       git \
-       python3 \
-       python3-pip \
-       python3-venv \
-       make \
-       g++ \
-       nmap \
-       netcat-openbsd \
-       samba-client \
+RUN rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial \
+  && apt-get update \
+     -o Acquire::Retries=5 \
+     -o Acquire::http::Timeout=120 \
+     -o Acquire::https::Timeout=120 \
+     -o Acquire::http::ForceIPv4=true \
+  && apt-get install -y --no-install-recommends \
+     -o Acquire::Retries=5 \
+     ca-certificates \
+     openssh-client \
+     sshpass \
   && rm -rf /var/lib/apt/lists/*
 
-# ── Node deps ─────────────────────────────────────────────────────────────────
 COPY package.json package-lock.json* ./
 RUN npm ci
 

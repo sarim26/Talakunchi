@@ -69,6 +69,17 @@ async function ensureWorkflowTables() {
     `);
     await c.query(`create index if not exists idx_command_approvals_scan_run_id on command_approvals(scan_run_id)`);
     await c.query(`create index if not exists idx_command_approvals_status on command_approvals(status)`);
+
+    await c.query(`
+      create table if not exists scan_messages (
+        id uuid primary key default uuid_generate_v4(),
+        scan_run_id uuid not null references scan_runs(id) on delete cascade,
+        role text not null, -- user | assistant | system
+        content text not null,
+        created_at timestamptz not null default now()
+      )
+    `);
+    await c.query(`create index if not exists idx_scan_messages_run on scan_messages(scan_run_id, created_at asc)`);
   });
 }
 
@@ -420,6 +431,112 @@ app.post("/api/scans/:id/cancel", async (req, reply) => {
     );
   });
   await writeAuditEvent("scan.cancel_requested", { scanRunId }, undefined, "operator");
+  return reply.send({ ok: true });
+});
+
+app.get("/api/scans/:id/messages", async (req) => {
+  const scanRunId = z.string().uuid().parse((req.params as any).id);
+  const rows = await withClient(async (c) => {
+    const res = await c.query(
+      `select id, role, content, created_at
+       from scan_messages
+       where scan_run_id = $1
+       order by created_at asc
+       limit 200`,
+      [scanRunId]
+    );
+    return res.rows;
+  });
+  return rows.map((r) => ({ id: r.id, role: r.role, content: r.content, createdAt: r.created_at }));
+});
+
+app.post("/api/scans/:id/messages", async (req, reply) => {
+  const scanRunId = z.string().uuid().parse((req.params as any).id);
+  const body = z
+    .object({
+      role: z.enum(["user", "assistant", "system"]).default("user"),
+      content: z.string().min(1).max(8000),
+      /** If true, queue a new scan job that continues using message context. */
+      resume: z.coerce.boolean().optional().default(false)
+    })
+    .parse(req.body ?? {});
+
+  const inserted = await withClient(async (c) => {
+    await c.query("begin");
+    try {
+      const ins = await c.query(
+        `insert into scan_messages (scan_run_id, role, content)
+         values ($1, $2, $3)
+         returning id, role, content, created_at`,
+        [scanRunId, body.role, body.content]
+      );
+
+      if (body.resume) {
+        // Reset run status so worker can pick it up again.
+        await c.query(
+          `update scan_runs
+           set status='queued', cancel_requested=false, finished_at=null
+           where id=$1`,
+          [scanRunId]
+        );
+        await c.query(
+          `insert into jobs (type, status, payload)
+           values ('scan', 'queued', $1::jsonb)`,
+          [JSON.stringify({ scanRunId, resume: true })]
+        );
+      }
+
+      await c.query("commit");
+      return ins.rows[0] as { id: string; role: string; content: string; created_at: any };
+    } catch (e) {
+      await c.query("rollback");
+      throw e;
+    }
+  });
+
+  await writeAuditEvent(
+    "scan.message",
+    { scanRunId, role: inserted.role, resumeQueued: body.resume },
+    undefined,
+    "operator"
+  );
+
+  return reply.send({ id: inserted.id, role: inserted.role, content: inserted.content, createdAt: inserted.created_at });
+});
+
+app.post("/api/scans/:id/resume", async (req, reply) => {
+  const scanRunId = z.string().uuid().parse((req.params as any).id);
+  const body = z
+    .object({
+      note: z.string().optional()
+    })
+    .parse(req.body ?? {});
+
+  await withClient(async (c) => {
+    await c.query("begin");
+    try {
+      if (body.note?.trim()) {
+        await c.query(
+          `insert into scan_messages (scan_run_id, role, content) values ($1, 'user', $2)`,
+          [scanRunId, body.note.trim()]
+        );
+      }
+      await c.query(
+        `update scan_runs set status='queued', cancel_requested=false, finished_at=null where id=$1`,
+        [scanRunId]
+      );
+      await c.query(
+        `insert into jobs (type, status, payload) values ('scan', 'queued', $1::jsonb)`,
+        [JSON.stringify({ scanRunId, resume: true })]
+      );
+      await c.query("commit");
+    } catch (e) {
+      await c.query("rollback");
+      throw e;
+    }
+  });
+
+  await writeAuditEvent("scan.resume_queued", { scanRunId }, undefined, "operator");
   return reply.send({ ok: true });
 });
 

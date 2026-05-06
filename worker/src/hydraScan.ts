@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawnWithRemotePolicy } from "./remoteExec.js";
 
 export type HydraService =
   | "ssh"
@@ -57,49 +57,6 @@ export type HydraHttpFormOpts = HydraBaseOpts & {
   failureString: string;
 };
 
-function run(
-  cmd: string,
-  args: string[],
-  opts?: {
-    onStdout?: (chunk: string) => void;
-    onStderr?: (chunk: string) => void;
-    signal?: AbortSignal;
-  }
-) {
-  return new Promise<{ stdout: string; stderr: string; exitCode: number | null }>((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-
-    const onAbort = () => {
-      child.kill("SIGKILL");
-      reject(new Error("aborted"));
-    };
-    if (opts?.signal) {
-      if (opts.signal.aborted) return void onAbort();
-      opts.signal.addEventListener("abort", onAbort, { once: true });
-    }
-
-    child.stdout.on("data", (d: Buffer) => {
-      const s = d.toString("utf8");
-      stdout += s;
-      opts?.onStdout?.(s);
-    });
-    child.stderr.on("data", (d: Buffer) => {
-      const s = d.toString("utf8");
-      stderr += s;
-      opts?.onStderr?.(s);
-    });
-    child.on("error", (e) => {
-      reject(e);
-    });
-    child.on("close", (code) => {
-      opts?.signal?.removeEventListener("abort", onAbort);
-      resolve({ stdout, stderr, exitCode: code });
-    });
-  });
-}
-
 function parseHydraOutput(raw: string, host: string, service: HydraService): HydraCredential[] {
   const results: HydraCredential[] = [];
   const lineRe = /\[(\d+)\]\[([^\]]+)\]\s+host:\s*\S+\s+login:\s*(\S+)\s+password:\s*(.+)/g;
@@ -152,7 +109,7 @@ export async function hydraScan(
   const args = buildBaseArgs(credSource, { ...opts, threads: safeThreads });
   args.push(`${service}://${targetAddress}`);
 
-  const { stdout, stderr, exitCode } = await run("hydra", args, {
+  const { stdout, stderr, exitCode } = await spawnWithRemotePolicy("hydra", args, {
     onStdout: (c) => opts.onOutput?.(c),
     onStderr: (c) => opts.onOutput?.(c),
     signal: opts.signal
@@ -177,7 +134,7 @@ export async function hydraHttpForm(
   const formSpec = `${opts.formPath}:${opts.formBody}:${opts.failureString}`;
   args.push(targetAddress, service, formSpec);
 
-  const { stdout, stderr, exitCode } = await run("hydra", args, {
+  const { stdout, stderr, exitCode } = await spawnWithRemotePolicy("hydra", args, {
     onStdout: (c) => opts.onOutput?.(c),
     onStderr: (c) => opts.onOutput?.(c),
     signal: opts.signal

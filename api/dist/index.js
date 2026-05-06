@@ -5,17 +5,15 @@ import { env } from "./env.js";
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 import { CreateScanSchema, CreateTargetSchema, PipelineConfigSchema, UpdateFindingSchema } from "./schemas.js";
-import { explainWithGemini, summarizeSurfaceWithGemini } from "./llm/gemini.js";
+import { explainWithGemini } from "./llm/gemini.js";
 const app = Fastify({ logger: true });
 const DEFAULT_PIPELINE_CONFIG = {
     maxConcurrentScans: 2,
     requestRatePerMinute: 120,
-    safeMode: true,
-    requireHumanApproval: false,
     auditEnabled: true,
     allowedWordlists: []
 };
-async function ensurePhase1Tables() {
+async function ensureWorkflowTables() {
     await withClient(async (c) => {
         await c.query(`
       create table if not exists pipeline_configs (
@@ -50,6 +48,31 @@ async function ensurePhase1Tables() {
       )
     `);
         await c.query(`create index if not exists idx_recon_assets_target on recon_assets(target_id)`);
+        await c.query(`
+      create table if not exists command_approvals (
+        id uuid primary key default uuid_generate_v4(),
+        scan_run_id uuid not null references scan_runs(id) on delete cascade,
+        command text not null,
+        reasoning text,
+        impact text not null default 'low',
+        status text not null default 'pending', -- pending | approved | rejected
+        decided_by text,
+        created_at timestamptz not null default now(),
+        decided_at timestamptz
+      )
+    `);
+        await c.query(`create index if not exists idx_command_approvals_scan_run_id on command_approvals(scan_run_id)`);
+        await c.query(`create index if not exists idx_command_approvals_status on command_approvals(status)`);
+        await c.query(`
+      create table if not exists scan_messages (
+        id uuid primary key default uuid_generate_v4(),
+        scan_run_id uuid not null references scan_runs(id) on delete cascade,
+        role text not null, -- user | assistant | system
+        content text not null,
+        created_at timestamptz not null default now()
+      )
+    `);
+        await c.query(`create index if not exists idx_scan_messages_run on scan_messages(scan_run_id, created_at asc)`);
     });
 }
 async function getPipelineConfig() {
@@ -277,51 +300,6 @@ app.get("/api/recon-assets", async (req) => {
         lastSeenAt: r.last_seen_at
     }));
 });
-app.post("/api/targets/:id/explain-surface", async (req, reply) => {
-    const targetId = z.string().uuid().parse(req.params.id);
-    const target = await withClient(async (c) => {
-        const tRes = await c.query(`select id, name, address from targets where id=$1`, [targetId]);
-        return tRes.rows[0];
-    });
-    if (!target)
-        return reply.code(404).send({ error: "Target not found" });
-    const services = await withClient(async (c) => {
-        const sRes = await c.query(`select port, protocol, service_name, product, version
-       from services
-       where target_id=$1
-       order by port asc`, [targetId]);
-        return sRes.rows;
-    });
-    const input = {
-        targetName: target.name,
-        targetAddress: target.address,
-        services: services.map((s) => ({
-            port: Number(s.port),
-            protocol: String(s.protocol),
-            serviceName: s.service_name ?? null,
-            product: s.product ?? null,
-            version: s.version ?? null
-        }))
-    };
-    if (env.AI_MODE !== "gemini") {
-        return reply.send({
-            mode: env.AI_MODE,
-            summary: `Found ${input.services.length} open services on ${input.targetName} (${input.targetAddress}).`,
-            keyRisks: [],
-            topExposures: [],
-            remediation: ["Restrict exposure to required subnets only.", "Patch/harden services."],
-            verification: ["Re-run the scan and confirm exposure is reduced."]
-        });
-    }
-    if (!env.GEMINI_API_KEY)
-        return reply.code(400).send({ error: "GEMINI_API_KEY is not set" });
-    const out = await summarizeSurfaceWithGemini({
-        apiKey: env.GEMINI_API_KEY,
-        model: env.GEMINI_MODEL,
-        input
-    });
-    return reply.send({ mode: "gemini", ...out });
-});
 app.post("/api/scans", async (req, reply) => {
     const body = CreateScanSchema.parse(req.body);
     const target = await withClient(async (c) => {
@@ -367,7 +345,7 @@ async function ensureCancelColumn() {
     });
 }
 await ensureCancelColumn();
-await ensurePhase1Tables();
+await ensureWorkflowTables();
 await getPipelineConfig();
 app.post("/api/scans/:id/cancel", async (req, reply) => {
     const scanRunId = z.string().uuid().parse(req.params.id);
@@ -379,6 +357,173 @@ app.post("/api/scans/:id/cancel", async (req, reply) => {
     });
     await writeAuditEvent("scan.cancel_requested", { scanRunId }, undefined, "operator");
     return reply.send({ ok: true });
+});
+app.get("/api/scans/:id/messages", async (req) => {
+    const scanRunId = z.string().uuid().parse(req.params.id);
+    const rows = await withClient(async (c) => {
+        const res = await c.query(`select id, role, content, created_at
+       from scan_messages
+       where scan_run_id = $1
+       order by created_at asc
+       limit 200`, [scanRunId]);
+        return res.rows;
+    });
+    return rows.map((r) => ({ id: r.id, role: r.role, content: r.content, createdAt: r.created_at }));
+});
+app.post("/api/scans/:id/messages", async (req, reply) => {
+    const scanRunId = z.string().uuid().parse(req.params.id);
+    const body = z
+        .object({
+        role: z.enum(["user", "assistant", "system"]).default("user"),
+        content: z.string().min(1).max(8000),
+        /** If true, queue a new scan job that continues using message context. */
+        resume: z.coerce.boolean().optional().default(false)
+    })
+        .parse(req.body ?? {});
+    const inserted = await withClient(async (c) => {
+        await c.query("begin");
+        try {
+            const ins = await c.query(`insert into scan_messages (scan_run_id, role, content)
+         values ($1, $2, $3)
+         returning id, role, content, created_at`, [scanRunId, body.role, body.content]);
+            if (body.resume) {
+                // Reset run status so worker can pick it up again.
+                await c.query(`update scan_runs
+           set status='queued', cancel_requested=false, finished_at=null
+           where id=$1`, [scanRunId]);
+                await c.query(`insert into jobs (type, status, payload)
+           values ('scan', 'queued', $1::jsonb)`, [JSON.stringify({ scanRunId, resume: true })]);
+            }
+            await c.query("commit");
+            return ins.rows[0];
+        }
+        catch (e) {
+            await c.query("rollback");
+            throw e;
+        }
+    });
+    await writeAuditEvent("scan.message", { scanRunId, role: inserted.role, resumeQueued: body.resume }, undefined, "operator");
+    return reply.send({ id: inserted.id, role: inserted.role, content: inserted.content, createdAt: inserted.created_at });
+});
+app.post("/api/scans/:id/resume", async (req, reply) => {
+    const scanRunId = z.string().uuid().parse(req.params.id);
+    const body = z
+        .object({
+        note: z.string().optional()
+    })
+        .parse(req.body ?? {});
+    await withClient(async (c) => {
+        await c.query("begin");
+        try {
+            if (body.note?.trim()) {
+                await c.query(`insert into scan_messages (scan_run_id, role, content) values ($1, 'user', $2)`, [scanRunId, body.note.trim()]);
+            }
+            await c.query(`update scan_runs set status='queued', cancel_requested=false, finished_at=null where id=$1`, [scanRunId]);
+            await c.query(`insert into jobs (type, status, payload) values ('scan', 'queued', $1::jsonb)`, [JSON.stringify({ scanRunId, resume: true })]);
+            await c.query("commit");
+        }
+        catch (e) {
+            await c.query("rollback");
+            throw e;
+        }
+    });
+    await writeAuditEvent("scan.resume_queued", { scanRunId }, undefined, "operator");
+    return reply.send({ ok: true });
+});
+app.post("/api/exploit-runs", async (req, reply) => {
+    const body = z
+        .object({
+        scanRunId: z.string().uuid().optional(),
+        targetId: z.string().uuid().optional(),
+        requestedBy: z.string().optional()
+    })
+        .parse(req.body ?? {});
+    if (!body.scanRunId && !body.targetId) {
+        return reply.code(400).send({ error: "Provide scanRunId or targetId" });
+    }
+    const scanRunId = await withClient(async (c) => {
+        if (body.scanRunId) {
+            const res = await c.query(`select id from scan_runs where id = $1`, [body.scanRunId]);
+            if (res.rows[0])
+                return res.rows[0].id;
+            return null;
+        }
+        const res = await c.query(`select id from scan_runs
+       where target_id = $1 and status = 'succeeded'
+       order by finished_at desc nulls last, created_at desc
+       limit 1`, [body.targetId]);
+        return res.rows[0]?.id ?? null;
+    });
+    if (!scanRunId) {
+        return reply
+            .code(404)
+            .send({ error: "No matching succeeded scan run found. Run a scan first or pass an explicit scanRunId." });
+    }
+    const target = await withClient(async (c) => {
+        const res = await c.query(`select t.address from scan_runs sr join targets t on t.id = sr.target_id where sr.id = $1`, [scanRunId]);
+        return res.rows[0];
+    });
+    await withClient(async (c) => {
+        await c.query(`insert into jobs (type, status, payload)
+       values ('exploit', 'queued', $1::jsonb)`, [JSON.stringify({ scanRunId, requestedBy: body.requestedBy ?? "operator" })]);
+    });
+    await writeAuditEvent("exploit.queued", { scanRunId, requestedBy: body.requestedBy ?? "operator" }, target?.address, "operator");
+    return reply.code(202).send({ scanRunId, status: "queued" });
+});
+app.get("/api/command-approvals", async (req, reply) => {
+    const q = req.query;
+    const scanRunId = q.scanRunId ? z.string().uuid().parse(q.scanRunId) : undefined;
+    if (!scanRunId)
+        return [];
+    const rows = await withClient(async (c) => {
+        const res = await c.query(`
+      select id,
+             scan_run_id,
+             command,
+             reasoning,
+             impact,
+             status,
+             created_at,
+             decided_at,
+             decided_by
+        from command_approvals
+       where scan_run_id = $1
+         and status = 'pending'
+       order by created_at asc
+       limit 50
+      `, [scanRunId]);
+        return res.rows;
+    });
+    return rows.map((r) => ({
+        id: r.id,
+        scanRunId: r.scan_run_id,
+        command: r.command,
+        reasoning: r.reasoning ?? "",
+        impact: r.impact ?? "low",
+        status: r.status,
+        createdAt: r.created_at,
+        decidedAt: r.decided_at ?? null,
+        decidedBy: r.decided_by ?? null
+    }));
+});
+app.patch("/api/command-approvals/:id", async (req, reply) => {
+    const approvalId = z.string().uuid().parse(req.params.id);
+    const body = z.object({ decision: z.enum(["approved", "rejected"]), note: z.string().optional() }).parse(req.body ?? {});
+    const updated = await withClient(async (c) => {
+        const res = await c.query(`
+      update command_approvals
+         set status = $2,
+             decided_by = $3,
+             decided_at = now()
+       where id = $1
+      returning id, status
+      `, [approvalId, body.decision, "operator"]);
+        return res.rows[0];
+    });
+    if (!updated)
+        return reply.code(404).send({ error: "Approval not found" });
+    await writeAuditEvent("approval.decision", { approvalId, decision: body.decision, note: body.note ?? null }, undefined, "operator");
+    return reply.send({ id: updated.id, status: updated.status });
 });
 app.get("/api/scans", async () => {
     const rows = await withClient(async (c) => {
