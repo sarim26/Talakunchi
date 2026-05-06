@@ -15,7 +15,8 @@ const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   maxConcurrentScans: 2,
   requestRatePerMinute: 120,
   auditEnabled: true,
-  allowedWordlists: []
+  // Prefer Kali-provided SecLists by default.
+  allowedWordlists: ["/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-10000.txt"]
 };
 
 async function ensureWorkflowTables() {
@@ -87,7 +88,13 @@ async function getPipelineConfig() {
   return withClient(async (c) => {
     const res = await c.query(`select config from pipeline_configs where id = 1`);
     const parsed = PipelineConfigSchema.safeParse(res.rows[0]?.config);
-    if (parsed.success) return parsed.data;
+    if (parsed.success) {
+      const merged = { ...DEFAULT_PIPELINE_CONFIG, ...parsed.data };
+      if (!Array.isArray(parsed.data.allowedWordlists) || parsed.data.allowedWordlists.length === 0) {
+        merged.allowedWordlists = DEFAULT_PIPELINE_CONFIG.allowedWordlists;
+      }
+      return merged;
+    }
     await c.query(
       `insert into pipeline_configs (id, config, updated_at)
        values (1, $1::jsonb, now())

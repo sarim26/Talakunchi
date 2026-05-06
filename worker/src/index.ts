@@ -20,7 +20,8 @@ const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   maxConcurrentScans: 2,
   requestRatePerMinute: 120,
   auditEnabled: true,
-  allowedWordlists: []
+  // Prefer Kali-provided SecLists by default (used by agent + exploit stages).
+  allowedWordlists: ["/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-10000.txt"]
 };
 
 async function ensureCancelColumn() {
@@ -306,7 +307,13 @@ async function getPipelineConfig() {
   return withClient(async (c) => {
     const res = await c.query(`select config from pipeline_configs where id = 1`);
     const cfg = res.rows[0]?.config as PipelineConfig | undefined;
-    if (cfg) return { ...DEFAULT_PIPELINE_CONFIG, ...cfg };
+    if (cfg) {
+      const merged = { ...DEFAULT_PIPELINE_CONFIG, ...cfg };
+      if (!Array.isArray(cfg.allowedWordlists) || cfg.allowedWordlists.length === 0) {
+        merged.allowedWordlists = DEFAULT_PIPELINE_CONFIG.allowedWordlists;
+      }
+      return merged;
+    }
     await c.query(
       `insert into pipeline_configs (id, config, updated_at)
        values (1, $1::jsonb, now())

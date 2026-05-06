@@ -10,7 +10,7 @@ export function RunDetailPage() {
 
   const cancelM = useMutation({
     mutationFn: async () => {
-      if (!id) throw new Error("Missing scan id");
+      if (!id) throw new Error("Missing scan ID");
       return cancelScan(id);
     }
   });
@@ -186,7 +186,7 @@ export function RunDetailPage() {
                 e.preventDefault();
                 const content = draft.trim();
                 if (!content) return;
-                await sendM.mutateAsync({ content, resume: canResume });
+                await sendM.mutateAsync({ content, resume: false });
                 setDraft("");
                 await msgsQ.refetch();
                 await runQ.refetch();
@@ -198,13 +198,13 @@ export function RunDetailPage() {
               onClick={async () => {
                 const content = draft.trim();
                 if (!content) return;
-                await sendM.mutateAsync({ content, resume: canResume });
+                await sendM.mutateAsync({ content, resume: false });
                 setDraft("");
                 await msgsQ.refetch();
                 await runQ.refetch();
               }}
             >
-              Send{canResume ? " & resume" : ""}
+              Send
             </Button>
           </Stack>
 

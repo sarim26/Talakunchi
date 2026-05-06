@@ -47,6 +47,8 @@ export type AgentOpts = {
   wordlistPath?: string;
 };
 
+type SeedMessage = { role: "user" | "assistant" | "system"; content: string };
+
 export const ALLOWED_BINARIES = new Set([
   "nmap", "masscan", "rustscan", "apt-get", "samba",
   "ls", "apt", "dpkg", "dpkg-query", "gem", 
@@ -383,6 +385,7 @@ AVAILABLE WORDLISTS
   Primary : ${wordlist}
   Dirs    : /usr/share/wordlists/dirb/common.txt
   Users   : /usr/share/seclists/Usernames/top-usernames-shortlist.txt
+  NOTE    : Avoid rockyou by default (too noisy). Prefer SecLists/Kali curated lists.
 
 YOUR APPROACH
   1. Start with nmap -vv (or -vvv) -sV -sC to find open ports and service versions (avoid nmap -d debug)
@@ -421,7 +424,11 @@ async function runAgentLoop(
   opts: AgentOpts,
   onLog: (text: string) => Promise<void>,
   signal?: AbortSignal,
-  initialUserInstruction?: string
+  initialUserInstruction?: string,
+  seed?: {
+    messages?: SeedMessage[];
+    priorAgentLogTail?: string;
+  }
 ): Promise<AgentState> {
   const parseRetryDelayMs = (msg: string): number | null => {
     const fromJson = /"retryDelay"\s*:\s*"(\d+)s"/i.exec(msg);
@@ -457,6 +464,18 @@ async function runAgentLoop(
 
   const history: Content[] = [];
 
+  const seedMessages = (seed?.messages ?? []).filter((m) => m.content?.trim());
+  if (seedMessages.length > 0) {
+    // Seed chat history so "resume" doesn't restart from scratch.
+    for (const m of seedMessages.slice(-50)) {
+      const role = m.role === "assistant" ? "model" : "user";
+      history.push({
+        role,
+        parts: [{ text: m.content.slice(0, 8000) }]
+      });
+    }
+  }
+
   await onLog("\n╔══════════════════════════════════════════════╗\n");
   await onLog("║  TALAKUNCHI · AI AGENT · FREE-FORM COMMANDS  ║\n");
   await onLog("╚══════════════════════════════════════════════╝\n");
@@ -465,13 +484,29 @@ async function runAgentLoop(
   await onLog(`  steps   : max ${maxSteps}\n`);
   await onLog("  shell     : bash xtrace+verbose (no wall-clock kill)\n\n");
 
+  const priorLogTail = seed?.priorAgentLogTail?.trim();
+  const resumePrefix =
+    seedMessages.length > 0 || priorLogTail
+      ? [
+          "You are resuming an existing assessment run.",
+          "Do NOT repeat scans/commands that were already executed unless you have a clear reason (e.g., new ports, new scope, or prior output was incomplete).",
+          priorLogTail ? `Prior agent log (tail):\n${priorLogTail}` : null
+        ]
+          .filter(Boolean)
+          .join("\n\n")
+      : null;
+
   history.push({
     role: "user",
     parts: [
       {
-        text:
+        text: [
+          resumePrefix,
           initialUserInstruction?.trim() ||
-          `Begin the security assessment of ${targetAddress}. Think step by step and run your first command`
+            `Begin the security assessment of ${targetAddress}. Think step by step and run your first command`
+        ]
+          .filter(Boolean)
+          .join("\n\n")
       }
     ]
   });
@@ -556,7 +591,16 @@ async function runAgentLoop(
 
           await onLog(`│\n│ 💭 ${reasoning}\n│ $ ${command}\n│\n`);
 
-          const validation = validateCommand(command, { whitelist: opts.whitelist });
+          const validation = validateCommand(command, {
+            whitelist: opts.whitelist,
+            extraGuard: (cmd) => {
+              // Enforce "Kali wordlists by default": block rockyou unless operator explicitly configures otherwise.
+              if (/\brockyou\.txt(\.gz)?\b/i.test(cmd) || /\/usr\/share\/wordlists\/rockyou/i.test(cmd)) {
+                return "rockyou is blocked by policy. Use Kali/SecLists lists (e.g. /usr/share/seclists/... or /usr/share/wordlists/dirb/common.txt) or change configuration explicitly.";
+              }
+              return null;
+            }
+          });
           if (!validation.allowed) {
             result = `BLOCKED: ${validation.reason}`;
             await onLog(`│ ⛔ ${result}\n`);
@@ -796,6 +840,20 @@ export async function runAgentScan(scanRunId: string, opts: AgentOpts) {
     ? `Continue the assessment from where you left off. Operator message: ${lastUserMsg}`
     : undefined;
 
+  const priorAgentLogTail = await withClient(async (c) => {
+    const res = await c.query(
+      `select log
+       from scan_steps
+       where scan_run_id = $1 and name = 'AI Agent'
+       order by created_at desc
+       limit 1`,
+      [scanRunId]
+    );
+    const log = (res.rows[0]?.log as string | undefined) ?? "";
+    if (!log) return "";
+    return log.slice(Math.max(0, log.length - 12_000));
+  }).catch(() => "");
+
   if (!isAddressAllowed(ctx.target_address, opts.whitelist)) {
     await withClient(async (c) => {
       await c.query(`update scan_runs set status='failed', finished_at=now() where id=$1`, [scanRunId]);
@@ -804,7 +862,38 @@ export async function runAgentScan(scanRunId: string, opts: AgentOpts) {
   }
 
   const stepId = await withClient(async (c) => {
-    await c.query(`update scan_runs set status='running', started_at=now() where id=$1`, [scanRunId]);
+    // Resume should not "restart" the run timeline. Keep original started_at if present.
+    await c.query(
+      `update scan_runs
+       set status='running',
+           started_at = coalesce(started_at, now())
+       where id=$1`,
+      [scanRunId]
+    );
+
+    // Reuse the most recent AI Agent step if it exists; otherwise create one.
+    const existing = await c.query(
+      `select id
+       from scan_steps
+       where scan_run_id = $1 and name = 'AI Agent'
+       order by created_at desc
+       limit 1`,
+      [scanRunId]
+    );
+
+    const existingId = existing.rows[0]?.id as string | undefined;
+    if (existingId) {
+      await c.query(
+        `update scan_steps
+         set status='running',
+             started_at = coalesce(started_at, now()),
+             finished_at = null
+         where id = $1`,
+        [existingId]
+      );
+      return existingId;
+    }
+
     const ins = await c.query(
       `insert into scan_steps (scan_run_id, name, status, started_at)
        values ($1,'AI Agent','running',now())
@@ -852,7 +941,14 @@ export async function runAgentScan(scanRunId: string, opts: AgentOpts) {
       opts,
       onLog,
       abortController.signal,
-      resumeHint
+      resumeHint,
+      {
+        messages: priorMessages.map((m) => ({
+          role: (m.role === "assistant" || m.role === "system" || m.role === "user" ? m.role : "user") as any,
+          content: String(m.content ?? "")
+        })),
+        priorAgentLogTail
+      }
     );
   } catch (err: any) {
     clearInterval(cancelPoll);
