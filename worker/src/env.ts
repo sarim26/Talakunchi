@@ -5,13 +5,22 @@ const EnvSchema = z.object({
   NEO4J_URI: z.string().min(1),
   NEO4J_USER: z.string().min(1),
   NEO4J_PASSWORD: z.string().min(1),
-  SCAN_MODE: z.enum(["nmap", "agent"]).default("nmap"),
-  AGENT_ENABLED: z.coerce.boolean().default(true),
-  GEMINI_API_KEY: z.string().optional(),
-  GEMINI_MODEL: z.string().optional().default("gemini-3.1-flash-lite-preview"),
-  AGENT_MAX_STEPS: z.coerce.number().default(30),
-  AGENT_SCOPE: z.string().optional().default(""),
-  HYDRA_ENABLED: z.coerce.boolean().default(true),
+
+  /**
+   * MCP recon system: Ollama configuration.
+   * Models can be overridden via env; defaults match the design doc:
+   *   manager:    qwen3:14b
+   *   specialist: qwen3:8b
+   *   prompter:   qwen3:8b
+   */
+  OLLAMA_URL: z.string().min(1).default("http://localhost:11434"),
+  OLLAMA_MANAGER_MODEL: z.string().min(1).default("qwen3:14b"),
+  OLLAMA_SPECIALIST_MODEL: z.string().min(1).default("qwen3:8b"),
+  OLLAMA_PROMPTER_MODEL: z.string().min(1).default("qwen3:8b"),
+  RECON_MAX_STEPS: z.coerce.number().int().positive().default(20),
+
+  /** Legacy classic-scan settings (still used by the deterministic nmap pipeline). */
+  HYDRA_ENABLED: z.coerce.boolean().default(false),
   HYDRA_USERNAME: z.string().optional(),
   HYDRA_PASSWORD: z.string().optional(),
   HYDRA_USERLIST: z.string().optional(),
@@ -23,13 +32,10 @@ const EnvSchema = z.object({
     .optional()
     .default("-Pn -vvv --reason --stats-every 5s -sV --version-light --top-ports 200"),
   POLL_INTERVAL_MS: z.coerce.number().default(1500),
-  EXPLOIT_ENABLED: z.coerce.boolean().default(true),
-  EXPLOIT_MAX_STEPS: z.coerce.number().default(15),
-  EXPLOIT_LHOST_ALLOWLIST: z.string().optional().default(""),
 
   /**
-   * All tool execution (nmap, hydra, AI execute_command, etc.) goes over SSH to this host.
-   * The worker container runs only Node + DB clients; it must not run scans locally.
+   * All tool execution (nmap, smbclient, openssl, curl, gobuster, dig, ...) goes
+   * over SSH to this host. The worker container only runs Node + DB clients.
    */
   REMOTE_SSH_HOST: z
     .string()
@@ -40,7 +46,6 @@ const EnvSchema = z.object({
     .transform((s) => s.trim())
     .pipe(z.string().min(1, "REMOTE_SSH_USER is required")),
   REMOTE_SSH_PORT: z.coerce.number().default(22),
-  /** Non-interactive auth; prefer REMOTE_SSH_IDENTITY_FILE when possible (password is visible in `ps` while sshpass runs). */
   REMOTE_SSH_PASSWORD: z.string().optional(),
   REMOTE_SSH_IDENTITY_FILE: z.string().optional(),
   REMOTE_SSH_STRICT_HOST_KEY_CHECKING: z.enum(["yes", "no", "accept-new"]).default("accept-new")
@@ -57,4 +62,3 @@ const EnvSchema = z.object({
 });
 
 export const env = EnvSchema.parse(process.env);
-

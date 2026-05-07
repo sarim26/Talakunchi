@@ -1,0 +1,114 @@
+import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
+import { remoteRun, snippet } from "./shared.js";
+import { parseNmapXml } from "../nmapScan.js";
+
+const DEFAULT_TOP_PORTS = 200;
+
+/**
+ * recon.nmap — port + light service detection.
+ *
+ * Phases supported via `args.profile`:
+ *   "fast"      → -Pn -T4 --top-ports 200 -sV --version-light
+ *   "targeted"  → uses args.ports
+ *   "deep"      → -Pn -sV -O --version-all --top-ports 1000 (heavier)
+ */
+export const nmapTool: ToolDefinition = {
+  name: "recon.nmap",
+  description: "Run an nmap scan to discover open ports and detect services on a target host.",
+  tags: ["recon", "network"],
+  requires: ["target"],
+  defaultTimeoutMs: 15 * 60 * 1000,
+  argSchema: {
+    profile: { type: "string", enum: ["fast", "targeted", "deep"], default: "fast" },
+    ports: { type: "array", items: { type: "number" } }
+  },
+  handler: async (input, emit): Promise<ToolEnvelope> => {
+    const profile = String((input.args as Record<string, unknown> | undefined)?.profile ?? "fast");
+    const portsArg = (input.args as Record<string, unknown> | undefined)?.ports as number[] | undefined;
+
+    const baseArgs = ["-Pn", "--reason", "--stats-every", "10s", "-oX", "-"];
+    if (profile === "deep") {
+      baseArgs.push("-sV", "--version-all", "--top-ports", "1000");
+    } else if (profile === "targeted" && portsArg && portsArg.length > 0) {
+      baseArgs.push("-sV", "--version-light", "-p", portsArg.join(","));
+    } else {
+      baseArgs.push("-T4", "-sV", "--version-light", "--top-ports", String(DEFAULT_TOP_PORTS));
+    }
+
+    baseArgs.push(input.target.host);
+    emit.log(`Starting nmap (${profile}) on ${input.target.host}`);
+
+    const r = await remoteRun("nmap", baseArgs, input.signal, (s) => emit.log(s));
+    const parsed = parseNmapXml(r.stdout, input.target.host);
+    if (!parsed) {
+      return {
+        status: "failed",
+        error: "Failed to parse nmap XML output",
+        artifacts: { commands: [r.command], stdoutSnippet: snippet(r.stdout), stderrSnippet: snippet(r.stderr) },
+        facts: [],
+        findings: [],
+        recommendations: [],
+        meta: { exitCode: r.exitCode, profile },
+        durationMs: r.durationMs
+      };
+    }
+
+    const openServices = parsed.services
+      .filter((s) => s.state === "open")
+      .map((s) => ({
+        port: s.port,
+        protocol: s.protocol,
+        name: s.serviceName ?? "",
+        product: s.product ?? "",
+        version: s.version ?? "",
+        banner: s.banner ?? ""
+      }));
+
+    for (const svc of openServices) emit.fact({ type: "service", value: svc, source: "nmap" });
+
+    const recs: ToolEnvelope["recommendations"] = [];
+    const has = (port: number) => openServices.some((s) => s.port === port);
+    if (has(80) || has(8080) || has(443) || has(8443)) {
+      recs.push({ agent: "recon.http_probe", reason: "HTTP/HTTPS ports open", priority: 80 });
+    }
+    if (has(443) || has(8443)) {
+      recs.push({ agent: "recon.tls_check", reason: "TLS ports open", priority: 70 });
+    }
+    if (has(53)) {
+      recs.push({ agent: "recon.dns_enum", reason: "DNS port open", priority: 60 });
+    }
+    if (has(445) || has(139)) {
+      recs.push({ agent: "recon.smb_enum", reason: "SMB ports open", priority: 75 });
+    }
+    if (has(22)) {
+      recs.push({ agent: "recon.ssh_enum", reason: "SSH port open", priority: 60 });
+    }
+    if (openServices.length > 0) {
+      recs.push({ agent: "recon.cve_enricher", reason: "Enrich detected services with CVE matches", priority: 50 });
+    }
+
+    return {
+      status: "succeeded",
+      durationMs: r.durationMs,
+      artifacts: { commands: [r.command], stdoutSnippet: snippet(r.stdout), stderrSnippet: snippet(r.stderr) },
+      facts: openServices.map((svc) => ({ type: "service", value: svc, source: "nmap" })),
+      findings: openServices.map((svc) => ({
+        title: `Open service: ${svc.port}/${svc.protocol}${svc.name ? ` (${svc.name})` : ""}`,
+        severity: severityForPort(svc.port),
+        port: svc.port,
+        protocol: svc.protocol,
+        evidence: `Detected ${svc.name || "service"}${svc.product ? ` ${svc.product}` : ""}${svc.version ? ` ${svc.version}` : ""} on ${input.target.host}:${svc.port}/${svc.protocol}`,
+        fingerprint: `nmap|${input.target.host}|${svc.protocol}|${svc.port}`
+      })),
+      recommendations: recs,
+      meta: { exitCode: r.exitCode, profile, serviceCount: openServices.length, hostStatus: parsed.status }
+    };
+  }
+};
+
+function severityForPort(port: number): "info" | "low" | "medium" | "high" | "critical" {
+  if ([3389, 445].includes(port)) return "medium";
+  if ([21, 23, 25, 110, 139].includes(port)) return "medium";
+  if ([22, 5985, 5986, 80].includes(port)) return "low";
+  return "info";
+}

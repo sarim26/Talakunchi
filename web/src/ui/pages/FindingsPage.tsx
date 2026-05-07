@@ -1,22 +1,24 @@
 import { useMemo, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import {
   Alert,
   Box,
   Card,
   CardContent,
   Chip,
-  Dialog,
-  DialogContent,
-  DialogTitle,
   Divider,
   MenuItem,
   Select,
   Stack,
   Typography
 } from "@mui/material";
-import { explainFinding, listFindings, listTargets } from "../../lib/api";
+import { listFindings, listTargets } from "../../lib/api";
 
+/**
+ * Findings list. Per-finding "Explain AI" was intentionally removed —
+ * AI summarisation now happens once per agentic-recon run from the
+ * Agentic Recon page (one summary covering the whole scan).
+ */
 export function FindingsPage() {
   const targetsQ = useQuery({ queryKey: ["targets"], queryFn: listTargets });
   const [targetId, setTargetId] = useState<string>("");
@@ -33,30 +35,6 @@ export function FindingsPage() {
     refetchInterval: 2000
   });
 
-  const [dialogOpen, setDialogOpen] = useState(false);
-  const [explainData, setExplainData] = useState<null | {
-    summary: string;
-    whyItMatters: string;
-    remediation: string[];
-    verification: string[];
-  }>(null);
-  const [explainError, setExplainError] = useState<string | null>(null);
-  const [selectedFindingId, setSelectedFindingId] = useState<string | null>(null);
-
-  const explainM = useMutation({
-    mutationFn: (fId: string) => explainFinding(fId),
-    onMutate: async () => {
-      setExplainError(null);
-      setExplainData(null);
-      setDialogOpen(true);
-    },
-    onSuccess: (data) => {
-      setExplainData(data);
-    },
-    onError: (e) => {
-      setExplainError(String(e));
-    }
-  });
   const findings = findingsQ.data ?? [];
 
   const bySeverity = useMemo(() => {
@@ -72,6 +50,10 @@ export function FindingsPage() {
       <Typography variant="h5" gutterBottom>
         Findings
       </Typography>
+
+      <Alert severity="info" sx={{ mb: 2 }}>
+        AI explanations are now generated once per run from the <strong>Agentic Recon</strong> page (one summary covering the whole scan).
+      </Alert>
 
       <Card sx={{ mb: 2 }}>
         <CardContent>
@@ -121,10 +103,8 @@ export function FindingsPage() {
               {findings.map((f) => (
                 <Box key={f.id} sx={{ display: "flex", alignItems: "center", gap: 2 }}>
                   <Box sx={{ flexGrow: 1 }}>
-                    <Typography variant="body1">
-                      {f.title}
-                    </Typography>
-                    <Stack direction="row" spacing={1} sx={{ mt: 0.5 }}>
+                    <Typography variant="body1">{f.title}</Typography>
+                    <Stack direction="row" spacing={1} sx={{ mt: 0.5 }} flexWrap="wrap" useFlexGap>
                       <Chip size="small" label={f.severity} />
                       <Chip size="small" label={f.status} />
                       <Chip size="small" label={`${f.target.name} (${f.target.address})`} />
@@ -133,17 +113,6 @@ export function FindingsPage() {
                     <Typography variant="body2" color="text.secondary" sx={{ mt: 0.8 }}>
                       {f.evidenceRedacted}
                     </Typography>
-                  </Box>
-                  <Box>
-                    <Chip
-                      clickable
-                      color="primary"
-                      label="Explain AI"
-                      onClick={() => {
-                        setSelectedFindingId(f.id);
-                        explainM.mutate(f.id);
-                      }}
-                    />
                   </Box>
                 </Box>
               ))}
@@ -155,52 +124,6 @@ export function FindingsPage() {
           )}
         </CardContent>
       </Card>
-
-      <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="md" fullWidth>
-        <DialogTitle>AI finding explanation</DialogTitle>
-        <DialogContent>
-          {explainError ? <Alert severity="error">{explainError}</Alert> : null}
-          {explainM.isPending ? <Typography>Generating…</Typography> : null}
-          {explainData ? (
-            <Stack spacing={2} sx={{ mt: 1 }}>
-              <Box>
-                <Typography variant="subtitle2">Summary</Typography>
-                <Typography variant="body2">{explainData.summary}</Typography>
-              </Box>
-              <Box>
-                <Typography variant="subtitle2">Why it matters</Typography>
-                <Typography variant="body2">{explainData.whyItMatters}</Typography>
-              </Box>
-              <Box>
-                <Typography variant="subtitle2">Recommended remediation</Typography>
-                <ul>
-                  {explainData.remediation.map((r, i) => (
-                    <li key={i}>
-                      <Typography variant="body2">{r}</Typography>
-                    </li>
-                  ))}
-                </ul>
-              </Box>
-              <Box>
-                <Typography variant="subtitle2">Verification</Typography>
-                <ul>
-                  {explainData.verification.map((r, i) => (
-                    <li key={i}>
-                      <Typography variant="body2">{r}</Typography>
-                    </li>
-                  ))}
-                </ul>
-              </Box>
-            </Stack>
-          ) : null}
-          {!explainData && !explainM.isPending && selectedFindingId ? (
-            <Typography variant="body2" color="text.secondary">
-              Unable to generate explanation for this finding.
-            </Typography>
-          ) : null}
-        </DialogContent>
-      </Dialog>
     </Box>
   );
 }
-

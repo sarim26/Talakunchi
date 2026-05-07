@@ -1,4 +1,5 @@
 import React from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -18,16 +19,20 @@ import {
   Typography
 } from "@mui/material";
 import {
-  createExploitRun,
+  AgentEvent,
+  AgentInvocation,
+  AgentRun,
+  getAgentRun,
+  getAgentRunEvents,
+  getAgentRunInvocations,
   getPipelineConfig,
+  listAgentRuns,
   listAuditEvents,
-  listCommandApprovals,
   listFindings,
   listReconAssets,
   listScans,
   listServices,
   listTargets,
-  decideCommandApproval,
   updatePipelineConfig
 } from "../../lib/api";
 
@@ -107,41 +112,12 @@ export function PipelinePage() {
   const pipelineQ = useQuery({ queryKey: ["pipeline-config"], queryFn: getPipelineConfig, refetchInterval: 5000 });
   const auditQ = useQuery({ queryKey: ["audit-events"], queryFn: () => listAuditEvents(12), refetchInterval: 5000 });
 
-  const latestSucceededId = (() => {
-    const rs = runsQ.data ?? [];
-    const targetRuns = rs.filter((r) => !targetId || r.targetId === targetId);
-    const succeeded = targetRuns.filter((r) => r.status === "succeeded");
-    return succeeded[0]?.id ?? null;
-  })();
-
-  const approvalsQ = useQuery({
-    queryKey: ["command-approvals", latestSucceededId ?? ""],
-    queryFn: () => listCommandApprovals(latestSucceededId as string),
-    enabled: Boolean(latestSucceededId),
-    refetchInterval: 2000
-  });
   const saveM = useMutation({
     mutationFn: updatePipelineConfig,
     onSuccess: async (updated) => {
       setConfig(updated);
       await qc.invalidateQueries({ queryKey: ["pipeline-config"] });
       await qc.invalidateQueries({ queryKey: ["audit-events"] });
-    }
-  });
-
-  const exploitM = useMutation({
-    mutationFn: (input: { scanRunId?: string; targetId?: string }) => createExploitRun(input),
-    onSuccess: async () => {
-      await qc.invalidateQueries({ queryKey: ["audit-events"] });
-      await qc.invalidateQueries({ queryKey: ["runs"] });
-    }
-  });
-
-  const decideApprovalM = useMutation({
-    mutationFn: (input: { approvalId: string; decision: "approved" | "rejected" }) =>
-      decideCommandApproval(input.approvalId, { decision: input.decision }),
-    onSuccess: async () => {
-      await qc.invalidateQueries({ queryKey: ["command-approvals"] });
     }
   });
 
@@ -276,157 +252,6 @@ export function PipelinePage() {
             </Box>
           ) : null}
 
-          {stage.id === 4 ? (() => {
-            const targetRuns = runs.filter((r) => !targetId || r.targetId === targetId);
-            const succeeded = targetRuns.filter((r) => r.status === "succeeded");
-            const latestSucceeded = succeeded[0];
-            const exploitEvents = (auditQ.data ?? []).filter((e) =>
-              e.action.startsWith("agent.exploit.") || e.action.startsWith("exploit.")
-            );
-            const pendingApprovals = approvalsQ.data ?? [];
-            return (
-              <Box sx={{ mb: 2 }}>
-                <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                  AI Exploitation Control
-                </Typography>
-                <Stack spacing={2}>
-                  <Stack direction={{ xs: "column", md: "row" }} spacing={2} alignItems={{ md: "center" }}>
-                    <Chip
-                      label={
-                        latestSucceeded
-                          ? `Latest scan: ${latestSucceeded.target.name} - ${new Date(
-                              (latestSucceeded.finishedAt ?? latestSucceeded.createdAt) as string
-                            ).toLocaleString()}`
-                          : targetId
-                          ? "No succeeded scans for this target yet"
-                          : "Pick a target above (or run any scan) to enable manual exploitation"
-                      }
-                      color={latestSucceeded ? "success" : "default"}
-                      variant="outlined"
-                    />
-                    <Button
-                      variant="contained"
-                      color="warning"
-                      disabled={(!latestSucceeded && !targetId) || exploitM.isPending}
-                      onClick={() =>
-                        exploitM.mutate(
-                          latestSucceeded ? { scanRunId: latestSucceeded.id } : { targetId: targetId || undefined }
-                        )
-                      }
-                    >
-                      {exploitM.isPending ? "Queueing..." : "Launch AI Exploitation"}
-                    </Button>
-                  </Stack>
-                  <Typography variant="caption" color="text.secondary">
-                    Auto-trigger after a successful scan is controlled by the worker env flag EXPLOIT_ENABLED. The
-                    AI agent will pick exploit/credential modules (hydra, medusa, ncrack, msfconsole, sqlmap...),
-                    install missing tools on demand, and stop after at most 15 commands. Reverse-shell payloads are
-                    pinned to the worker host - no external callbacks.
-                  </Typography>
-                  {exploitM.isError ? (
-                    <Alert severity="error">
-                      {exploitM.error instanceof Error ? exploitM.error.message : String(exploitM.error)}
-                    </Alert>
-                  ) : null}
-                  {exploitM.isSuccess ? (
-                    <Alert severity="success">
-                      Exploitation queued for scan {exploitM.data?.scanRunId.slice(0, 8)}... - watch the scan run
-                      page for the "AI Exploitation" step log.
-                    </Alert>
-                  ) : null}
-
-                  <Divider />
-                  <Typography variant="subtitle2">Pending High-Impact Exploit Commands</Typography>
-                  {approvalsQ.isError ? (
-                    <Alert severity="error">Failed to load pending approvals.</Alert>
-                  ) : pendingApprovals.length === 0 ? (
-                    <Typography variant="body2" color="text.secondary">
-                      No high-impact msfconsole exploit commands pending approval.
-                    </Typography>
-                  ) : (
-                    <Stack spacing={1}>
-                      {pendingApprovals.slice(0, 10).map((a) => (
-                        <Box
-                          key={a.id}
-                          sx={{ p: 1, border: "1px solid", borderColor: "divider", borderRadius: 1 }}
-                        >
-                          <Typography variant="body2" sx={{ mb: 0.5 }}>
-                            {a.impact.toUpperCase()} • {a.status}
-                          </Typography>
-                          <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
-                            Command:
-                          </Typography>
-                          <Typography
-                            variant="caption"
-                            color="text.secondary"
-                            component="pre"
-                            sx={{ m: 0, mt: 0.5, whiteSpace: "pre-wrap", wordBreak: "break-all" }}
-                          >
-                            {a.command}
-                          </Typography>
-                          <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
-                            <Button
-                              size="small"
-                              variant="contained"
-                              color="success"
-                              disabled={decideApprovalM.isPending}
-                              onClick={() => decideApprovalM.mutate({ approvalId: a.id, decision: "approved" })}
-                            >
-                              Approve
-                            </Button>
-                            <Button
-                              size="small"
-                              variant="outlined"
-                              color="error"
-                              disabled={decideApprovalM.isPending}
-                              onClick={() => decideApprovalM.mutate({ approvalId: a.id, decision: "rejected" })}
-                            >
-                              Reject
-                            </Button>
-                          </Stack>
-                        </Box>
-                      ))}
-                    </Stack>
-                  )}
-
-                  <Divider />
-                  <Typography variant="subtitle2">Recent Exploitation Audit Events</Typography>
-                  {exploitEvents.length === 0 ? (
-                    <Typography variant="body2" color="text.secondary">
-                      No exploitation activity yet. Launch a run above (or wait for the next scan to auto-trigger).
-                    </Typography>
-                  ) : (
-                    <Stack spacing={1}>
-                      {exploitEvents.slice(0, 10).map((e) => (
-                        <Box
-                          key={e.id}
-                          sx={{ p: 1, border: "1px solid", borderColor: "divider", borderRadius: 1 }}
-                        >
-                          <Typography variant="body2">
-                            {e.actor} - {e.action}
-                          </Typography>
-                          <Typography variant="caption" color="text.secondary">
-                            {new Date(e.createdAt).toLocaleString()} {e.target ? `- ${e.target}` : ""}
-                          </Typography>
-                          {e.payload && Object.keys(e.payload).length > 0 ? (
-                            <Typography
-                              variant="caption"
-                              color="text.secondary"
-                              component="pre"
-                              sx={{ m: 0, mt: 0.5, whiteSpace: "pre-wrap", wordBreak: "break-all" }}
-                            >
-                              {JSON.stringify(e.payload, null, 2)}
-                            </Typography>
-                          ) : null}
-                        </Box>
-                      ))}
-                    </Stack>
-                  )}
-                </Stack>
-              </Box>
-            );
-          })() : null}
-
           {stage.id === 2 ? (
             <Box sx={{ mb: 2 }}>
               <Typography variant="subtitle2" sx={{ mb: 1 }}>
@@ -504,6 +329,9 @@ export function PipelinePage() {
               <Typography variant="subtitle2" sx={{ mb: 1 }}>
                 Recent Audit Events
               </Typography>
+              {/* Audit + agent telemetry sit on Stage 1 because that's the
+                  operator-control stage; the AI commentary lives here so the
+                  human-in-the-loop can see exactly what the agents ran. */}
               <Stack spacing={1}>
                 {(auditQ.data ?? []).map((e) => (
                   <Box key={e.id} sx={{ p: 1, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
@@ -516,10 +344,155 @@ export function PipelinePage() {
                   </Box>
                 ))}
               </Stack>
+
+              <Divider sx={{ my: 2 }} />
+              <LatestAgentTelemetry targetId={targetId} />
             </>
           ) : null}
         </CardContent>
       </Card>
+    </Box>
+  );
+}
+
+/**
+ * Compact telemetry surface — shows what the latest Agentic Recon run is
+ * doing right now: manager decisions, tool invocations, the actual command
+ * that ran, and a stdout/stderr snippet. Operator can deep-link into the
+ * full Agentic Recon page for more.
+ */
+function LatestAgentTelemetry(props: { targetId: string }) {
+  const runsQ = useQuery({
+    queryKey: ["agent-runs-latest", props.targetId || "any"],
+    queryFn: () => listAgentRuns({ targetId: props.targetId || undefined, limit: 1 }),
+    refetchInterval: 4000
+  });
+  const latest: AgentRun | undefined = runsQ.data?.[0];
+
+  const runQ = useQuery({
+    queryKey: ["pipeline-agent-run", latest?.id],
+    queryFn: () => getAgentRun(latest!.id),
+    enabled: Boolean(latest),
+    refetchInterval: 3000
+  });
+  const invocationsQ = useQuery({
+    queryKey: ["pipeline-agent-run-invocations", latest?.id],
+    queryFn: () => getAgentRunInvocations(latest!.id),
+    enabled: Boolean(latest),
+    refetchInterval: 3000
+  });
+  const eventsQ = useQuery({
+    queryKey: ["pipeline-agent-run-events", latest?.id],
+    queryFn: () => getAgentRunEvents(latest!.id),
+    enabled: Boolean(latest),
+    refetchInterval: 3000
+  });
+
+  if (!latest) {
+    return (
+      <Box>
+        <Typography variant="subtitle2" sx={{ mb: 1 }}>
+          Agent telemetry
+        </Typography>
+        <Typography variant="body2" color="text.secondary">
+          No agentic recon runs yet.{" "}
+          <Link to="/agents">Start one in Agentic Recon →</Link>
+        </Typography>
+      </Box>
+    );
+  }
+
+  const run = runQ.data ?? latest;
+  const invocations: AgentInvocation[] = invocationsQ.data ?? [];
+  const decisionEvents: AgentEvent[] = (eventsQ.data ?? []).filter((e) => e.kind === "manager.decision");
+
+  return (
+    <Box>
+      <Stack direction={{ xs: "column", md: "row" }} spacing={1} alignItems={{ md: "center" }} justifyContent="space-between" sx={{ mb: 1 }}>
+        <Typography variant="subtitle2">
+          Agent telemetry — latest run on {run.target.name}
+        </Typography>
+        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+          <Chip size="small" label={run.status} />
+          <Chip size="small" label={`steps ${run.stepsTaken}/${run.maxSteps}`} variant="outlined" />
+          <Chip size="small" label={`tools ${run.invocationCount}`} variant="outlined" />
+          <Chip
+            size="small"
+            label={`findings ${run.findingCount}`}
+            variant="outlined"
+            color={run.findingCount ? "warning" : "default"}
+          />
+          <Button size="small" component={Link} to="/agents">Open Agentic Recon</Button>
+        </Stack>
+      </Stack>
+
+      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 2 }}>
+        <Card variant="outlined">
+          <CardContent>
+            <Typography variant="caption" color="text.secondary">Recent manager decisions</Typography>
+            {decisionEvents.length === 0 ? (
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>No decisions yet.</Typography>
+            ) : (
+              <Stack spacing={0.75} sx={{ mt: 1 }}>
+                {decisionEvents.slice(-5).map((e) => {
+                  const p = (e.payload ?? {}) as { step?: number; decision?: { action?: string; tool?: string; intentGoal?: string; reason?: string; reasoning?: string } };
+                  const d = p.decision ?? {};
+                  return (
+                    <Box key={e.id} sx={{ p: 0.75, border: "1px dashed", borderColor: "divider", borderRadius: 1 }}>
+                      <Typography variant="body2">
+                        <strong>step {p.step ?? "?"}</strong> · {d.action ?? "?"}{d.tool ? ` → ${d.tool}` : ""}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {d.intentGoal ?? d.reason ?? d.reasoning ?? ""}
+                      </Typography>
+                    </Box>
+                  );
+                })}
+              </Stack>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card variant="outlined">
+          <CardContent>
+            <Typography variant="caption" color="text.secondary">Specialist invocations (commands & status)</Typography>
+            {invocations.length === 0 ? (
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>No invocations yet.</Typography>
+            ) : (
+              <Stack spacing={0.75} sx={{ mt: 1 }}>
+                {invocations.slice(-6).map((inv) => {
+                  const env = (inv.envelope ?? {}) as {
+                    artifacts?: { commands?: string[]; stdoutSnippet?: string; stderrSnippet?: string };
+                    durationMs?: number;
+                    error?: string;
+                  };
+                  const cmd = env.artifacts?.commands?.[0];
+                  return (
+                    <Box key={inv.id} sx={{ p: 0.75, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+                      <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                        <Typography variant="body2" sx={{ fontWeight: 600 }}>{inv.tool}</Typography>
+                        <Chip size="small" label={inv.status} />
+                      </Stack>
+                      {cmd ? (
+                        <Box sx={{ p: 0.75, bgcolor: "grey.100", borderRadius: 1, mt: 0.5, maxHeight: 80, overflow: "auto" }}>
+                          <Typography variant="caption" component="pre" sx={{ m: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "monospace" }}>
+                            $ {cmd}
+                          </Typography>
+                        </Box>
+                      ) : null}
+                      {env.error ? (
+                        <Typography variant="caption" color="error" sx={{ display: "block", mt: 0.5 }}>
+                          err: {env.error}
+                        </Typography>
+                      ) : null}
+                    </Box>
+                  );
+                })}
+              </Stack>
+            )}
+          </CardContent>
+        </Card>
+      </Box>
     </Box>
   );
 }

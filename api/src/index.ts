@@ -5,7 +5,7 @@ import { env } from "./env.js";
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 import { CreateScanSchema, CreateTargetSchema, PipelineConfigSchema, UpdateFindingSchema } from "./schemas.js";
-import { explainWithGemini } from "./llm/gemini.js";
+import { explainWithOllama, listOllamaModels, summariseAgentRunWithOllama } from "./llm/ollama.js";
 
 const app = Fastify({ logger: true });
 
@@ -214,6 +214,17 @@ app.post("/api/admin/reset/confirm", async (req, reply) => {
       await c.query("truncate table jobs restart identity cascade");
       await c.query("truncate table targets restart identity cascade");
       await c.query("truncate table audit_events restart identity cascade");
+      await c.query(`do $$ begin
+        if exists (select 1 from information_schema.tables where table_name='agent_events') then
+          execute 'truncate table agent_events restart identity cascade';
+        end if;
+        if exists (select 1 from information_schema.tables where table_name='agent_invocations') then
+          execute 'truncate table agent_invocations restart identity cascade';
+        end if;
+        if exists (select 1 from information_schema.tables where table_name='agent_runs') then
+          execute 'truncate table agent_runs restart identity cascade';
+        end if;
+      end $$`);
       await c.query("commit");
     } catch (e) {
       await c.query("rollback");
@@ -232,29 +243,12 @@ app.post("/api/admin/reset/confirm", async (req, reply) => {
 });
 
 app.get("/api/ai/models", async (_req, reply) => {
-  if (env.AI_MODE !== "gemini") return reply.send({ provider: env.AI_MODE, models: [] });
-  if (!env.GEMINI_API_KEY) return reply.code(400).send({ error: "GEMINI_API_KEY is not set" });
-
-  const { GoogleGenerativeAI } = await import("@google/generative-ai");
-  const client = new GoogleGenerativeAI(env.GEMINI_API_KEY);
-  // listModels exists in recent versions of the SDK; if not, return a hint.
-  const anyClient: any = client as any;
-  if (typeof anyClient.listModels !== "function") {
-    return reply.send({
-      provider: "gemini",
-      models: [],
-      note: "SDK does not expose listModels(); set GEMINI_MODEL manually."
-    });
+  try {
+    const models = await listOllamaModels();
+    return reply.send({ provider: "ollama", url: env.OLLAMA_URL, models });
+  } catch (err) {
+    return reply.code(502).send({ provider: "ollama", url: env.OLLAMA_URL, error: (err as Error).message });
   }
-
-  const models = await anyClient.listModels();
-  return reply.send({
-    provider: "gemini",
-    models: (models?.models ?? models ?? []).map((m: any) => ({
-      name: m.name,
-      supportedGenerationMethods: m.supportedGenerationMethods
-    }))
-  });
 });
 
 app.post("/api/targets", async (req, reply) => {
@@ -547,139 +541,6 @@ app.post("/api/scans/:id/resume", async (req, reply) => {
   return reply.send({ ok: true });
 });
 
-app.post("/api/exploit-runs", async (req, reply) => {
-  const body = z
-    .object({
-      scanRunId: z.string().uuid().optional(),
-      targetId: z.string().uuid().optional(),
-      requestedBy: z.string().optional()
-    })
-    .parse(req.body ?? {});
-
-  if (!body.scanRunId && !body.targetId) {
-    return reply.code(400).send({ error: "Provide scanRunId or targetId" });
-  }
-
-  const scanRunId = await withClient(async (c) => {
-    if (body.scanRunId) {
-      const res = await c.query(`select id from scan_runs where id = $1`, [body.scanRunId]);
-      if (res.rows[0]) return res.rows[0].id as string;
-      return null;
-    }
-    const res = await c.query(
-      `select id from scan_runs
-       where target_id = $1 and status = 'succeeded'
-       order by finished_at desc nulls last, created_at desc
-       limit 1`,
-      [body.targetId]
-    );
-    return (res.rows[0]?.id as string | undefined) ?? null;
-  });
-
-  if (!scanRunId) {
-    return reply
-      .code(404)
-      .send({ error: "No matching succeeded scan run found. Run a scan first or pass an explicit scanRunId." });
-  }
-
-  const target = await withClient(async (c) => {
-    const res = await c.query(
-      `select t.address from scan_runs sr join targets t on t.id = sr.target_id where sr.id = $1`,
-      [scanRunId]
-    );
-    return res.rows[0] as { address: string } | undefined;
-  });
-
-  await withClient(async (c) => {
-    await c.query(
-      `insert into jobs (type, status, payload)
-       values ('exploit', 'queued', $1::jsonb)`,
-      [JSON.stringify({ scanRunId, requestedBy: body.requestedBy ?? "operator" })]
-    );
-  });
-
-  await writeAuditEvent(
-    "exploit.queued",
-    { scanRunId, requestedBy: body.requestedBy ?? "operator" },
-    target?.address,
-    "operator"
-  );
-
-  return reply.code(202).send({ scanRunId, status: "queued" });
-});
-
-app.get("/api/command-approvals", async (req, reply) => {
-  const q = req.query as any;
-  const scanRunId = q.scanRunId ? z.string().uuid().parse(q.scanRunId) : undefined;
-  if (!scanRunId) return [];
-
-  const rows = await withClient(async (c) => {
-    const res = await c.query(
-      `
-      select id,
-             scan_run_id,
-             command,
-             reasoning,
-             impact,
-             status,
-             created_at,
-             decided_at,
-             decided_by
-        from command_approvals
-       where scan_run_id = $1
-         and status = 'pending'
-       order by created_at asc
-       limit 50
-      `,
-      [scanRunId]
-    );
-    return res.rows;
-  });
-
-  return rows.map((r) => ({
-    id: r.id,
-    scanRunId: r.scan_run_id,
-    command: r.command,
-    reasoning: r.reasoning ?? "",
-    impact: r.impact ?? "low",
-    status: r.status,
-    createdAt: r.created_at,
-    decidedAt: r.decided_at ?? null,
-    decidedBy: r.decided_by ?? null
-  }));
-});
-
-app.patch("/api/command-approvals/:id", async (req, reply) => {
-  const approvalId = z.string().uuid().parse((req.params as any).id);
-  const body = z.object({ decision: z.enum(["approved", "rejected"]), note: z.string().optional() }).parse(req.body ?? {});
-
-  const updated = await withClient(async (c) => {
-    const res = await c.query(
-      `
-      update command_approvals
-         set status = $2,
-             decided_by = $3,
-             decided_at = now()
-       where id = $1
-      returning id, status
-      `,
-      [approvalId, body.decision, "operator"]
-    );
-    return res.rows[0] as { id: string; status: string } | undefined;
-  });
-
-  if (!updated) return reply.code(404).send({ error: "Approval not found" });
-
-  await writeAuditEvent(
-    "approval.decision",
-    { approvalId, decision: body.decision, note: body.note ?? null },
-    undefined,
-    "operator"
-  );
-
-  return reply.send({ id: updated.id, status: updated.status });
-});
-
 app.get("/api/scans", async () => {
   const rows = await withClient(async (c) => {
     const res = await c.query(
@@ -855,28 +716,23 @@ app.post("/api/findings/:id/explain", async (req, reply) => {
     evidenceRedacted: String(finding.evidence_redacted ?? "")
   };
 
-  if (env.AI_MODE === "gemini") {
-    if (!env.GEMINI_API_KEY) {
-      return {
-        mode: "gemini",
-        error: "GEMINI_API_KEY is not set",
-        summary: "Gemini is enabled but not configured.",
-        whyItMatters: "Set GEMINI_API_KEY in your environment (Docker Compose .env) and retry.",
-        remediation: ["Set GEMINI_API_KEY and restart the API container."],
-        verification: ["Click Explain (AI) again."]
-      };
+  if (env.AI_MODE === "ollama") {
+    try {
+      const out = await explainWithOllama(input);
+      return { mode: "ollama", ...out };
+    } catch (err) {
+      return reply.code(502).send({
+        mode: "ollama",
+        error: (err as Error).message,
+        summary: "Ollama explain failed; verify the local Ollama server is reachable.",
+        whyItMatters: "Check OLLAMA_URL and that the model is pulled (e.g. `ollama pull qwen3:8b`).",
+        remediation: ["Verify OLLAMA_URL", "Pull the model with `ollama pull qwen3:8b`"],
+        verification: ["Retry explain after model is available."]
+      });
     }
-
-    const out = await explainWithGemini({
-      apiKey: env.GEMINI_API_KEY,
-      model: env.GEMINI_MODEL,
-      input
-    });
-
-    return { mode: "gemini", ...out };
   }
 
-  // Safe fallback.
+  // Mock fallback.
   return {
     mode: "mock",
     summary: `This finding indicates a potentially risky exposure on ${input.targetName} (${input.targetAddress}).`,
@@ -891,50 +747,479 @@ app.post("/api/findings/:id/explain", async (req, reply) => {
   };
 });
 
+// --- Agentic Recon (MCP) endpoints ---
+async function ensureAgentTablesApi() {
+  await withClient(async (c) => {
+    await c.query(`
+      create table if not exists agent_runs (
+        id uuid primary key default uuid_generate_v4(),
+        target_id uuid not null references targets(id) on delete cascade,
+        status text not null default 'queued',
+        manager_model text not null default '',
+        specialist_model text not null default '',
+        prompter_model text not null default '',
+        max_steps int not null default 25,
+        steps_taken int not null default 0,
+        invocation_count int not null default 0,
+        finding_count int not null default 0,
+        service_count int not null default 0,
+        notes text,
+        started_at timestamptz,
+        finished_at timestamptz,
+        created_at timestamptz not null default now()
+      )
+    `);
+    await c.query(`create index if not exists idx_agent_runs_target on agent_runs(target_id, created_at desc)`);
+    await c.query(`
+      create table if not exists agent_invocations (
+        id uuid primary key default uuid_generate_v4(),
+        agent_run_id uuid not null references agent_runs(id) on delete cascade,
+        tool text not null,
+        intent text,
+        args jsonb not null default '{}'::jsonb,
+        status text not null default 'running',
+        envelope jsonb,
+        log text not null default '',
+        started_at timestamptz not null default now(),
+        finished_at timestamptz
+      )
+    `);
+    await c.query(`create index if not exists idx_agent_invocations_run on agent_invocations(agent_run_id, started_at asc)`);
+    await c.query(`
+      create table if not exists agent_events (
+        id uuid primary key default uuid_generate_v4(),
+        agent_run_id uuid not null references agent_runs(id) on delete cascade,
+        invocation_id uuid references agent_invocations(id) on delete cascade,
+        kind text not null,
+        payload jsonb not null default '{}'::jsonb,
+        created_at timestamptz not null default now()
+      )
+    `);
+    await c.query(`create index if not exists idx_agent_events_run on agent_events(agent_run_id, created_at asc)`);
+  });
+}
+await ensureAgentTablesApi();
+
+const StartAgentRunSchema = z.object({
+  targetId: z.string().uuid(),
+  maxSteps: z.coerce.number().int().positive().max(60).optional(),
+  notes: z.string().optional()
+});
+
+app.post("/api/agent-runs", async (req, reply) => {
+  const body = StartAgentRunSchema.parse(req.body);
+  const target = await withClient(async (c) => {
+    const r = await c.query(`select id, name, address from targets where id = $1`, [body.targetId]);
+    return r.rows[0] as { id: string; name: string; address: string } | undefined;
+  });
+  if (!target) return reply.code(404).send({ error: "Target not found" });
+
+  const created = await withClient(async (c) => {
+    await c.query("begin");
+    try {
+      const r = await c.query(
+        `insert into agent_runs (target_id, status, manager_model, specialist_model, prompter_model, max_steps, notes)
+         values ($1, 'queued', '', '', '', $2, $3)
+         returning id, max_steps`,
+        [body.targetId, body.maxSteps ?? 20, body.notes ?? null]
+      );
+      const runId = r.rows[0].id as string;
+      await c.query(
+        `insert into jobs (type, status, payload) values ('recon-mcp','queued', $1::jsonb)`,
+        [JSON.stringify({ agentRunId: runId, targetId: body.targetId })]
+      );
+      await c.query("commit");
+      return { id: runId, maxSteps: r.rows[0].max_steps as number };
+    } catch (e) {
+      await c.query("rollback");
+      throw e;
+    }
+  });
+  await writeAuditEvent("agent.recon.queued", { agentRunId: created.id, targetId: body.targetId }, target.address, "operator");
+  return reply.code(202).send({ id: created.id, status: "queued" });
+});
+
+app.get("/api/agent-runs", async (req) => {
+  const q = req.query as { targetId?: string; limit?: string };
+  const limit = q.limit ? Math.min(200, Math.max(1, Number(q.limit))) : 50;
+  const rows = await withClient(async (c) => {
+    if (q.targetId) {
+      const r = await c.query(
+        `select ar.*, t.name as target_name, t.address as target_address
+         from agent_runs ar join targets t on t.id = ar.target_id
+         where ar.target_id = $1
+         order by ar.created_at desc limit $2`,
+        [q.targetId, limit]
+      );
+      return r.rows;
+    }
+    const r = await c.query(
+      `select ar.*, t.name as target_name, t.address as target_address
+       from agent_runs ar join targets t on t.id = ar.target_id
+       order by ar.created_at desc limit $1`,
+      [limit]
+    );
+    return r.rows;
+  });
+  return rows.map((r) => ({
+    id: r.id,
+    targetId: r.target_id,
+    target: { id: r.target_id, name: r.target_name, address: r.target_address },
+    status: r.status,
+    managerModel: r.manager_model,
+    specialistModel: r.specialist_model,
+    prompterModel: r.prompter_model,
+    maxSteps: r.max_steps,
+    stepsTaken: r.steps_taken,
+    invocationCount: r.invocation_count,
+    findingCount: r.finding_count,
+    serviceCount: r.service_count,
+    notes: r.notes ?? null,
+    startedAt: r.started_at,
+    finishedAt: r.finished_at,
+    createdAt: r.created_at
+  }));
+});
+
+app.get("/api/agent-runs/:id", async (req, reply) => {
+  const id = z.string().uuid().parse((req.params as any).id);
+  const data = await withClient(async (c) => {
+    const r = await c.query(
+      `select ar.*, t.name as target_name, t.address as target_address
+       from agent_runs ar join targets t on t.id = ar.target_id where ar.id = $1`,
+      [id]
+    );
+    return r.rows[0];
+  });
+  if (!data) return reply.code(404).send({ error: "agent_run not found" });
+  return {
+    id: data.id,
+    targetId: data.target_id,
+    target: { id: data.target_id, name: data.target_name, address: data.target_address },
+    status: data.status,
+    managerModel: data.manager_model,
+    specialistModel: data.specialist_model,
+    prompterModel: data.prompter_model,
+    maxSteps: data.max_steps,
+    stepsTaken: data.steps_taken,
+    invocationCount: data.invocation_count,
+    findingCount: data.finding_count,
+    serviceCount: data.service_count,
+    notes: data.notes ?? null,
+    startedAt: data.started_at,
+    finishedAt: data.finished_at,
+    createdAt: data.created_at
+  };
+});
+
+app.get("/api/agent-runs/:id/invocations", async (req) => {
+  const id = z.string().uuid().parse((req.params as any).id);
+  const rows = await withClient(async (c) => {
+    const r = await c.query(
+      `select id, tool, intent, args, status, envelope, log, started_at, finished_at
+       from agent_invocations where agent_run_id = $1 order by started_at asc`,
+      [id]
+    );
+    return r.rows;
+  });
+  return rows.map((r) => ({
+    id: r.id,
+    tool: r.tool,
+    intent: r.intent,
+    args: r.args ?? {},
+    status: r.status,
+    envelope: r.envelope ?? null,
+    log: r.log ?? "",
+    startedAt: r.started_at,
+    finishedAt: r.finished_at
+  }));
+});
+
+app.get("/api/agent-runs/:id/events", async (req) => {
+  const id = z.string().uuid().parse((req.params as any).id);
+  const q = req.query as { since?: string; limit?: string };
+  const limit = q.limit ? Math.min(500, Math.max(1, Number(q.limit))) : 200;
+  const rows = await withClient(async (c) => {
+    if (q.since) {
+      const r = await c.query(
+        `select id, invocation_id, kind, payload, created_at
+         from agent_events
+         where agent_run_id = $1 and created_at > $2
+         order by created_at asc limit $3`,
+        [id, new Date(q.since), limit]
+      );
+      return r.rows;
+    }
+    const r = await c.query(
+      `select id, invocation_id, kind, payload, created_at
+       from agent_events where agent_run_id = $1
+       order by created_at asc limit $2`,
+      [id, limit]
+    );
+    return r.rows;
+  });
+  return rows.map((r) => ({
+    id: r.id,
+    invocationId: r.invocation_id ?? null,
+    kind: r.kind,
+    payload: r.payload ?? {},
+    createdAt: r.created_at
+  }));
+});
+
+/**
+ * Run-level AI explain. Replaces the per-finding explain UX.
+ * Reads agent_runs / invocations / events for the run, hands the compact bundle
+ * to Ollama, and returns a structured executive summary the UI can render.
+ */
+app.post("/api/agent-runs/:id/explain", async (req, reply) => {
+  const id = z.string().uuid().parse((req.params as any).id);
+
+  const run = await withClient(async (c) => {
+    const r = await c.query(
+      `select ar.id, ar.status, ar.steps_taken, ar.invocation_count, ar.finding_count, ar.service_count,
+              t.name as target_name, t.address as target_address, t.id as target_id
+         from agent_runs ar join targets t on t.id = ar.target_id
+         where ar.id = $1`,
+      [id]
+    );
+    return r.rows[0];
+  });
+  if (!run) return reply.code(404).send({ error: "agent_run not found" });
+
+  const invocations = await withClient(async (c) => {
+    const r = await c.query(
+      `select tool, status, envelope, started_at, finished_at, args
+         from agent_invocations
+         where agent_run_id = $1
+         order by started_at asc`,
+      [id]
+    );
+    return r.rows;
+  });
+
+  const decisions = await withClient(async (c) => {
+    const r = await c.query(
+      `select payload, created_at
+         from agent_events
+         where agent_run_id = $1 and kind = 'manager.decision'
+         order by created_at asc
+         limit 60`,
+      [id]
+    );
+    return r.rows;
+  });
+
+  const services = await withClient(async (c) => {
+    const r = await c.query(
+      `select port, protocol, service_name, product, version
+         from services where target_id = $1
+         order by port asc`,
+      [run.target_id]
+    );
+    return r.rows;
+  });
+
+  const findings = await withClient(async (c) => {
+    const r = await c.query(
+      `select title, severity, evidence_redacted
+         from findings where target_id = $1
+         order by case severity
+                    when 'critical' then 0 when 'high' then 1
+                    when 'medium' then 2 when 'low' then 3 else 4 end asc,
+                  last_seen_at desc
+         limit 80`,
+      [run.target_id]
+    );
+    return r.rows;
+  });
+
+  const toolsUsed = invocations.map((i: any) => {
+    const env_ = (i.envelope ?? {}) as { artifacts?: { commands?: string[] }; durationMs?: number };
+    const cmd = Array.isArray(env_.artifacts?.commands) && env_.artifacts!.commands!.length > 0 ? String(env_.artifacts!.commands![0]) : null;
+    return {
+      tool: String(i.tool),
+      status: String(i.status),
+      durationMs: typeof env_.durationMs === "number" ? env_.durationMs : null,
+      commandSnippet: cmd ? cmd.slice(0, 240) : null
+    };
+  });
+
+  const summaryInput = {
+    target: { name: String(run.target_name), address: String(run.target_address) },
+    status: String(run.status),
+    steps: Number(run.steps_taken ?? 0),
+    invocationCount: Number(run.invocation_count ?? 0),
+    findingCount: Number(run.finding_count ?? 0),
+    serviceCount: Number(run.service_count ?? 0),
+    toolsUsed,
+    services: services.map((s: any) => ({
+      port: Number(s.port),
+      protocol: String(s.protocol),
+      name: s.service_name ?? null,
+      product: s.product ?? null,
+      version: s.version ?? null
+    })),
+    findings: findings.map((f: any) => ({
+      title: String(f.title),
+      severity: String(f.severity),
+      evidence: f.evidence_redacted ? String(f.evidence_redacted).slice(0, 400) : null
+    })),
+    decisions: decisions.map((d: any, idx: number) => {
+      const p = (d.payload ?? {}) as { step?: number; decision?: { tool?: string; intentGoal?: string; reasoning?: string; action?: string; reason?: string } };
+      const dec = p.decision ?? {};
+      return {
+        step: typeof p.step === "number" ? p.step : idx + 1,
+        tool: dec.tool,
+        intent: dec.intentGoal,
+        reasoning: dec.reasoning,
+        reason: dec.action === "stop" ? dec.reason : undefined
+      };
+    })
+  };
+
+  if (env.AI_MODE === "ollama") {
+    try {
+      const out = await summariseAgentRunWithOllama(summaryInput);
+      return { mode: "ollama", run: { id: run.id, status: run.status }, ...out };
+    } catch (err) {
+      return reply.code(502).send({
+        mode: "ollama",
+        error: (err as Error).message,
+        overallRisk: "info",
+        headline: "AI summary unavailable.",
+        keyExposures: [],
+        prioritizedFixes: [],
+        whatWeDid: summaryInput.toolsUsed.slice(0, 8).map((t) => `${t.tool} (${t.status})`),
+        verificationSteps: ["Verify Ollama is reachable and the explain model is pulled, then retry."]
+      });
+    }
+  }
+
+  // Mock fallback (AI_MODE=mock) – useful for offline dev.
+  return {
+    mode: "mock",
+    run: { id: run.id, status: run.status },
+    overallRisk: findings.find((f: any) => f.severity === "critical")
+      ? "critical"
+      : findings.find((f: any) => f.severity === "high")
+        ? "high"
+        : findings.find((f: any) => f.severity === "medium")
+          ? "medium"
+          : "low",
+    headline: `${summaryInput.target.name}: ${summaryInput.findingCount} findings across ${summaryInput.serviceCount} services in ${summaryInput.invocationCount} agent invocations.`,
+    keyExposures: summaryInput.findings.slice(0, 5).map((f) => `${f.severity.toUpperCase()}: ${f.title}`),
+    prioritizedFixes: [
+      { priority: "p1", recommendation: "Patch and harden services flagged with high/critical findings." },
+      { priority: "p2", recommendation: "Restrict network exposure of unused services." }
+    ],
+    whatWeDid: summaryInput.toolsUsed.slice(0, 8).map((t) => `${t.tool} (${t.status})`),
+    verificationSteps: ["Re-run the agentic recon and confirm findings disappear or are downgraded."]
+  };
+});
+
+app.get("/api/agent-tools", async () => {
+  // Stable list: keep in lock-step with worker/src/agents/registry.ts
+  return [
+    { name: "recon.nmap", description: "Run an nmap scan to discover open ports and detect services on a target host.", tags: ["recon", "network"] },
+    { name: "recon.http_probe", description: "Probe HTTP/HTTPS endpoints for status code, server header and title.", tags: ["recon", "web"] },
+    { name: "recon.gobuster", description: "Brute-force common content paths on a discovered HTTP(S) endpoint using gobuster.", tags: ["recon", "web"] },
+    { name: "recon.dns_enum", description: "Enumerate DNS records (A/AAAA/MX/NS/TXT), reverse PTR and attempt safe zone transfers.", tags: ["recon", "dns"] },
+    { name: "recon.tls_check", description: "Inspect TLS certificate and protocol versions on TLS-enabled ports.", tags: ["recon", "tls"] },
+    { name: "recon.smb_enum", description: "Enumerate SMB on the target: dialects, signing, anonymous share listing.", tags: ["recon", "smb"] },
+    { name: "recon.ssh_enum", description: "Capture SSH banner and offered algorithms for the target.", tags: ["recon", "ssh"] },
+    { name: "recon.cve_enricher", description: "Enrich detected services with known-vulnerable software heuristics (no remote scanning).", tags: ["recon", "enrichment"] }
+  ];
+});
+
 app.get("/api/graph/target/:id", async (req) => {
   const targetId = z.string().uuid().parse((req.params as any).id);
+
+  type Pair = { from: unknown; to: unknown };
   const graph = await withSession(async (s) => {
     const res = await s.run(
       `
       match (t:Target {id: $targetId})
       optional match (t)-[:HAS_SERVICE]->(svc:Service)
-      optional match (svc)-[:HAS_FINDING]->(f:Finding)
-      with t, collect(distinct svc) as services, collect(distinct f) as findings
-      optional match (t)-[:HAS_SERVICE]->(svc2:Service)
-      optional match (svc2)-[:HAS_FINDING]->(f2:Finding)
+      with t, collect(distinct svc) as services
+      optional match (t)-[:HAS_SERVICE]->(s2:Service)-[:HAS_FINDING]->(fViaSvc:Finding)
+      optional match (t)-[:HAS_FINDING]->(fViaTgt:Finding)
       return t,
              services,
-             findings,
-             collect(distinct { from: svc2.id, to: f2.id }) as serviceFindingPairs
+             collect(distinct {from: s2.id, to: fViaSvc.id}) as serviceFindingPairsRaw,
+             collect(distinct fViaSvc) as findingsFromSvcNodes,
+             collect(distinct fViaTgt) as findingsFromTgtNodes
       `,
       { targetId }
     );
 
     const rec = res.records[0];
-    if (!rec) return { target: null, services: [], findings: [], edges: [] };
+    if (!rec) return { target: null, services: [], findings: [], nodes: [], edges: [] };
 
-    const t = rec.get("t").properties;
-    const services = (rec.get("services") as any[]).filter(Boolean).map((n) => n.properties);
-    const findings = (rec.get("findings") as any[]).filter(Boolean).map((n) => n.properties);
-    const pairs = (rec.get("serviceFindingPairs") as any[]).filter((p) => p?.from && p?.to);
+    const tNode = rec.get("t");
+    if (!tNode) return { target: null, services: [], findings: [], nodes: [], edges: [] };
+
+    const t = (tNode as any).properties as Record<string, unknown>;
+    const tid = String(t.id);
+
+    const services = (rec.get("services") as any[])
+      .filter((n) => n != null)
+      .map((n) => n.properties as Record<string, unknown>);
+    const fromSvcFindingNodes = ((rec.get("findingsFromSvcNodes") as any[]) ?? []).filter(Boolean);
+    const fromTgtFindingNodes = ((rec.get("findingsFromTgtNodes") as any[]) ?? []).filter(Boolean);
+
+    const findingPropsById = new Map<string, Record<string, unknown>>();
+    for (const n of [...fromSvcFindingNodes, ...fromTgtFindingNodes]) {
+      const fp = n.properties as Record<string, unknown>;
+      if (fp?.id != null) findingPropsById.set(String(fp.id), fp);
+    }
+    const findings = [...findingPropsById.values()];
+    const targetLinkedIds = new Set(fromTgtFindingNodes.map((n) => String(n.properties.id)));
+
+    const svcLabel = (s: Record<string, unknown>) =>
+      `${s.port ?? ""}/${s.protocol ?? ""}\n${s.name ?? "service"}`;
+    const findingLabel = (f: Record<string, unknown>) =>
+      `${String(f.severity ?? "").toUpperCase()}\n${String(f.title ?? "")}`;
 
     const edges = [
-      ...services.map((s: any) => ({
-        id: `t->s:${t.id}:${s.id}`,
-        source: `target:${t.id}`,
-        target: `service:${s.id}`
+      ...services.map((sv) => ({
+        id: `t->s:${tid}:${sv.id}`,
+        source: `target:${tid}`,
+        target: `service:${String(sv.id)}`
       })),
-      ...pairs.map((p: any) => ({
-        id: `s->f:${p.from}:${p.to}`,
-        source: `service:${p.from}`,
-        target: `finding:${p.to}`
-      }))
+      ...(rec.get("serviceFindingPairsRaw") as Pair[])
+        .map((p) => ({ from: p?.from, to: p?.to }))
+        .filter((p) => p.from != null && p.to != null)
+        .map((p) => ({
+          id: `s->f:${String(p.from)}:${String(p.to)}`,
+          source: `service:${String(p.from)}`,
+          target: `finding:${String(p.to)}`
+        })),
+      ...findings
+        .filter((f) => targetLinkedIds.has(String(f.id)))
+        .map((f) => ({
+          id: `t->f:${tid}:${String(f.id)}`,
+          source: `target:${tid}`,
+          target: `finding:${String(f.id)}`
+        }))
     ];
 
     const nodes = [
-      { id: `target:${t.id}`, kind: "Target", data: t },
-      ...services.map((s: any) => ({ id: `service:${s.id}`, kind: "Service", data: s })),
-      ...findings.map((f: any) => ({ id: `finding:${f.id}`, kind: "Finding", data: f }))
+      {
+        id: `target:${tid}`,
+        kind: "Target" as const,
+        data: { ...t, label: `${t.name ?? "Target"}\n${t.address ?? ""}` }
+      },
+      ...services.map((sv) => ({
+        id: `service:${String(sv.id)}`,
+        kind: "Service" as const,
+        data: { ...sv, label: svcLabel(sv) }
+      })),
+      ...findings.map((f) => ({
+        id: `finding:${String(f.id)}`,
+        kind: "Finding" as const,
+        data: { ...f, label: findingLabel(f) }
+      }))
     ];
 
     return { target: t, services, findings, nodes, edges };

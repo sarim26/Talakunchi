@@ -7,7 +7,6 @@
     "dev": "tsx src/index.ts"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
     "fast-xml-parser": "^5.2.5",
     "neo4j-driver": "^5.28.1",
     "pg": "^8.14.1",

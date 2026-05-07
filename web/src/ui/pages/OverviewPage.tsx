@@ -1,3 +1,5 @@
+import React from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -10,16 +12,17 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  Divider,
   Stack,
   TextField,
   Typography
 } from "@mui/material";
-import { confirmReset, listFindings, listScans, listTargets, requestReset } from "../../lib/api";
+import { confirmReset, listAgentRuns, listFindings, listTargets, requestReset } from "../../lib/api";
 
 export function OverviewPage() {
   const qc = useQueryClient();
   const targetsQ = useQuery({ queryKey: ["targets"], queryFn: listTargets });
-  const runsQ = useQuery({ queryKey: ["runs"], queryFn: listScans, refetchInterval: 2000 });
+  const agentRunsQ = useQuery({ queryKey: ["agent-runs-overview"], queryFn: () => listAgentRuns({ limit: 8 }), refetchInterval: 3000 });
   const findingsQ = useQuery({ queryKey: ["findings"], queryFn: () => listFindings(), refetchInterval: 2000 });
   const [resetOpen, setResetOpen] = React.useState(false);
   const [resetCode, setResetCode] = React.useState<string | null>(null);
@@ -42,7 +45,7 @@ export function OverviewPage() {
     }
   });
 
-  if (targetsQ.isError || runsQ.isError || findingsQ.isError) {
+  if (targetsQ.isError || agentRunsQ.isError || findingsQ.isError) {
     return <Alert severity="error">Failed to load overview data.</Alert>;
   }
 
@@ -51,6 +54,8 @@ export function OverviewPage() {
     acc[f.severity] = (acc[f.severity] ?? 0) + 1;
     return acc;
   }, {});
+
+  const agentRuns = agentRunsQ.data ?? [];
 
   return (
     <Box>
@@ -76,8 +81,8 @@ export function OverviewPage() {
         <Box>
           <Card>
             <CardContent>
-              <Typography variant="overline">Recent runs</Typography>
-              <Typography variant="h4">{runsQ.data?.length ?? 0}</Typography>
+              <Typography variant="overline">Recent agent runs</Typography>
+              <Typography variant="h4">{agentRuns.length}</Typography>
             </CardContent>
           </Card>
         </Box>
@@ -102,7 +107,7 @@ export function OverviewPage() {
                 ))}
               </Stack>
               <Typography variant="body2" sx={{ mt: 2, color: "text.secondary" }}>
-                This is prototype data. Scans run in mock mode until you add your real `10.x.x.x` target.
+                Overview focuses on the Agentic Recon system. Historical findings stay persisted in Postgres.
               </Typography>
 
               <Box sx={{ mt: 2 }}>
@@ -117,6 +122,47 @@ export function OverviewPage() {
                   Reset demo database
                 </Button>
               </Box>
+            </CardContent>
+          </Card>
+        </Box>
+
+        <Box sx={{ gridColumn: { xs: "1 / -1", md: "1 / -1" } }}>
+          <Card>
+            <CardContent>
+              <Stack direction={{ xs: "column", md: "row" }} alignItems={{ md: "center" }} justifyContent="space-between" spacing={1}>
+                <Typography variant="subtitle1">Recent Agentic Recon runs</Typography>
+                <Button component={Link} to="/agents" size="small" variant="contained">
+                  Open Agentic Recon
+                </Button>
+              </Stack>
+              <Divider sx={{ my: 2 }} />
+
+              {agentRuns.length === 0 ? (
+                <Typography variant="body2" color="text.secondary">
+                  No agent runs yet. Start one from <Link to="/agents">Agentic Recon</Link>.
+                </Typography>
+              ) : (
+                <Stack spacing={1}>
+                  {agentRuns.map((r) => (
+                    <Box key={r.id} sx={{ p: 1, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+                      <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                        <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                          {r.target.name} <Typography component="span" variant="caption" color="text.secondary">({r.target.address})</Typography>
+                        </Typography>
+                        <Chip size="small" label={r.status} />
+                      </Stack>
+                      <Typography variant="caption" color="text.secondary">
+                        {new Date(r.createdAt).toLocaleString()} · steps {r.stepsTaken}/{r.maxSteps} · tools {r.invocationCount} · findings {r.findingCount}
+                      </Typography>
+                      <Box sx={{ mt: 1 }}>
+                        <Button component={Link} to={`/agents?runId=${encodeURIComponent(r.id)}`} size="small">
+                          View in Agentic Recon
+                        </Button>
+                      </Box>
+                    </Box>
+                  ))}
+                </Stack>
+              )}
             </CardContent>
           </Card>
         </Box>
@@ -158,6 +204,3 @@ export function OverviewPage() {
     </Box>
   );
 }
-
-import React from "react";
-

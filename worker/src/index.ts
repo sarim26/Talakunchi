@@ -2,12 +2,12 @@ import { setTimeout as sleep } from "node:timers/promises";
 import dns from "node:dns/promises";
 import net from "node:net";
 import { env } from "./env.js";
-import { runAgentScan } from "./agent.js";
-import { runExploitAgent } from "./exploit.js";
 import { withClient } from "./db.js";
-import { withSession } from "./neo4j.js";
+import { rebuildNeo4jForTarget, upsertNeo4jTarget } from "./neo4jSync.js";
 import { nmapScan } from "./nmapScan.js";
 import { HydraCredSource, hydraFromNmapServices } from "./hydraScan.js";
+import { runReconLoop } from "./orchestrator/reconRun.js";
+import { ensureAgentTables } from "./persistence/agentEvents.js";
 
 type PipelineConfig = {
   maxConcurrentScans: number;
@@ -76,84 +76,6 @@ async function setJobDone(jobId: string, ok: boolean, error?: string) {
       `update jobs set status = $2, error = $3, updated_at = now() where id = $1`,
       [jobId, ok ? "succeeded" : "failed", error ?? null]
     );
-  });
-}
-
-async function upsertNeo4jTarget(target: { id: string; name: string; address: string }) {
-  await withSession(async (s) => {
-    await s.run(
-      `
-      merge (t:Target {id: $id})
-      set t.name = $name, t.address = $address
-      return t
-      `,
-      { id: target.id, name: target.name, address: target.address }
-    );
-  });
-}
-
-async function rebuildNeo4jForTarget(targetId: string) {
-  // For prototype simplicity: rebuild relationships from Postgres state.
-  const data = await withClient(async (c) => {
-    const tRes = await c.query(`select id, name, address from targets where id = $1`, [targetId]);
-    const sRes = await c.query(
-      `select id, port, protocol, service_name, product, version from services where target_id = $1`,
-      [targetId]
-    );
-    const fRes = await c.query(
-      `select id, service_id, title, severity, status from findings where target_id = $1`,
-      [targetId]
-    );
-    return { target: tRes.rows[0], services: sRes.rows, findings: fRes.rows };
-  });
-
-  await withSession(async (s) => {
-    await s.run(
-      `merge (t:Target {id: $id}) set t.name=$name, t.address=$address`,
-      { id: data.target.id, name: data.target.name, address: data.target.address }
-    );
-
-    for (const svc of data.services) {
-      await s.run(
-        `
-        merge (svc:Service {id: $id})
-        set svc.port=$port, svc.protocol=$protocol, svc.name=$name, svc.product=$product, svc.version=$version
-        with svc
-        match (t:Target {id: $targetId})
-        merge (t)-[:HAS_SERVICE]->(svc)
-        `,
-        {
-          id: svc.id,
-          targetId,
-          port: svc.port,
-          protocol: svc.protocol,
-          name: svc.service_name ?? "",
-          product: svc.product ?? "",
-          version: svc.version ?? ""
-        }
-      );
-    }
-
-    for (const f of data.findings) {
-      await s.run(
-        `
-        merge (f:Finding {id: $id})
-        set f.title=$title, f.severity=$severity, f.status=$status
-        `,
-        { id: f.id, title: f.title, severity: f.severity, status: f.status }
-      );
-
-      if (f.service_id) {
-        await s.run(
-          `
-          match (svc:Service {id: $svcId})
-          match (f:Finding {id: $findingId})
-          merge (svc)-[:HAS_FINDING]->(f)
-          `,
-          { svcId: f.service_id, findingId: f.id }
-        );
-      }
-    }
   });
 }
 
@@ -726,92 +648,6 @@ function buildHydraCredSource(): HydraCredSource | null {
   return { ...usernameSource, ...passwordSource } as HydraCredSource;
 }
 
-function shouldUseAgentMode() {
-  if (!env.GEMINI_API_KEY) return false;
-  return env.AGENT_ENABLED || env.SCAN_MODE === "agent";
-}
-
-function buildAgentOpts(config: PipelineConfig) {
-  if (!env.GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY is required when AGENT_ENABLED=true or SCAN_MODE=agent");
-  }
-  const preferredWordlist = config.allowedWordlists.find((w) => w.trim().length > 0);
-
-  return {
-    geminiApiKey: env.GEMINI_API_KEY,
-    geminiModel: env.GEMINI_MODEL,
-    maxSteps: env.AGENT_MAX_STEPS,
-    whitelist: [] as string[],
-    wordlistPath: preferredWordlist ?? env.HYDRA_PASSLIST
-  };
-}
-
-function buildAgentWhitelist(targetAddress: string) {
-  return [...new Set([
-    targetAddress,
-    ...env.AGENT_SCOPE.split(",").map((entry) => entry.trim()).filter(Boolean)
-  ])];
-}
-
-function shouldAutoExploit() {
-  return env.EXPLOIT_ENABLED && Boolean(env.GEMINI_API_KEY);
-}
-
-function buildExploitOpts(config: PipelineConfig) {
-  if (!env.GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY is required when EXPLOIT_ENABLED=true");
-  }
-  const preferredWordlist = config.allowedWordlists.find((w) => w.trim().length > 0);
-  return {
-    geminiApiKey: env.GEMINI_API_KEY,
-    geminiModel: env.GEMINI_MODEL,
-    maxSteps: env.EXPLOIT_MAX_STEPS,
-    whitelist: [] as string[],
-    wordlistPath: preferredWordlist ?? env.HYDRA_PASSLIST,
-    lhostAllowList: env.EXPLOIT_LHOST_ALLOWLIST
-      ? env.EXPLOIT_LHOST_ALLOWLIST.split(",").map((s) => s.trim()).filter(Boolean)
-      : undefined
-  };
-}
-
-async function targetHasServices(scanRunId: string) {
-  return await withClient(async (c) => {
-    const res = await c.query(
-      `select 1
-       from services s
-       join scan_runs sr on sr.target_id = s.target_id
-       where sr.id = $1
-       limit 1`,
-      [scanRunId]
-    );
-    return res.rows.length > 0;
-  });
-}
-
-async function enqueueExploitJob(scanRunId: string) {
-  await withClient(async (c) => {
-    await c.query(
-      `insert into jobs (type, status, payload)
-       values ('exploit', 'queued', $1::jsonb)`,
-      [JSON.stringify({ scanRunId })]
-    );
-  });
-}
-
-async function maybeEnqueueExploit(scanRunId: string) {
-  if (!shouldAutoExploit()) return;
-  try {
-    if (!(await targetHasServices(scanRunId))) {
-      await writeAuditEvent("exploit.auto.skipped", { scanRunId, reason: "no services" });
-      return;
-    }
-    await enqueueExploitJob(scanRunId);
-    await writeAuditEvent("exploit.auto.queued", { scanRunId });
-  } catch (e: any) {
-    console.error("[worker] failed to enqueue exploit job", e?.message ?? e);
-  }
-}
-
 let lastScanStartAtMs = 0;
 async function enforceScanRate(config: PipelineConfig) {
   const rpm = Math.max(1, Number(config.requestRatePerMinute) || 1);
@@ -823,13 +659,14 @@ async function enforceScanRate(config: PipelineConfig) {
 
 async function main() {
   await ensureWorkflowTables();
+  await ensureAgentTables();
   await getPipelineConfig();
   console.log(
-    `[worker] starting (mode=${env.SCAN_MODE}, tools_ssh=${env.REMOTE_SSH_USER}@${env.REMOTE_SSH_HOST}:${env.REMOTE_SSH_PORT})`
+    `[worker] starting (tools_ssh=${env.REMOTE_SSH_USER}@${env.REMOTE_SSH_HOST}:${env.REMOTE_SSH_PORT}, ollama=${env.OLLAMA_URL})`
   );
-  if ((env.AGENT_ENABLED || env.SCAN_MODE === "agent") && !env.GEMINI_API_KEY) {
-    console.warn("[worker] AGENT mode requested but GEMINI_API_KEY is missing; falling back to deterministic scan mode.");
-  }
+  console.log(
+    `[worker] mcp models: manager=${env.OLLAMA_MANAGER_MODEL} specialist=${env.OLLAMA_SPECIALIST_MODEL} prompter=${env.OLLAMA_PROMPTER_MODEL}`
+  );
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const pipelineConfig = await getPipelineConfig();
@@ -843,40 +680,15 @@ async function main() {
       if (job.type === "scan") {
         const scanRunId = job.payload.scanRunId as string;
         await enforceScanRate(pipelineConfig);
-        if (shouldUseAgentMode()) {
-          const runCtx = await withClient(async (c) => {
-            const res = await c.query(
-              `select t.address as target_address
-               from scan_runs sr
-               join targets t on t.id = sr.target_id
-               where sr.id = $1`,
-              [scanRunId]
-            );
-            return res.rows[0] as { target_address: string };
-          });
-          const agentOpts = buildAgentOpts(pipelineConfig);
-          agentOpts.whitelist = buildAgentWhitelist(runCtx.target_address);
-          await runAgentScan(scanRunId, agentOpts);
-        } else {
-          await runScan(scanRunId);
-        }
-        await maybeEnqueueExploit(scanRunId);
+        await runScan(scanRunId);
+      } else if (job.type === "recon-mcp") {
+        const agentRunId = job.payload.agentRunId as string;
+        await runReconLoop(agentRunId);
       } else if (job.type === "exploit") {
-        const scanRunId = job.payload.scanRunId as string;
-        const runCtx = await withClient(async (c) => {
-          const res = await c.query(
-            `select t.address as target_address
-             from scan_runs sr
-             join targets t on t.id = sr.target_id
-             where sr.id = $1`,
-            [scanRunId]
-          );
-          return res.rows[0] as { target_address: string } | undefined;
+        // Legacy path — left here so older queued jobs drain gracefully.
+        await withClient(async (c) => {
+          await c.query(`insert into audit_events (actor, action, payload) values ('worker','exploit.legacy.skipped', $1::jsonb)`, [JSON.stringify({ jobId: job.id, payload: job.payload })]);
         });
-        if (!runCtx) throw new Error(`exploit job: scan run ${scanRunId} not found`);
-        const exploitOpts = buildExploitOpts(pipelineConfig);
-        exploitOpts.whitelist = buildAgentWhitelist(runCtx.target_address);
-        await runExploitAgent(scanRunId, exploitOpts);
       } else {
         throw new Error(`Unknown job type: ${job.type}`);
       }

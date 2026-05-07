@@ -122,6 +122,50 @@ create index if not exists idx_findings_target on findings(target_id);
 create index if not exists idx_audit_events_created_at on audit_events(created_at desc);
 create index if not exists idx_recon_assets_target on recon_assets(target_id);
 
+-- Agentic Recon (MCP) tables
+create table if not exists agent_runs (
+  id uuid primary key default uuid_generate_v4(),
+  target_id uuid not null references targets(id) on delete cascade,
+  status text not null default 'queued',
+  manager_model text not null default '',
+  specialist_model text not null default '',
+  prompter_model text not null default '',
+  max_steps int not null default 25,
+  steps_taken int not null default 0,
+  invocation_count int not null default 0,
+  finding_count int not null default 0,
+  service_count int not null default 0,
+  notes text,
+  started_at timestamptz,
+  finished_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_agent_runs_target on agent_runs(target_id, created_at desc);
+
+create table if not exists agent_invocations (
+  id uuid primary key default uuid_generate_v4(),
+  agent_run_id uuid not null references agent_runs(id) on delete cascade,
+  tool text not null,
+  intent text,
+  args jsonb not null default '{}'::jsonb,
+  status text not null default 'running',
+  envelope jsonb,
+  log text not null default '',
+  started_at timestamptz not null default now(),
+  finished_at timestamptz
+);
+create index if not exists idx_agent_invocations_run on agent_invocations(agent_run_id, started_at asc);
+
+create table if not exists agent_events (
+  id uuid primary key default uuid_generate_v4(),
+  agent_run_id uuid not null references agent_runs(id) on delete cascade,
+  invocation_id uuid references agent_invocations(id) on delete cascade,
+  kind text not null,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_agent_events_run on agent_events(agent_run_id, created_at asc);
+
 -- High-impact command approvals (operator gate for dangerous exploit steps)
 create table if not exists command_approvals (
   id uuid primary key default uuid_generate_v4(),

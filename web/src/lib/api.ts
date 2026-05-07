@@ -103,19 +103,6 @@ export const AuditEventSchema = z.object({
 });
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
 
-export const CommandApprovalSchema = z.object({
-  id: z.string().uuid(),
-  scanRunId: z.string().uuid(),
-  command: z.string(),
-  reasoning: z.string(),
-  impact: z.string(),
-  status: z.string(),
-  createdAt: z.any(),
-  decidedAt: z.any().nullable().optional(),
-  decidedBy: z.string().nullable().optional()
-});
-export type CommandApproval = z.infer<typeof CommandApprovalSchema>;
-
 export const ReconAssetSchema = z.object({
   id: z.string().uuid(),
   targetId: z.string().uuid(),
@@ -253,17 +240,20 @@ export async function getGraphForTarget(targetId: string) {
     `/api/graph/target/${targetId}`,
     undefined,
     z.object({
-      target: z.any(),
+      target: z.any().nullable(),
       services: z.array(z.any()),
       findings: z.array(z.any()),
       nodes: z.array(z.any()).optional(),
-      edges: z.array(
-        z.object({
-          id: z.string(),
-          source: z.string(),
-          target: z.string()
-        })
-      )
+      edges: z
+        .array(
+          z.object({
+            id: z.string(),
+            source: z.string(),
+            target: z.string()
+          })
+        )
+        .optional()
+        .default([])
     })
   );
 }
@@ -280,31 +270,117 @@ export async function listAuditEvents(limit = 50) {
   return http(`/api/audit-events?limit=${limit}`, undefined, z.array(AuditEventSchema));
 }
 
-export async function listCommandApprovals(scanRunId: string) {
-  const qp = new URLSearchParams();
-  qp.set("scanRunId", scanRunId);
-  return http(`/api/command-approvals?${qp.toString()}`, undefined, z.array(CommandApprovalSchema));
-}
-
-export async function decideCommandApproval(approvalId: string, input: { decision: "approved" | "rejected"; note?: string }) {
-  return http(
-    `/api/command-approvals/${approvalId}`,
-    { method: "PATCH", body: JSON.stringify(input) },
-    z.object({ id: z.string().uuid(), status: z.string() })
-  );
-}
-
 export async function listReconAssets(targetId: string) {
   const qp = new URLSearchParams();
   qp.set("targetId", targetId);
   return http(`/api/recon-assets?${qp.toString()}`, undefined, z.array(ReconAssetSchema));
 }
 
-export async function createExploitRun(input: { scanRunId?: string; targetId?: string; requestedBy?: string }) {
+// --- Agentic Recon (MCP) ---
+
+export const AgentToolSchema = z.object({
+  name: z.string(),
+  description: z.string(),
+  tags: z.array(z.string()).optional()
+});
+export type AgentTool = z.infer<typeof AgentToolSchema>;
+
+export const AgentRunSchema = z.object({
+  id: z.string().uuid(),
+  targetId: z.string().uuid(),
+  target: z.object({ id: z.string().uuid(), name: z.string(), address: z.string() }),
+  status: z.string(),
+  managerModel: z.string(),
+  specialistModel: z.string(),
+  prompterModel: z.string(),
+  maxSteps: z.number(),
+  stepsTaken: z.number(),
+  invocationCount: z.number(),
+  findingCount: z.number(),
+  serviceCount: z.number(),
+  notes: z.string().nullable().optional(),
+  startedAt: z.any().nullable().optional(),
+  finishedAt: z.any().nullable().optional(),
+  createdAt: z.any()
+});
+export type AgentRun = z.infer<typeof AgentRunSchema>;
+
+export const AgentInvocationSchema = z.object({
+  id: z.string().uuid(),
+  tool: z.string(),
+  intent: z.string().nullable(),
+  args: z.record(z.string(), z.any()),
+  status: z.string(),
+  envelope: z.any().nullable().optional(),
+  log: z.string(),
+  startedAt: z.any(),
+  finishedAt: z.any().nullable().optional()
+});
+export type AgentInvocation = z.infer<typeof AgentInvocationSchema>;
+
+export const AgentEventSchema = z.object({
+  id: z.string().uuid(),
+  invocationId: z.string().uuid().nullable(),
+  kind: z.string(),
+  payload: z.any(),
+  createdAt: z.any()
+});
+export type AgentEvent = z.infer<typeof AgentEventSchema>;
+
+export async function listAgentTools() {
+  return http("/api/agent-tools", undefined, z.array(AgentToolSchema));
+}
+
+export async function startAgentRun(input: { targetId: string; maxSteps?: number; notes?: string }) {
   return http(
-    "/api/exploit-runs",
+    "/api/agent-runs",
     { method: "POST", body: JSON.stringify(input) },
-    z.object({ scanRunId: z.string().uuid(), status: z.string() })
+    z.object({ id: z.string().uuid(), status: z.string() })
   );
+}
+
+export async function listAgentRuns(params?: { targetId?: string; limit?: number }) {
+  const qp = new URLSearchParams();
+  if (params?.targetId) qp.set("targetId", params.targetId);
+  if (params?.limit) qp.set("limit", String(params.limit));
+  const qs = qp.toString() ? `?${qp.toString()}` : "";
+  return http(`/api/agent-runs${qs}`, undefined, z.array(AgentRunSchema));
+}
+
+export async function getAgentRun(id: string) {
+  return http(`/api/agent-runs/${id}`, undefined, AgentRunSchema);
+}
+
+export async function getAgentRunInvocations(id: string) {
+  return http(`/api/agent-runs/${id}/invocations`, undefined, z.array(AgentInvocationSchema));
+}
+
+export async function getAgentRunEvents(id: string, since?: string) {
+  const qp = new URLSearchParams();
+  if (since) qp.set("since", since);
+  const qs = qp.toString() ? `?${qp.toString()}` : "";
+  return http(`/api/agent-runs/${id}/events${qs}`, undefined, z.array(AgentEventSchema));
+}
+
+export const AgentRunSummarySchema = z.object({
+  mode: z.string(),
+  run: z.object({ id: z.string().uuid(), status: z.string() }).optional(),
+  overallRisk: z.enum(["info", "low", "medium", "high", "critical"]),
+  headline: z.string(),
+  keyExposures: z.array(z.string()),
+  prioritizedFixes: z.array(
+    z.object({
+      priority: z.enum(["p0", "p1", "p2"]),
+      recommendation: z.string()
+    })
+  ),
+  whatWeDid: z.array(z.string()),
+  verificationSteps: z.array(z.string()),
+  error: z.string().optional()
+});
+export type AgentRunSummary = z.infer<typeof AgentRunSummarySchema>;
+
+export async function explainAgentRun(id: string) {
+  return http(`/api/agent-runs/${id}/explain`, { method: "POST", body: "{}" }, AgentRunSummarySchema);
 }
 

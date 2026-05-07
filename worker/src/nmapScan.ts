@@ -85,21 +85,38 @@ export async function nmapScan(
     noise.flush();
   }
 
-  const rawXml = stdout;
+  const parsed = parseNmapXml(stdout, targetAddress);
+  if (!parsed) {
+    throw new Error("nmap XML could not be parsed");
+  }
+  return { ...parsed, rawXml: stdout } satisfies NmapResult;
+}
 
+/**
+ * Parses nmap `-oX -` XML into NmapResult (without rawXml). Returns null if
+ * the document cannot be parsed.
+ */
+export function parseNmapXml(rawXml: string, fallbackHost = ""): Omit<NmapResult, "rawXml"> | null {
+  if (!rawXml || !rawXml.trim().startsWith("<")) return null;
   const parser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: "",
     allowBooleanAttributes: true
   });
-  const doc: any = parser.parse(rawXml);
+  let doc: any;
+  try {
+    doc = parser.parse(rawXml);
+  } catch {
+    return null;
+  }
 
   const host = doc?.nmaprun?.host;
+  if (!host) return { host: fallbackHost, status: "down", services: [] };
   const hostStatus = host?.status?.state === "up" ? "up" : "down";
   const hostAddresses = Array.isArray(host?.address) ? host.address : host?.address ? [host.address] : [];
   const ipv4 = hostAddresses.find((a: any) => a?.addrtype === "ipv4")?.addr;
   const firstAddress = hostAddresses[0]?.addr;
-  const resolvedHost = ipv4 ?? firstAddress ?? targetAddress;
+  const resolvedHost = ipv4 ?? firstAddress ?? fallbackHost;
   const ports = host?.ports?.port;
   const portList = Array.isArray(ports) ? ports : ports ? [ports] : [];
 
@@ -120,5 +137,5 @@ export async function nmapScan(
     });
   }
 
-  return { host: resolvedHost, status: hostStatus, services, rawXml } satisfies NmapResult;
+  return { host: resolvedHost, status: hostStatus, services };
 }
