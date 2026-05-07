@@ -40,7 +40,7 @@ services:
       NEO4J_PASSWORD: "neo4jpassword"
       AI_MODE: "ollama"
       OLLAMA_URL: "${OLLAMA_URL:-http://host.docker.internal:11434}"
-      OLLAMA_EXPLAIN_MODEL: "${OLLAMA_EXPLAIN_MODEL:-qwen3:8b}"
+      OLLAMA_EXPLAIN_MODEL: "${OLLAMA_EXPLAIN_MODEL:-qwen3:4b}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

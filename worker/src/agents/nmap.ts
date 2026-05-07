@@ -11,6 +11,7 @@ const DEFAULT_TOP_PORTS = 200;
  *   "fast"      → -Pn -T4 --top-ports 200 -sV --version-light
  *   "targeted"  → uses args.ports
  *   "deep"      → -Pn -sV -O --version-all --top-ports 1000 (heavier)
+ *   "full"      → -Pn -sV --version-light -p- (all TCP ports, heavier)
  */
 export const nmapTool: ToolDefinition = {
   name: "recon.nmap",
@@ -19,7 +20,7 @@ export const nmapTool: ToolDefinition = {
   requires: ["target"],
   defaultTimeoutMs: 15 * 60 * 1000,
   argSchema: {
-    profile: { type: "string", enum: ["fast", "targeted", "deep"], default: "fast" },
+    profile: { type: "string", enum: ["fast", "targeted", "deep", "full"], default: "fast" },
     ports: { type: "array", items: { type: "number" } }
   },
   handler: async (input, emit): Promise<ToolEnvelope> => {
@@ -27,7 +28,9 @@ export const nmapTool: ToolDefinition = {
     const portsArg = (input.args as Record<string, unknown> | undefined)?.ports as number[] | undefined;
 
     const baseArgs = ["-Pn", "--reason", "--stats-every", "10s", "-oX", "-"];
-    if (profile === "deep") {
+    if (profile === "full") {
+      baseArgs.push("-sV", "--version-light", "-p-");
+    } else if (profile === "deep") {
       baseArgs.push("-sV", "--version-all", "--top-ports", "1000");
     } else if (profile === "targeted" && portsArg && portsArg.length > 0) {
       baseArgs.push("-sV", "--version-light", "-p", portsArg.join(","));
@@ -107,8 +110,26 @@ export const nmapTool: ToolDefinition = {
 };
 
 function severityForPort(port: number): "info" | "low" | "medium" | "high" | "critical" {
-  if ([3389, 445].includes(port)) return "medium";
-  if ([21, 23, 25, 110, 139].includes(port)) return "medium";
-  if ([22, 5985, 5986, 80].includes(port)) return "low";
+  // This is an EXPOSURE severity for an open service (not a confirmed vuln).
+  // Keep it policy-based (service classes) rather than ad-hoc single ports.
+
+  // Remote admin / lateral movement enablers.
+  if ([3389, 5985, 5986, 5900, 5901, 16992, 16993].includes(port)) return "medium";
+
+  // SMB is often a big deal in internal networks.
+  if ([445, 139].includes(port)) return "medium";
+
+  // Databases / data stores exposed.
+  if ([3306, 5432, 1433, 1521, 27017, 6379, 9200, 9300, 11211].includes(port)) return "medium";
+
+  // Cleartext / legacy protocols (credential leakage risk).
+  if ([21, 23, 25, 110, 143, 445, 139].includes(port)) return "medium";
+
+  // Common web entry points.
+  if ([80, 443, 8080, 8443, 8000].includes(port)) return "low";
+
+  // SSH is common; exposure depends on environment.
+  if ([22].includes(port)) return "low";
+
   return "info";
 }

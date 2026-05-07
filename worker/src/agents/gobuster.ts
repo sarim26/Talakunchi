@@ -86,7 +86,7 @@ export const gobusterTool: ToolDefinition = {
       `  echo "WORDLIST_MISSING: $WORDLIST"`,
       `  exit 0`,
       `fi`,
-      `gobuster dir -u "$URL" -w "$WORDLIST" -k --no-error --quiet --threads ${threads} -t ${threads} -b 404,403`
+      `gobuster dir -u "$URL" -w "$WORDLIST" -k --no-error --quiet -t ${threads} -b 404,403`
     ].join("\n");
 
     emit.log(`Running gobuster against ${url} (wordlist=${wordlistSource}: ${wordlist})`);
@@ -101,6 +101,20 @@ export const gobusterTool: ToolDefinition = {
         findings: [],
         recommendations: [],
         meta: { wordlist, wordlistSource }
+      };
+    }
+
+    const flagErr = /Cannot use two forms of the same flag|unknown flag|flag provided but not defined/i.test(`${r.stdout}\n${r.stderr}`);
+    if ((r.exitCode != null && r.exitCode !== 0) || flagErr) {
+      return {
+        status: "failed",
+        error: flagErr ? "Gobuster CLI flag error (invalid args)" : `Gobuster failed (exitCode=${r.exitCode ?? "?"})`,
+        durationMs: r.durationMs,
+        artifacts: { commands: r.commands, stdoutSnippet: snippet(r.stdout), stderrSnippet: snippet(r.stderr) },
+        facts: [],
+        findings: [],
+        recommendations: [],
+        meta: { exitCode: r.exitCode, wordlist, wordlistSource, threads }
       };
     }
 

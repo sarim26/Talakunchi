@@ -17,7 +17,9 @@ const HEURISTICS: Array<{
   { match: /Apache\/2\.4\.50/i, cves: ["CVE-2021-42013"], severity: "critical", description: "Apache 2.4.50 path traversal (incomplete fix)" },
   { match: /nginx\/1\.(?:1[0-7]|[0-9])\b/i, cves: ["CVE-2019-9511"], severity: "medium", description: "Older nginx HTTP/2 DoS family" },
   { match: /Microsoft IIS httpd\/?\s*(?:6|7|7\.5)\b/i, cves: ["EOL"], severity: "high", description: "End-of-life IIS — patches no longer issued" },
-  { match: /vsftpd 2\.3\.4/i, cves: ["CVE-2011-2523"], severity: "critical", description: "vsftpd 2.3.4 backdoor" }
+  { match: /vsftpd 2\.3\.4/i, cves: ["CVE-2011-2523"], severity: "critical", description: "vsftpd 2.3.4 backdoor" },
+  { match: /\bJetty\b.*\b8\./i, cves: ["EOL"], severity: "medium", description: "Older Jetty 8.x is end-of-life; review upgrade path" },
+  { match: /\bProFTPD\b.*\b1\.3\.5\b/i, cves: ["CVE-2015-3306"], severity: "high", description: "ProFTPD 1.3.5 has known mod_copy file copy issues (context-dependent)" }
 ];
 
 export const cveEnricherTool: ToolDefinition = {
@@ -33,6 +35,12 @@ export const cveEnricherTool: ToolDefinition = {
 
     for (const svc of services) {
       const banner = [svc.product, svc.version, svc.name].filter(Boolean).join(" ").trim();
+      // Always emit a normalization fact so the operator can see what the enricher considered.
+      facts.push({
+        type: "service_banner",
+        value: { port: svc.port, protocol: svc.protocol, name: svc.name ?? null, product: svc.product ?? null, version: svc.version ?? null, banner },
+        source: "enricher"
+      });
       if (!banner) continue;
       for (const h of HEURISTICS) {
         if (h.match.test(banner)) {
