@@ -72,7 +72,11 @@ export const dnsEnumTool: ToolDefinition = {
       facts,
       findings,
       recommendations: subdomains.size > 0 ? [{ agent: "recon.http_probe", reason: "Probe newly discovered subdomains", priority: 50 }] : [],
-      meta: { exitCode: r.exitCode, subdomainCount: subdomains.size }
+      meta: {
+        exitCode: r.exitCode,
+        subdomainCount: subdomains.size,
+        commandSummary: `Query DNS records for ${host} and attempt a zone transfer (AXFR) where possible.`
+      }
     };
   }
 };

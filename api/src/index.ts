@@ -764,11 +764,17 @@ async function ensureAgentTablesApi() {
         finding_count int not null default 0,
         service_count int not null default 0,
         notes text,
+        initial_nmap_profile text,
+        initial_nmap_ports int[],
+        initial_nmap_extra_args text,
         started_at timestamptz,
         finished_at timestamptz,
         created_at timestamptz not null default now()
       )
     `);
+    await c.query(`alter table agent_runs add column if not exists initial_nmap_profile text`);
+    await c.query(`alter table agent_runs add column if not exists initial_nmap_ports int[]`);
+    await c.query(`alter table agent_runs add column if not exists initial_nmap_extra_args text`);
     await c.query(`create index if not exists idx_agent_runs_target on agent_runs(target_id, created_at desc)`);
     await c.query(`
       create table if not exists agent_invocations (
@@ -803,7 +809,14 @@ await ensureAgentTablesApi();
 const StartAgentRunSchema = z.object({
   targetId: z.string().uuid(),
   maxSteps: z.coerce.number().int().positive().max(60).optional(),
-  notes: z.string().optional()
+  notes: z.string().optional(),
+  initialNmap: z
+    .object({
+      profile: z.enum(["fast", "targeted", "deep", "full"]).optional(),
+      ports: z.array(z.number().int().positive().max(65535)).optional(),
+      extraArgs: z.string().optional()
+    })
+    .optional()
 });
 
 app.post("/api/agent-runs", async (req, reply) => {
@@ -818,10 +831,20 @@ app.post("/api/agent-runs", async (req, reply) => {
     await c.query("begin");
     try {
       const r = await c.query(
-        `insert into agent_runs (target_id, status, manager_model, specialist_model, prompter_model, max_steps, notes)
-         values ($1, 'queued', '', '', '', $2, $3)
+        `insert into agent_runs (
+           target_id, status, manager_model, specialist_model, prompter_model, max_steps, notes,
+           initial_nmap_profile, initial_nmap_ports, initial_nmap_extra_args
+         )
+         values ($1, 'queued', '', '', '', $2, $3, $4, $5, $6)
          returning id, max_steps`,
-        [body.targetId, body.maxSteps ?? 20, body.notes ?? null]
+        [
+          body.targetId,
+          body.maxSteps ?? 20,
+          body.notes ?? null,
+          body.initialNmap?.profile ?? "deep",
+          body.initialNmap?.ports ?? null,
+          body.initialNmap?.extraArgs ?? null
+        ]
       );
       const runId = r.rows[0].id as string;
       await c.query(

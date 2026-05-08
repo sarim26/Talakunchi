@@ -21,7 +21,7 @@ export const smbEnumTool: ToolDefinition = {
         facts: [],
         findings: [],
         recommendations: [],
-        meta: {}
+        meta: { commandSummary: `Enumerate SMB shares and signing posture on ${input.target.host} (anonymous / read-only).` }
       };
     }
 
@@ -77,7 +77,7 @@ export const smbEnumTool: ToolDefinition = {
       facts,
       findings,
       recommendations: [],
-      meta: { exitCode: r.exitCode }
+      meta: { exitCode: r.exitCode, commandSummary: `Enumerate SMB shares and signing posture on ${host} (anonymous / read-only).` }
     };
   }
 };

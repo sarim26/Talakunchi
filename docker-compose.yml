@@ -63,7 +63,7 @@ services:
       # MCP Recon system — Ollama models. The default URL points at the host
       # because Ollama is typically run on the developer's host, not inside Docker.
       OLLAMA_URL: "${OLLAMA_URL:-http://host.docker.internal:11434}"
-      OLLAMA_MANAGER_MODEL: "${OLLAMA_MANAGER_MODEL:-qwen3:14b}"
+      OLLAMA_MANAGER_MODEL: "${OLLAMA_MANAGER_MODEL:-qwen3:8b}"
       OLLAMA_SPECIALIST_MODEL: "${OLLAMA_SPECIALIST_MODEL:-qwen3:8b}"
       OLLAMA_PROMPTER_MODEL: "${OLLAMA_PROMPTER_MODEL:-qwen3:8b}"
       RECON_MAX_STEPS: "${RECON_MAX_STEPS:-20}"

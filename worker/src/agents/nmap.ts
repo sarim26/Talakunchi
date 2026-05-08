@@ -20,12 +20,15 @@ export const nmapTool: ToolDefinition = {
   requires: ["target"],
   defaultTimeoutMs: 15 * 60 * 1000,
   argSchema: {
-    profile: { type: "string", enum: ["fast", "targeted", "deep", "full"], default: "fast" },
-    ports: { type: "array", items: { type: "number" } }
+    profile: { type: "string", enum: ["fast", "targeted", "deep", "full"], default: "deep" },
+    ports: { type: "array", items: { type: "number" } },
+    extraArgs: { type: "string", description: "Optional additional raw nmap flags (space-separated). Example: -sC -sV" }
   },
   handler: async (input, emit): Promise<ToolEnvelope> => {
-    const profile = String((input.args as Record<string, unknown> | undefined)?.profile ?? "fast");
+    const profile = String((input.args as Record<string, unknown> | undefined)?.profile ?? "deep");
     const portsArg = (input.args as Record<string, unknown> | undefined)?.ports as number[] | undefined;
+    const extraArgsRaw = String(((input.args as Record<string, unknown> | undefined)?.extraArgs as string | undefined) ?? "").trim();
+    const extraArgs = extraArgsRaw ? extraArgsRaw.split(/\s+/).filter(Boolean) : [];
 
     const baseArgs = ["-Pn", "--reason", "--stats-every", "10s", "-oX", "-"];
     if (profile === "full") {
@@ -37,6 +40,10 @@ export const nmapTool: ToolDefinition = {
     } else {
       baseArgs.push("-T4", "-sV", "--version-light", "--top-ports", String(DEFAULT_TOP_PORTS));
     }
+
+    // Append optional user-supplied flags at the end (before host).
+    // This is intentionally simple: whitespace split, no quoting support.
+    if (extraArgs.length) baseArgs.push(...extraArgs);
 
     baseArgs.push(input.target.host);
     emit.log(`Starting nmap (${profile}) on ${input.target.host}`);
@@ -104,7 +111,13 @@ export const nmapTool: ToolDefinition = {
         fingerprint: `nmap|${input.target.host}|${svc.protocol}|${svc.port}`
       })),
       recommendations: recs,
-      meta: { exitCode: r.exitCode, profile, serviceCount: openServices.length, hostStatus: parsed.status }
+      meta: {
+        exitCode: r.exitCode,
+        profile,
+        serviceCount: openServices.length,
+        hostStatus: parsed.status,
+        commandSummary: `Scan ${input.target.host} for open ports and service banners using nmap (${profile} profile).`
+      }
     };
   }
 };

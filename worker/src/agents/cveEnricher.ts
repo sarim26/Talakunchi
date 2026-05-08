@@ -63,7 +63,11 @@ export const cveEnricherTool: ToolDefinition = {
       findings,
       recommendations: [],
       artifacts: { commands: [] },
-      meta: { servicesScanned: services.length, matches: findings.length }
+      meta: {
+        servicesScanned: services.length,
+        matches: findings.length,
+        commandSummary: `Enrich discovered services with local CVE/version heuristics (no remote scanning).`
+      }
     };
   }
 };

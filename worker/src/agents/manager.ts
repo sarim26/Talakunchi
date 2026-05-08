@@ -10,7 +10,7 @@
  *   { action: "invoke", tool: string, intentGoal: string, args?: Record<string, unknown> }
  *   { action: "stop", reason: string }
  *
- * Uses an Ollama LLM (qwen3:14b by default) but always falls back to a
+ * Uses an Ollama LLM (qwen3:8b by default) but always falls back to a
  * deterministic policy so a missing/down LLM never breaks the pipeline.
  */
 import { z } from "zod";
@@ -18,7 +18,7 @@ import { env } from "../env.js";
 import { chatJSON } from "../llm/ollama.js";
 import type { MCPServer } from "../mcp/server.js";
 import type { ToolFinding } from "../mcp/types.js";
-import { summariseCatalogForLLM, type WordlistCatalog } from "./wordlists.js";
+import type { WordlistCatalog } from "./wordlists.js";
 
 export const ManagerDecisionSchema = z.union([
   z.object({
@@ -76,7 +76,7 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
   const systemMsg = [
     "You are the MANAGER agent of a multi-agent penetration testing system.",
     "You decide which specialist tool to invoke next, or stop the run.",
-    "Operate in SAFE RECON mode (no exploitation, no destructive operations).",
+    "Operate in read-only reconnaissance mode (no exploitation, no destructive operations).",
     "",
     'Return ONLY a JSON object matching ONE of:',
     '  { "action": "invoke", "tool": "<tool-name>", "intentGoal": "<short english goal>", "args": { ... }, "reasoning": "<why>" }',
@@ -85,7 +85,6 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
     "Rules:",
     "- Choose tool from the manifest below.",
     "- Do not pick a tool whose preconditions are not yet satisfied (e.g. recon.gobuster needs an HTTP endpoint).",
-    "- When invoking a tool that takes a wordlist (e.g. recon.gobuster), set args.wordlist to an absolute path from the supplied wordlistCatalog (prefer the smallest list that fits the goal).",
     "- If there are recentFailures, prefer safe recovery actions: retry with reduced scope (e.g. fewer threads), adjust timeouts, pick a different valid wordlist, or choose an alternative recon tool.",
     "- Stop early if no productive next step is available."
   ].join("\n");
@@ -100,7 +99,6 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
       pendingRecommendations: ctx.pendingRecommendations.slice(0, 10),
       knownFindings: ctx.knownFindings.slice(-15).map((f) => ({ title: f.title, severity: f.severity })),
       history: ctx.invocationHistory.slice(-15),
-      wordlistCatalog: ctx.wordlistCatalog ? summariseCatalogForLLM(ctx.wordlistCatalog) : null,
       recentFailures: (ctx.recentFailures ?? []).slice(-5)
     },
     null,

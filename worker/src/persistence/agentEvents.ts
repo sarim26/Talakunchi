@@ -21,6 +21,9 @@ export type AgentRunSpec = {
   specialistModel: string;
   prompterModel: string;
   maxSteps: number;
+  initialNmapProfile?: string | null;
+  initialNmapPorts?: number[] | null;
+  initialNmapExtraArgs?: string | null;
 };
 
 export async function ensureAgentTables() {
@@ -39,11 +42,18 @@ export async function ensureAgentTables() {
         finding_count int not null default 0,
         service_count int not null default 0,
         notes text,
+        initial_nmap_profile text,
+        initial_nmap_ports int[],
+        initial_nmap_extra_args text,
         started_at timestamptz,
         finished_at timestamptz,
         created_at timestamptz not null default now()
       )
     `);
+    // Backfill/upgrade older installs (safe if columns already exist).
+    await c.query(`alter table agent_runs add column if not exists initial_nmap_profile text`);
+    await c.query(`alter table agent_runs add column if not exists initial_nmap_ports int[]`);
+    await c.query(`alter table agent_runs add column if not exists initial_nmap_extra_args text`);
     await c.query(`create index if not exists idx_agent_runs_target on agent_runs(target_id, created_at desc)`);
 
     await c.query(`
@@ -79,10 +89,23 @@ export async function ensureAgentTables() {
 export async function createAgentRun(spec: Omit<AgentRunSpec, "id" | "status"> & { notes?: string }): Promise<string> {
   return withClient(async (c) => {
     const r = await c.query(
-      `insert into agent_runs (target_id, status, manager_model, specialist_model, prompter_model, max_steps, notes)
-       values ($1, 'queued', $2, $3, $4, $5, $6)
+      `insert into agent_runs (
+         target_id, status, manager_model, specialist_model, prompter_model, max_steps, notes,
+         initial_nmap_profile, initial_nmap_ports, initial_nmap_extra_args
+       )
+       values ($1, 'queued', $2, $3, $4, $5, $6, $7, $8, $9)
        returning id`,
-      [spec.targetId, spec.managerModel, spec.specialistModel, spec.prompterModel, spec.maxSteps, spec.notes ?? null]
+      [
+        spec.targetId,
+        spec.managerModel,
+        spec.specialistModel,
+        spec.prompterModel,
+        spec.maxSteps,
+        spec.notes ?? null,
+        spec.initialNmapProfile ?? null,
+        spec.initialNmapPorts ?? null,
+        spec.initialNmapExtraArgs ?? null
+      ]
     );
     return r.rows[0].id as string;
   });

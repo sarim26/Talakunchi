@@ -35,7 +35,7 @@ export const httpProbeTool: ToolDefinition = {
         facts: [],
         findings: [],
         recommendations: [],
-        meta: {}
+        meta: { commandSummary: `Probe HTTP/HTTPS endpoints on ${input.target.host} to capture status, headers, and title.` }
       };
     }
 
@@ -114,7 +114,11 @@ export const httpProbeTool: ToolDefinition = {
       facts,
       findings,
       recommendations: recs,
-      meta: { exitCode: r.exitCode, probed: knownPorts.length }
+      meta: {
+        exitCode: r.exitCode,
+        probed: knownPorts.length,
+        commandSummary: `Probe ${knownPorts.length} HTTP/HTTPS endpoint(s) on ${host} to capture status, headers, and title.`
+      }
     };
   }
 };

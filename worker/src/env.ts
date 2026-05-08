@@ -9,12 +9,12 @@ const EnvSchema = z.object({
   /**
    * MCP recon system: Ollama configuration.
    * Models can be overridden via env; defaults match the design doc:
-   *   manager:    qwen3:14b
+   *   manager:    qwen3:8b
    *   specialist: qwen3:8b
    *   prompter:   qwen3:8b
    */
   OLLAMA_URL: z.string().min(1).default("http://localhost:11434"),
-  OLLAMA_MANAGER_MODEL: z.string().min(1).default("qwen3:14b"),
+  OLLAMA_MANAGER_MODEL: z.string().min(1).default("qwen3:8b"),
   OLLAMA_SPECIALIST_MODEL: z.string().min(1).default("qwen3:8b"),
   OLLAMA_PROMPTER_MODEL: z.string().min(1).default("qwen3:8b"),
   RECON_MAX_STEPS: z.coerce.number().int().positive().default(20),

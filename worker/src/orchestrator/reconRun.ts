@@ -31,6 +31,11 @@ export type StartReconRunInput = {
   targetId: string;
   notes?: string;
   maxSteps?: number;
+  initialNmap?: {
+    profile?: "fast" | "targeted" | "deep" | "full";
+    ports?: number[];
+    extraArgs?: string;
+  };
 };
 
 export async function startReconRun(input: StartReconRunInput): Promise<string> {
@@ -48,7 +53,10 @@ export async function startReconRun(input: StartReconRunInput): Promise<string> 
     specialistModel: env.OLLAMA_SPECIALIST_MODEL,
     prompterModel: env.OLLAMA_PROMPTER_MODEL,
     maxSteps: input.maxSteps ?? env.RECON_MAX_STEPS,
-    notes: input.notes
+    notes: input.notes,
+    initialNmapProfile: input.initialNmap?.profile ?? "deep",
+    initialNmapPorts: input.initialNmap?.ports ?? null,
+    initialNmapExtraArgs: input.initialNmap?.extraArgs ?? null
   });
 
   await withClient(async (c) => {
@@ -66,13 +74,26 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
 
   const data = await withClient(async (c) => {
     const r = await c.query(
-      `select ar.id, ar.target_id, ar.max_steps, t.name as target_name, t.address as target_address
+      `select ar.id, ar.target_id, ar.max_steps,
+              ar.initial_nmap_profile, ar.initial_nmap_ports, ar.initial_nmap_extra_args,
+              t.name as target_name, t.address as target_address
        from agent_runs ar
        join targets t on t.id = ar.target_id
        where ar.id = $1`,
       [agentRunId]
     );
-    return r.rows[0] as { id: string; target_id: string; max_steps: number; target_name: string; target_address: string } | undefined;
+    return r.rows[0] as
+      | {
+          id: string;
+          target_id: string;
+          max_steps: number;
+          initial_nmap_profile: string | null;
+          initial_nmap_ports: number[] | null;
+          initial_nmap_extra_args: string | null;
+          target_name: string;
+          target_address: string;
+        }
+      | undefined;
   });
   if (!data) throw new Error(`agent_run ${agentRunId} not found`);
 
@@ -116,7 +137,20 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
   for (let step = 1; step <= data.max_steps; step += 1) {
     ctx.stepsRemaining = data.max_steps - step + 1;
 
-    const decision = await decideNextAction(server, ctx);
+    // Step 1 is always recon.nmap (configurable per run).
+    const decision =
+      step === 1 && server.has("recon.nmap")
+        ? ({
+            action: "invoke",
+            tool: "recon.nmap",
+            intentGoal: "Initial network scan (required first step)",
+            args: {
+              profile: data.initial_nmap_profile ?? "deep",
+              ports: data.initial_nmap_ports ?? undefined,
+              extraArgs: data.initial_nmap_extra_args ?? undefined
+            }
+          } as const)
+        : await decideNextAction(server, ctx);
     await sink.emitDecision({ step, decision, snapshot: { knownPorts: ctx.knownPorts, services: ctx.knownServices.length, findings: allFindings.length } });
 
     if (decision.action === "stop") break;
@@ -127,8 +161,8 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       continue;
     }
 
-    const decisionArgs = "args" in decision ? decision.args : undefined;
-    const selectedWordlist = typeof decisionArgs?.wordlist === "string" ? decisionArgs.wordlist : undefined;
+    const decisionArgs = "args" in decision ? (decision.args as Record<string, unknown> | undefined) : undefined;
+    const selectedWordlist = typeof decisionArgs?.wordlist === "string" ? String(decisionArgs.wordlist) : undefined;
 
     const prompt = await generatePrompt({
       agent: toolDef,

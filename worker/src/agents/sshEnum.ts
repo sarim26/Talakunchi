@@ -60,7 +60,11 @@ export const sshEnumTool: ToolDefinition = {
       facts,
       findings,
       recommendations: [],
-      meta: { exitCode: r.exitCode, ports: sshPorts }
+      meta: {
+        exitCode: r.exitCode,
+        ports: sshPorts,
+        commandSummary: `Check SSH banner and supported algorithms on ${host} (ports: ${sshPorts.join(",")}).`
+      }
     };
   }
 };

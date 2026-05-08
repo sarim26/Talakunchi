@@ -100,7 +100,11 @@ export const tlsCheckTool: ToolDefinition = {
       facts,
       findings,
       recommendations: [],
-      meta: { exitCode: r.exitCode, ports: [...tlsPorts] }
+      meta: {
+        exitCode: r.exitCode,
+        ports: [...tlsPorts],
+        commandSummary: `Check TLS certificate details and supported protocol versions on ${host} (ports: ${[...tlsPorts].join(",")}).`
+      }
     };
   }
 };

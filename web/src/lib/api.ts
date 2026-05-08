@@ -331,7 +331,12 @@ export async function listAgentTools() {
   return http("/api/agent-tools", undefined, z.array(AgentToolSchema));
 }
 
-export async function startAgentRun(input: { targetId: string; maxSteps?: number; notes?: string }) {
+export async function startAgentRun(input: {
+  targetId: string;
+  maxSteps?: number;
+  notes?: string;
+  initialNmap?: { profile?: "fast" | "targeted" | "deep" | "full"; ports?: number[]; extraArgs?: string };
+}) {
   return http(
     "/api/agent-runs",
     { method: "POST", body: JSON.stringify(input) },

@@ -68,7 +68,7 @@ export async function generatePrompt(input: PrompterInput): Promise<string> {
     "that the specialist (an LLM-backed worker) can execute.",
     "Constraints:",
     "- Always remind the agent of its identity and the target.",
-    "- Respect read-only / safe-recon scope (no exploitation).",
+    "- Respect read-only reconnaissance scope (no exploitation).",
     "- Tell the agent to return STRICT JSON when it finishes.",
     "- Keep it under 8 sentences."
   ].join("\n");

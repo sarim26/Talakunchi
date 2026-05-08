@@ -21,7 +21,18 @@ export const gobusterTool: ToolDefinition = {
   },
   handler: async (input, emit): Promise<ToolEnvelope> => {
     const args = (input.args ?? {}) as { url?: string; wordlist?: string; threads?: number };
-    let url = args.url;
+    // Always prefer URLs derived from this run's target/services.
+    // Ignore arbitrary args.url unless it clearly matches the current target host.
+    let url: string | undefined = undefined;
+    if (args.url) {
+      try {
+        const u = new URL(args.url);
+        if (u.hostname === input.target.host) url = args.url;
+      } catch {
+        // ignore invalid urls
+      }
+    }
+
     if (!url) {
       const httpFact = (input.context?.priorFindings ?? []).find((f) => /Reachable web endpoint:/i.test(f.title));
       if (httpFact) {
@@ -127,18 +138,51 @@ export const gobusterTool: ToolDefinition = {
     const facts: ToolEnvelope["facts"] = [];
 
     for (const line of lines) {
-      const pathMatch = /^(\/\S+)/.exec(line);
       const codeMatch = /Status:\s*(\d{3})/.exec(line);
-      if (!pathMatch || !codeMatch) continue;
-      const path = pathMatch[1];
+      if (!codeMatch?.[1]) continue;
       const code = Number(codeMatch[1]);
-      facts.push({ type: "web_path", value: { url: `${url.replace(/\/$/, "")}${path}`, status: code }, source: "gobuster" });
-      if (code === 200 && /(admin|login|backup|config|setup|test|debug|api|graphql)/i.test(path)) {
+      if (!Number.isFinite(code)) continue;
+
+      // gobuster can output either:
+      //  - "/admin (Status: 200) ..."
+      //  - "admin (Status: 301) ... [--> http://host/admin/]"
+      const redirectUrlMatch = /\[-->\s*(https?:\/\/[^\]\s]+)\s*\]/i.exec(line);
+      const leadingTokenMatch = /^(\S+)\s+\(Status:\s*\d{3}\)/.exec(line);
+      const leadingPathMatch = /^(\/\S+)\s+\(Status:\s*\d{3}\)/.exec(line);
+
+      let fullUrl: string | null = null;
+      let path: string | null = null;
+
+      if (redirectUrlMatch?.[1]) {
+        fullUrl = redirectUrlMatch[1];
+        try {
+          const u = new URL(fullUrl);
+          path = u.pathname || "/";
+        } catch {
+          path = null;
+        }
+      } else if (leadingPathMatch?.[1]) {
+        path = leadingPathMatch[1];
+        fullUrl = `${url.replace(/\/$/, "")}${path}`;
+      } else if (leadingTokenMatch?.[1]) {
+        path = `/${leadingTokenMatch[1].replace(/^\/+/, "")}`;
+        fullUrl = `${url.replace(/\/$/, "")}${path}`;
+      }
+
+      if (!fullUrl) continue;
+
+      facts.push({ type: "web_path", value: { url: fullUrl, status: code }, source: "gobuster" });
+
+      // Promote high-signal paths into Findings so they show in the Findings tab.
+      const interesting = /(phpmyadmin|drupal|wp-admin|wp-login|admin|login|uploads|backup|config|setup|test|debug|api|graphql)/i.test(
+        path ?? fullUrl
+      );
+      if (interesting && [200, 301, 302, 401, 403].includes(code)) {
         findings.push({
-          title: `Sensitive web path discovered: ${path}`,
-          severity: "medium",
-          evidence: `${url}${path} → HTTP ${code}`,
-          fingerprint: `gobuster|${url}|${path}`
+          title: `Interesting web path discovered: ${path ?? fullUrl}`,
+          severity: code === 200 ? "medium" : "low",
+          evidence: `${fullUrl} → HTTP ${code}`,
+          fingerprint: `gobuster|${url}|${path ?? fullUrl}|${code}`
         });
       }
     }
@@ -150,7 +194,13 @@ export const gobusterTool: ToolDefinition = {
       facts,
       findings,
       recommendations: [],
-      meta: { exitCode: r.exitCode, wordlist, wordlistSource, count: facts.length }
+      meta: {
+        exitCode: r.exitCode,
+        wordlist,
+        wordlistSource,
+        count: facts.length,
+        commandSummary: `Brute-force common web paths on ${url} using gobuster.`
+      }
     };
   }
 };

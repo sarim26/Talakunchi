@@ -66,6 +66,9 @@ export function AgenticReconPage() {
   const [selectedRunId, setSelectedRunId] = React.useState<string | null>(null);
   const [maxSteps, setMaxSteps] = React.useState(20);
   const [notes, setNotes] = React.useState("");
+  const [initialNmapProfile, setInitialNmapProfile] = React.useState<"fast" | "targeted" | "deep" | "full">("deep");
+  const [initialNmapPorts, setInitialNmapPorts] = React.useState<string>("");
+  const [initialNmapExtraArgs, setInitialNmapExtraArgs] = React.useState<string>("");
   React.useEffect(() => {
     const runId = sp.get("runId");
     if (runId && runId !== selectedRunId) setSelectedRunId(runId);
@@ -81,7 +84,23 @@ export function AgenticReconPage() {
   });
 
   const startM = useMutation({
-    mutationFn: () => startAgentRun({ targetId, maxSteps, notes: notes.trim() || undefined }),
+    mutationFn: () =>
+      startAgentRun({
+        targetId,
+        maxSteps,
+        notes: notes.trim() || undefined,
+        initialNmap: {
+          profile: initialNmapProfile,
+          ports:
+            initialNmapProfile === "targeted"
+              ? initialNmapPorts
+                  .split(/[,\s]+/)
+                  .map((s) => Number(s.trim()))
+                  .filter((n) => Number.isInteger(n) && n > 0 && n <= 65535)
+              : undefined,
+          extraArgs: initialNmapExtraArgs.trim() || undefined
+        }
+      }),
     onSuccess: async (created) => {
       setSelectedRunId(created.id);
       setNotes("");
@@ -116,7 +135,7 @@ export function AgenticReconPage() {
         Agentic Recon (MCP)
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        A manager LLM ({"qwen3:14b"}) sequences specialised local agents (qwen3:8b) over an MCP framework. The
+        A manager LLM sequences specialised local agents over an MCP framework. The
         prompter translates manager intents into agent-specific instructions; specialists run nmap, gobuster,
         DNS, TLS, SMB, SSH and CVE enrichment over the SSH bastion. All telemetry streams below in real time.
       </Typography>
@@ -150,6 +169,35 @@ export function AgenticReconPage() {
                   label="Notes (optional)"
                   value={notes}
                   onChange={(e) => setNotes(e.target.value)}
+                  size="small"
+                />
+                <Divider />
+                <Typography variant="subtitle2">Initial Nmap scan (step 1)</Typography>
+                <Select
+                  value={initialNmapProfile}
+                  onChange={(e) => setInitialNmapProfile(e.target.value as any)}
+                  size="small"
+                  fullWidth
+                >
+                  <MenuItem value="fast">fast (top ports 200, -sV)</MenuItem>
+                  <MenuItem value="deep">deep (top ports 1000, --version-all)</MenuItem>
+                  <MenuItem value="full">full (-p-)</MenuItem>
+                  <MenuItem value="targeted">targeted (custom ports)</MenuItem>
+                </Select>
+                {initialNmapProfile === "targeted" ? (
+                  <TextField
+                    label="Target ports (comma/space separated)"
+                    placeholder="22,80,443,445"
+                    value={initialNmapPorts}
+                    onChange={(e) => setInitialNmapPorts(e.target.value)}
+                    size="small"
+                  />
+                ) : null}
+                <TextField
+                  label="Extra nmap args (optional)"
+                  placeholder="-sC -sV"
+                  value={initialNmapExtraArgs}
+                  onChange={(e) => setInitialNmapExtraArgs(e.target.value)}
                   size="small"
                 />
                 <Button
@@ -300,7 +348,7 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
                 {run.target.name} <Typography component="span" color="text.secondary">({run.target.address})</Typography>
               </Typography>
               <Typography variant="caption" color="text.secondary">
-                Manager: {run.managerModel || "qwen3:14b"} · Specialist: {run.specialistModel || "qwen3:8b"} · Prompter: {run.prompterModel || "qwen3:8b"}
+                Manager: {run.managerModel || "qwen3:8b"} · Specialist: {run.specialistModel || "qwen3:8b"} · Prompter: {run.prompterModel || "qwen3:8b"}
               </Typography>
             </Box>
             <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
@@ -453,6 +501,10 @@ function InvocationCard(props: { inv: AgentInvocation; open: boolean; onToggle: 
     meta?: Record<string, unknown>;
   };
   const cmds = env.artifacts?.commands ?? [];
+  const webPaths = Array.isArray(env.facts)
+    ? (env.facts as Array<{ type?: string; value?: any }>).filter((f) => f?.type === "web_path").slice(0, 40)
+    : [];
+  const commandSummary = typeof env.meta?.commandSummary === "string" ? env.meta.commandSummary : null;
   const argsKeys = Object.keys(inv.args ?? {});
 
   return (
@@ -521,6 +573,17 @@ function InvocationCard(props: { inv: AgentInvocation; open: boolean; onToggle: 
             </>
           ) : null}
 
+          {commandSummary ? (
+            <>
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: "block" }}>
+                What this did (simple English)
+              </Typography>
+              <Alert severity="info" sx={{ mt: 0.5 }}>
+                {commandSummary}
+              </Alert>
+            </>
+          ) : null}
+
           {env.artifacts?.stdoutSnippet ? (
             <>
               <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: "block" }}>
@@ -565,6 +628,26 @@ function InvocationCard(props: { inv: AgentInvocation; open: boolean; onToggle: 
                   </Box>
                 ))}
               </Stack>
+            </>
+          ) : null}
+
+          {webPaths.length ? (
+            <>
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: "block" }}>
+                Web paths discovered
+              </Typography>
+              <Box sx={mono(180)}>
+                <Typography variant="caption" component="pre" sx={preSx}>
+                  {webPaths
+                    .map((p) => {
+                      const u = String(p?.value?.url ?? "");
+                      const s = p?.value?.status != null ? `HTTP ${String(p.value.status)}` : "";
+                      return `${s}  ${u}`.trim();
+                    })
+                    .filter(Boolean)
+                    .join("\n")}
+                </Typography>
+              </Box>
             </>
           ) : null}
         </>
