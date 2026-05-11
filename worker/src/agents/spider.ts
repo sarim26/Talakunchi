@@ -141,6 +141,47 @@ export const spiderTool: ToolDefinition = {
       });
     }
 
+    // Layer 3: endpoint amplification.
+    //
+    // 1) For any discovered URL whose path matches API conventions, queue a
+    //    surgical recon.ffuf run pointed at that exact subtree. We pick at
+    //    most a handful so the manager isn't drowned in recommendations.
+    const apiPathRegex = /\/(api|graphql|v\d+|rest|gql)(\/|$)/i;
+    const ffufedTargets = new Set<string>();
+    for (const fact of facts) {
+      if (fact.type !== "web_url") continue;
+      const v = (fact.value ?? {}) as { url?: string };
+      if (!v.url) continue;
+      try {
+        const u = new URL(v.url);
+        if (!apiPathRegex.test(u.pathname)) continue;
+        // Strip the trailing segment so we fuzz the directory, not the file.
+        const dir = u.pathname.replace(/\/[^/]*$/, "/") || "/";
+        const targetUrl = `${u.origin}${dir.endsWith("/") ? dir : dir + "/"}FUZZ`;
+        if (ffufedTargets.has(targetUrl)) continue;
+        ffufedTargets.add(targetUrl);
+        recs.push({
+          agent: "recon.ffuf",
+          reason: `Spider found API-shaped path ${u.pathname} — fuzz ${dir} for more endpoints`,
+          priority: 70,
+          args: { targetUrl }
+        });
+        if (ffufedTargets.size >= 4) break;
+      } catch {
+        // ignore
+      }
+    }
+
+    // 2) Backup amplifier: when katana's output is thin (<10 URLs), recommend
+    //    recon.waybackurls so the manager has historical paths to consider.
+    if (facts.length < 10) {
+      recs.push({
+        agent: "recon.waybackurls",
+        reason: `Katana returned only ${facts.length} URL(s) — query Wayback Machine for historical endpoints`,
+        priority: 65
+      });
+    }
+
     return {
       status: facts.length > 0 ? "succeeded" : "partial",
       durationMs: r.durationMs,
@@ -247,7 +288,11 @@ function recordDiscoveredUrl(
       title: `Interesting web path discovered: ${path || endpoint}`,
       severity: status === 200 ? "medium" : "low",
       evidence: `${endpoint} -> HTTP ${status} (${method})`,
-      fingerprint: fp
+      fingerprint: fp,
+      // Katana fetched the page and observed this status code — definitive.
+      confidence: "high",
+      requiresVerification: false,
+      claimType: "web_path"
     });
     return;
   }
@@ -260,7 +305,11 @@ function recordDiscoveredUrl(
       title: `Interesting web path discovered: ${path || endpoint}`,
       severity: "low",
       evidence: `${endpoint} (Katana; HTTP status not captured in output)`,
-      fingerprint: fp
+      fingerprint: fp,
+      // No status captured — prefer corroboration by ffuf/gobuster.
+      confidence: "medium",
+      requiresVerification: true,
+      claimType: "web_path"
     });
   }
 }

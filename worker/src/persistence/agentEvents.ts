@@ -83,6 +83,33 @@ export async function ensureAgentTables() {
       )
     `);
     await c.query(`create index if not exists idx_agent_events_run on agent_events(agent_run_id, created_at asc)`);
+
+    // Confidence + verification metadata on findings (Layer 1).
+    // Stored on the row so the API can compute verification status without
+    // re-scanning the evidence table for every query.
+    await c.query(`alter table findings add column if not exists confidence text not null default 'medium'`);
+    await c.query(`alter table findings add column if not exists requires_verification boolean not null default true`);
+    await c.query(`alter table findings add column if not exists claim_type text`);
+
+    // Evidence chain: every tool observation, plus verifier outcomes
+    // (verifier_failed / verifier_no_response) so unverified findings stay
+    // unverified instead of silently disappearing.
+    await c.query(`
+      create table if not exists finding_evidence (
+        id uuid primary key default uuid_generate_v4(),
+        fingerprint text not null,
+        target_id uuid references targets(id) on delete cascade,
+        agent_run_id uuid references agent_runs(id) on delete cascade,
+        invocation_id uuid references agent_invocations(id) on delete cascade,
+        tool text not null,
+        status text not null default 'observed',
+        evidence text not null default '',
+        created_at timestamptz not null default now()
+      )
+    `);
+    await c.query(`create index if not exists idx_finding_evidence_fp on finding_evidence(fingerprint, created_at asc)`);
+    await c.query(`create index if not exists idx_finding_evidence_target on finding_evidence(target_id)`);
+    await c.query(`create index if not exists idx_finding_evidence_run on finding_evidence(agent_run_id)`);
   });
 }
 
@@ -230,18 +257,133 @@ export async function persistDiscoveredServices(targetId: string, services: Arra
   return map;
 }
 
-export async function persistFindings(targetId: string, findings: Array<{ title: string; severity: string; port?: number | null; protocol?: string | null; evidence: string; fingerprint?: string }>, serviceIdByPort: Map<number, string>) {
+export type PersistFindingInput = {
+  title: string;
+  severity: string;
+  port?: number | null;
+  protocol?: string | null;
+  evidence: string;
+  fingerprint?: string;
+  confidence?: "low" | "medium" | "high";
+  requiresVerification?: boolean;
+  verifiesFingerprint?: string;
+  claimType?: string;
+};
+
+export type PersistFindingsContext = {
+  tool: string;
+  invocationId?: string | null;
+  agentRunId?: string | null;
+};
+
+/**
+ * Persist findings + record their evidence chain.
+ *
+ * Each call writes:
+ *   1. an upsert into `findings` (verification metadata stays sticky once high)
+ *   2. an `finding_evidence` row with status='observed' per finding
+ *   3. when `verifiesFingerprint` is set, an additional 'observed' row keyed
+ *      to the original finding — this is what promotes the original to
+ *      verificationStatus='confirmed' (Situation 1: gold-standard).
+ */
+export async function persistFindings(
+  targetId: string,
+  findings: PersistFindingInput[],
+  serviceIdByPort: Map<number, string>,
+  ctx?: PersistFindingsContext
+) {
   if (findings.length === 0) return;
+  const tool = ctx?.tool ?? "unknown";
+  const invocationId = ctx?.invocationId ?? null;
+  const agentRunId = ctx?.agentRunId ?? null;
+
   await withClient(async (c) => {
     for (const f of findings) {
       const fp = f.fingerprint ?? `mcp|${targetId}|${f.title}`;
       const svcId = f.port ? serviceIdByPort.get(f.port) ?? null : null;
+      const confidence = f.confidence ?? "medium";
+      const requiresVerification =
+        typeof f.requiresVerification === "boolean"
+          ? f.requiresVerification
+          : confidence !== "high";
+
       await c.query(
-        `insert into findings (target_id, service_id, title, severity, status, fingerprint, evidence_redacted, first_seen_at, last_seen_at)
-         values ($1, $2, $3, $4, 'open', $5, $6, now(), now())
+        `insert into findings (
+           target_id, service_id, title, severity, status,
+           fingerprint, evidence_redacted,
+           confidence, requires_verification, claim_type,
+           first_seen_at, last_seen_at
+         )
+         values ($1, $2, $3, $4, 'open', $5, $6, $7, $8, $9, now(), now())
          on conflict (fingerprint)
-         do update set last_seen_at = now(), evidence_redacted = excluded.evidence_redacted`,
-        [targetId, svcId, f.title, f.severity, fp, f.evidence]
+         do update set
+           last_seen_at = now(),
+           evidence_redacted = excluded.evidence_redacted,
+           confidence = case
+             when findings.confidence = 'high' then findings.confidence
+             else excluded.confidence
+           end,
+           requires_verification = case
+             when findings.confidence = 'high' or excluded.confidence = 'high' then false
+             else findings.requires_verification
+           end,
+           claim_type = coalesce(findings.claim_type, excluded.claim_type)`,
+        [targetId, svcId, f.title, f.severity, fp, f.evidence, confidence, requiresVerification, f.claimType ?? null]
+      );
+
+      await c.query(
+        `insert into finding_evidence (fingerprint, target_id, agent_run_id, invocation_id, tool, status, evidence)
+         values ($1, $2, $3, $4, $5, 'observed', $6)`,
+        [fp, targetId, agentRunId, invocationId, tool, f.evidence]
+      );
+
+      // Situation 1: this tool corroborates a previously emitted claim.
+      // We record evidence keyed to the ORIGINAL fingerprint so verifier
+      // status calculations can count distinct tools per fingerprint.
+      if (f.verifiesFingerprint && f.verifiesFingerprint !== fp) {
+        await c.query(
+          `insert into finding_evidence (fingerprint, target_id, agent_run_id, invocation_id, tool, status, evidence)
+           values ($1, $2, $3, $4, $5, 'observed', $6)`,
+          [
+            f.verifiesFingerprint,
+            targetId,
+            agentRunId,
+            invocationId,
+            tool,
+            `Corroborated by ${tool}: ${f.evidence}`.slice(0, 1000)
+          ]
+        );
+      }
+    }
+  });
+}
+
+/**
+ * Record that a verifier tool was attempted against a set of fingerprints but
+ * did not produce a corroborating observation. This is Situation 3 from the
+ * verification design: the original finding stays Unverified (permanent for
+ * this run) rather than silently rotting in the Pending bucket.
+ */
+export async function recordVerifierAttempts(
+  targetId: string,
+  attempts: Array<{ fingerprint: string; tool: string; status: "verifier_failed" | "verifier_no_response"; evidence?: string }>,
+  ctx?: { invocationId?: string | null; agentRunId?: string | null }
+) {
+  if (attempts.length === 0) return;
+  await withClient(async (c) => {
+    for (const a of attempts) {
+      await c.query(
+        `insert into finding_evidence (fingerprint, target_id, agent_run_id, invocation_id, tool, status, evidence)
+         values ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          a.fingerprint,
+          targetId,
+          ctx?.agentRunId ?? null,
+          ctx?.invocationId ?? null,
+          a.tool,
+          a.status,
+          a.evidence ?? ""
+        ]
       );
     }
   });

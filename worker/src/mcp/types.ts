@@ -31,7 +31,28 @@ export const ToolFindingSchema = z.object({
   port: z.number().int().nullable().optional(),
   protocol: z.string().nullable().optional(),
   evidence: z.string().default(""),
-  fingerprint: z.string().optional()
+  fingerprint: z.string().optional(),
+  /**
+   * Confidence the emitting tool has in the claim itself.
+   * - "high"   = output is intrinsically definitive (e.g. cert returned, banner returned)
+   * - "medium" = default; benefits from a second tool corroborating it
+   * - "low"    = inferred/heuristic, prefer to verify before reporting upward
+   */
+  confidence: z.enum(["low", "medium", "high"]).optional(),
+  /**
+   * If false, this finding is considered confirmed immediately
+   * (Situation 2: inherently high-confidence). Defaults to true when
+   * confidence is not "high".
+   */
+  requiresVerification: z.boolean().optional(),
+  /**
+   * When set, this finding corroborates another finding identified by its
+   * fingerprint (Situation 1: gold-standard verification). The orchestrator
+   * uses this to promote the original finding to "confirmed".
+   */
+  verifiesFingerprint: z.string().optional(),
+  /** Optional normalised claim key (e.g. "open_port", "http_reachable"). */
+  claimType: z.string().optional()
 });
 export type ToolFinding = z.infer<typeof ToolFindingSchema>;
 

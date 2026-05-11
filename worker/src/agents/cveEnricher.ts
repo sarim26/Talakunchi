@@ -51,7 +51,12 @@ export const cveEnricherTool: ToolDefinition = {
             port: svc.port,
             protocol: svc.protocol,
             evidence: `${h.description} — references: ${h.cves.join(", ")}`,
-            fingerprint: `cve|${svc.port}|${h.cves.join(",")}`
+            fingerprint: `cve|${svc.port}|${h.cves.join(",")}`,
+            // The exact version string in the banner is the evidence; no
+            // second tool is needed for the CVE attribution itself.
+            confidence: "high",
+            requiresVerification: false,
+            claimType: "cve_match"
           });
         }
       }

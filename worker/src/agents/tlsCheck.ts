@@ -93,6 +93,23 @@ export const tlsCheckTool: ToolDefinition = {
         source: "testssl.sh"
       });
 
+      // Emit a "TLS reachable" finding that also verifies nmap's open-port
+      // claim for this port (Situation 1: corroborated by an independent tool).
+      if (certSubject || certIssuer) {
+        findings.push({
+          title: `TLS service reachable on ${host}:${port}`,
+          severity: "info",
+          port,
+          protocol: "tcp",
+          evidence: `TLS handshake completed; subject=${certSubject ?? "?"}`,
+          fingerprint: `tls-reachable|${host}|${port}`,
+          confidence: "high",
+          requiresVerification: false,
+          claimType: "tls_reachable",
+          verifiesFingerprint: `open-port|${host}|tcp|${port}`
+        });
+      }
+
       for (const item of parsed) {
         const sev = String(item.severity ?? "INFO").toUpperCase() as TestsslSeverity;
         const mapped = mapSeverity(sev);
@@ -106,7 +123,12 @@ export const tlsCheckTool: ToolDefinition = {
           port,
           protocol: "tcp",
           evidence: `${finding}${cve ? ` (CVE: ${cve})` : ""}`,
-          fingerprint: `testssl|${host}|${port}|${id}`
+          fingerprint: `testssl|${host}|${port}|${id}`,
+          // testssl.sh either negotiates a TLS session and reads the
+          // certificate / cipher list or it doesn't — no ambiguity.
+          confidence: "high",
+          requiresVerification: false,
+          claimType: "tls_finding"
         });
       }
     }

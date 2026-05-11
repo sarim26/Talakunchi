@@ -91,19 +91,42 @@ export const httpProbeTool: ToolDefinition = {
         source: "httpx"
       });
 
+      // Pull the port we just probed back out of the URL so we can link this
+      // back to nmap's open-port claim (Situation 1: gold-standard verifier).
+      let probedPort: number | null = null;
+      try {
+        const u = new URL(url);
+        probedPort = Number(u.port || (u.protocol === "https:" ? 443 : 80));
+      } catch {
+        probedPort = null;
+      }
+      const verifiesFp =
+        probedPort !== null
+          ? `open-port|${input.target.host}|tcp|${probedPort}`
+          : undefined;
+
       if (status !== null && status >= 200 && status < 400) {
         findings.push({
           title: `Reachable web endpoint: ${url}`,
           severity: "info",
           evidence: `HTTP ${status}${server ? ` Server: ${server}` : ""}${tech.length ? ` Tech: ${tech.join(", ")}` : ""}`,
-          fingerprint: `http|${url}`
+          fingerprint: `http|${url}`,
+          // httpx independently spoke HTTP and got a response — definitive.
+          confidence: "high",
+          requiresVerification: false,
+          claimType: "http_reachable",
+          verifiesFingerprint: verifiesFp
         });
       } else if (status !== null && status >= 500) {
         findings.push({
           title: `Web endpoint returns ${status}: ${url}`,
           severity: "low",
           evidence: `HTTP ${status} from ${url}`,
-          fingerprint: `http5xx|${url}`
+          fingerprint: `http5xx|${url}`,
+          confidence: "high",
+          requiresVerification: false,
+          claimType: "http_5xx",
+          verifiesFingerprint: verifiesFp
         });
       }
     }

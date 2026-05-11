@@ -108,7 +108,14 @@ export const nmapTool: ToolDefinition = {
         port: svc.port,
         protocol: svc.protocol,
         evidence: `Detected ${svc.name || "service"}${svc.product ? ` ${svc.product}` : ""}${svc.version ? ` ${svc.version}` : ""} on ${input.target.host}:${svc.port}/${svc.protocol}`,
-        fingerprint: `nmap|${input.target.host}|${svc.protocol}|${svc.port}`
+        // Stable, normalised claim key so other tools (httpx, tls_check, etc.)
+        // can corroborate the same open-port claim via verifiesFingerprint.
+        fingerprint: `open-port|${input.target.host}|${svc.protocol}|${svc.port}`,
+        // A single-tool open-port claim should be corroborated before we
+        // treat it as confirmed (Situation 1).
+        confidence: "medium",
+        requiresVerification: true,
+        claimType: "open_port"
       })),
       recommendations: recs,
       meta: {

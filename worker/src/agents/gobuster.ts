@@ -16,11 +16,17 @@ export const gobusterTool: ToolDefinition = {
   defaultTimeoutMs: 6 * 60 * 1000,
   argSchema: {
     url: { type: "string" },
+    /**
+     * Optional path under the base URL to brute-force from. Layer 3 lets the
+     * manager point gobuster at a directory spider already discovered
+     * (e.g. `/admin/`) instead of always starting at `/`.
+     */
+    basePath: { type: "string", description: "Optional path under the base URL to brute-force from (e.g. /admin/)." },
     wordlist: { type: "string", description: "Absolute path under /home/kali/Desktop/SecLists/. Manager should pick from the run-time catalog." },
     threads: { type: "number", default: 20 }
   },
   handler: async (input, emit): Promise<ToolEnvelope> => {
-    const args = (input.args ?? {}) as { url?: string; wordlist?: string; threads?: number };
+    const args = (input.args ?? {}) as { url?: string; basePath?: string; wordlist?: string; threads?: number };
     // Always prefer URLs derived from this run's target/services.
     // Ignore arbitrary args.url unless it clearly matches the current target host.
     let url: string | undefined = undefined;
@@ -46,6 +52,18 @@ export const gobusterTool: ToolDefinition = {
       if (knownWeb) {
         const scheme = knownWeb.port === 443 || knownWeb.port === 8443 ? "https" : "http";
         url = `${scheme}://${input.target.host}:${knownWeb.port}/`;
+      }
+    }
+
+    // Apply basePath so the brute-force starts at a discovered directory.
+    if (url && typeof args.basePath === "string" && args.basePath.trim()) {
+      try {
+        const base = new URL(url);
+        const pathClean = "/" + args.basePath.replace(/^\/+/, "").replace(/\/+$/, "") + "/";
+        base.pathname = pathClean;
+        url = base.toString();
+      } catch {
+        // ignore invalid basePath
       }
     }
 
@@ -182,7 +200,11 @@ export const gobusterTool: ToolDefinition = {
           title: `Interesting web path discovered: ${path ?? fullUrl}`,
           severity: code === 200 ? "medium" : "low",
           evidence: `${fullUrl} → HTTP ${code}`,
-          fingerprint: `gobuster|${url}|${path ?? fullUrl}|${code}`
+          fingerprint: `gobuster|${url}|${path ?? fullUrl}|${code}`,
+          // gobuster actually retrieved this response from the server.
+          confidence: "high",
+          requiresVerification: false,
+          claimType: "web_path"
         });
       }
     }

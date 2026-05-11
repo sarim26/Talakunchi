@@ -611,6 +611,77 @@ app.get("/api/scans/:id", async (req) => {
   };
 });
 
+// Make sure verification columns/table exist on legacy databases.
+async function ensureFindingVerificationSchema() {
+  await withClient(async (c) => {
+    await c.query(`alter table findings add column if not exists confidence text not null default 'medium'`);
+    await c.query(`alter table findings add column if not exists requires_verification boolean not null default true`);
+    await c.query(`alter table findings add column if not exists claim_type text`);
+    await c.query(`
+      create table if not exists finding_evidence (
+        id uuid primary key default uuid_generate_v4(),
+        fingerprint text not null,
+        target_id uuid references targets(id) on delete cascade,
+        agent_run_id uuid,
+        invocation_id uuid,
+        tool text not null,
+        status text not null default 'observed',
+        evidence text not null default '',
+        created_at timestamptz not null default now()
+      )
+    `);
+    await c.query(`create index if not exists idx_finding_evidence_fp on finding_evidence(fingerprint, created_at asc)`);
+    await c.query(`create index if not exists idx_finding_evidence_target on finding_evidence(target_id)`);
+  });
+}
+await ensureFindingVerificationSchema();
+
+type EvidenceRow = {
+  tool: string;
+  status: string;
+  evidence: string;
+  createdAt: string | Date;
+  invocationId: string | null;
+};
+
+/**
+ * Compute verification status from raw evidence rows.
+ *
+ * Promotion rules (mirrors plan):
+ *  - confidence='high' and requires_verification=false → confirmed (Situation 2)
+ *  - 2+ distinct tools with status='observed' for the fingerprint → confirmed (Situation 1)
+ *  - any verifier_no_response / verifier_failed and no second 'observed' → unverified (Situation 3)
+ *  - otherwise → pending
+ */
+function computeVerification(
+  finding: { confidence: string; requiresVerification: boolean; sourceTool: string | null },
+  evidence: EvidenceRow[]
+): {
+  status: "confirmed" | "unverified" | "pending";
+  confirmedByTools: string[];
+  attempts: Array<{ tool: string; outcome: string; at: string | Date; invocationId: string | null }>;
+} {
+  const observedTools = new Set<string>();
+  const attempts: Array<{ tool: string; outcome: string; at: string | Date; invocationId: string | null }> = [];
+  let hasFailedAttempt = false;
+  for (const e of evidence) {
+    if (e.status === "observed") observedTools.add(e.tool);
+    if (e.status === "verifier_failed" || e.status === "verifier_no_response") hasFailedAttempt = true;
+    attempts.push({ tool: e.tool, outcome: e.status, at: e.createdAt, invocationId: e.invocationId });
+  }
+  const tools = [...observedTools];
+  if (finding.confidence === "high" && !finding.requiresVerification) {
+    return { status: "confirmed", confirmedByTools: tools.length > 0 ? tools : finding.sourceTool ? [finding.sourceTool] : [], attempts };
+  }
+  if (tools.length >= 2) {
+    return { status: "confirmed", confirmedByTools: tools, attempts };
+  }
+  if (hasFailedAttempt) {
+    return { status: "unverified", confirmedByTools: tools, attempts };
+  }
+  return { status: "pending", confirmedByTools: tools, attempts };
+}
+
 app.get("/api/findings", async (req) => {
   const q = req.query as any;
   const targetId = q.targetId ? z.string().uuid().parse(q.targetId) : undefined;
@@ -619,6 +690,9 @@ app.get("/api/findings", async (req) => {
     ? z
         .enum(["open", "triaged", "in_progress", "fixed", "verified", "false_positive", "accepted_risk"])
         .parse(q.status)
+    : undefined;
+  const verification = q.verification
+    ? z.enum(["confirmed", "unverified", "pending"]).parse(q.verification)
     : undefined;
 
   const rows = await withClient(async (c) => {
@@ -640,6 +714,7 @@ app.get("/api/findings", async (req) => {
     const res = await c.query(
       `
       select f.id, f.title, f.severity, f.status, f.evidence_redacted, f.first_seen_at, f.last_seen_at,
+             f.fingerprint, f.confidence, f.requires_verification, f.claim_type,
              t.id as target_id, t.name as target_name, t.address as target_address,
              s.port as service_port, s.protocol as service_protocol, s.service_name as service_name
       from findings f
@@ -654,19 +729,113 @@ app.get("/api/findings", async (req) => {
     return res.rows;
   });
 
-  return rows.map((r) => ({
-    id: r.id,
-    title: r.title,
-    severity: r.severity,
-    status: r.status,
-    evidenceRedacted: r.evidence_redacted,
-    firstSeenAt: r.first_seen_at,
-    lastSeenAt: r.last_seen_at,
-    target: { id: r.target_id, name: r.target_name, address: r.target_address },
-    service: r.service_port
-      ? { port: r.service_port, protocol: r.service_protocol, name: r.service_name ?? null }
-      : null
+  // Batch-fetch evidence for every fingerprint in one query, then bucket per finding.
+  const fingerprints = rows.map((r) => r.fingerprint as string).filter(Boolean);
+  const evidenceByFp = new Map<string, EvidenceRow[]>();
+  if (fingerprints.length > 0) {
+    await withClient(async (c) => {
+      const res = await c.query(
+        `select fingerprint, tool, status, evidence, created_at, invocation_id
+         from finding_evidence
+         where fingerprint = any($1::text[])
+         order by created_at asc`,
+        [fingerprints]
+      );
+      for (const row of res.rows) {
+        const fp = String(row.fingerprint);
+        if (!evidenceByFp.has(fp)) evidenceByFp.set(fp, []);
+        evidenceByFp.get(fp)!.push({
+          tool: String(row.tool),
+          status: String(row.status),
+          evidence: String(row.evidence ?? ""),
+          createdAt: row.created_at,
+          invocationId: row.invocation_id ?? null
+        });
+      }
+    });
+  }
+
+  const enriched = rows.map((r) => {
+    const ev = evidenceByFp.get(r.fingerprint) ?? [];
+    const sourceTool = ev.find((e) => e.status === "observed")?.tool ?? null;
+    const vc = computeVerification(
+      { confidence: r.confidence ?? "medium", requiresVerification: r.requires_verification ?? true, sourceTool },
+      ev
+    );
+    return {
+      id: r.id,
+      title: r.title,
+      severity: r.severity,
+      status: r.status,
+      evidenceRedacted: r.evidence_redacted,
+      firstSeenAt: r.first_seen_at,
+      lastSeenAt: r.last_seen_at,
+      target: { id: r.target_id, name: r.target_name, address: r.target_address },
+      service: r.service_port
+        ? { port: r.service_port, protocol: r.service_protocol, name: r.service_name ?? null }
+        : null,
+      verification: {
+        status: vc.status,
+        confirmedByTools: vc.confirmedByTools,
+        attempts: vc.attempts,
+        confidence: r.confidence ?? "medium",
+        claimType: r.claim_type ?? null
+      }
+    };
+  });
+
+  return verification ? enriched.filter((f) => f.verification.status === verification) : enriched;
+});
+
+app.get("/api/findings/:id/evidence", async (req, reply) => {
+  const findingId = z.string().uuid().parse((req.params as any).id);
+  const row = await withClient(async (c) => {
+    const r = await c.query(
+      `select f.id, f.fingerprint, f.title, f.severity, f.confidence, f.requires_verification, f.claim_type
+       from findings f where f.id = $1`,
+      [findingId]
+    );
+    return r.rows[0];
+  });
+  if (!row) return reply.code(404).send({ error: "finding not found" });
+
+  const events = await withClient(async (c) => {
+    const r = await c.query(
+      `select tool, status, evidence, created_at, invocation_id
+       from finding_evidence
+       where fingerprint = $1
+       order by created_at asc`,
+      [row.fingerprint]
+    );
+    return r.rows;
+  });
+
+  const evidence: EvidenceRow[] = events.map((e: any) => ({
+    tool: String(e.tool),
+    status: String(e.status),
+    evidence: String(e.evidence ?? ""),
+    createdAt: e.created_at,
+    invocationId: e.invocation_id ?? null
   }));
+  const sourceTool = evidence.find((e) => e.status === "observed")?.tool ?? null;
+  const vc = computeVerification(
+    { confidence: row.confidence ?? "medium", requiresVerification: row.requires_verification ?? true, sourceTool },
+    evidence
+  );
+  return {
+    id: row.id,
+    fingerprint: row.fingerprint,
+    title: row.title,
+    severity: row.severity,
+    claimType: row.claim_type ?? null,
+    verification: {
+      status: vc.status,
+      confirmedByTools: vc.confirmedByTools,
+      attempts: vc.attempts,
+      confidence: row.confidence ?? "medium"
+    },
+    evidence
+  };
 });
 
 app.patch("/api/findings/:id", async (req) => {
@@ -1147,6 +1316,8 @@ app.get("/api/agent-tools", async () => {
     { name: "recon.nmap", description: "Run an nmap scan to discover open ports and detect services on a target host.", tags: ["recon", "network"] },
     { name: "recon.http_probe", description: "Probe HTTP/HTTPS endpoints for status code, server header and title.", tags: ["recon", "web"] },
     { name: "recon.spider", description: "Crawl a discovered HTTP(S) endpoint with Katana to enumerate URLs, JS routes, robots.txt and sitemap entries.", tags: ["recon", "web"] },
+    { name: "recon.waybackurls", description: "Backup endpoint discovery via the Wayback Machine when katana's output is thin.", tags: ["recon", "web", "amplification"] },
+    { name: "recon.ffuf", description: "Surgical web path fuzzing with ffuf using a FUZZ placeholder in the target URL.", tags: ["recon", "web", "fuzz"] },
     { name: "recon.gobuster", description: "Brute-force common content paths on a discovered HTTP(S) endpoint using gobuster.", tags: ["recon", "web"] },
     { name: "recon.dns_enum", description: "Enumerate DNS records (A/AAAA/MX/NS/TXT), reverse PTR and attempt safe zone transfers.", tags: ["recon", "dns"] },
     { name: "recon.tls_check", description: "Inspect TLS certificate and protocol versions on TLS-enabled ports.", tags: ["recon", "tls"] },

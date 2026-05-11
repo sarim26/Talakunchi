@@ -56,6 +56,23 @@ export const ScanRunDetailSchema = ScanRunSchema.extend({
 });
 export type ScanRunDetail = z.infer<typeof ScanRunDetailSchema>;
 
+export const VerificationAttemptSchema = z.object({
+  tool: z.string(),
+  outcome: z.string(),
+  at: z.any(),
+  invocationId: z.string().uuid().nullable().optional()
+});
+export type VerificationAttempt = z.infer<typeof VerificationAttemptSchema>;
+
+export const FindingVerificationSchema = z.object({
+  status: z.enum(["confirmed", "unverified", "pending"]),
+  confirmedByTools: z.array(z.string()),
+  attempts: z.array(VerificationAttemptSchema),
+  confidence: z.enum(["low", "medium", "high"]).optional(),
+  claimType: z.string().nullable().optional()
+});
+export type FindingVerification = z.infer<typeof FindingVerificationSchema>;
+
 export const FindingSchema = z.object({
   id: z.string().uuid(),
   title: z.string(),
@@ -67,9 +84,29 @@ export const FindingSchema = z.object({
   target: z.object({ id: z.string().uuid(), name: z.string(), address: z.string() }),
   service: z
     .object({ port: z.number(), protocol: z.string(), name: z.string().nullable() })
-    .nullable()
+    .nullable(),
+  verification: FindingVerificationSchema.optional()
 });
 export type Finding = z.infer<typeof FindingSchema>;
+
+export const FindingEvidenceSchema = z.object({
+  id: z.string().uuid(),
+  fingerprint: z.string(),
+  title: z.string(),
+  severity: z.string(),
+  claimType: z.string().nullable().optional(),
+  verification: FindingVerificationSchema,
+  evidence: z.array(
+    z.object({
+      tool: z.string(),
+      status: z.string(),
+      evidence: z.string(),
+      createdAt: z.any(),
+      invocationId: z.string().uuid().nullable().optional()
+    })
+  )
+});
+export type FindingEvidenceDetail = z.infer<typeof FindingEvidenceSchema>;
 
 export const ServiceSchema = z.object({
   id: z.string().uuid(),
@@ -153,13 +190,18 @@ export async function getScan(id: string) {
   return http(`/api/scans/${id}`, undefined, ScanRunDetailSchema);
 }
 
-export async function listFindings(params?: { targetId?: string; severity?: string; status?: string }) {
+export async function listFindings(params?: { targetId?: string; severity?: string; status?: string; verification?: string }) {
   const qp = new URLSearchParams();
   if (params?.targetId) qp.set("targetId", params.targetId);
   if (params?.severity) qp.set("severity", params.severity);
   if (params?.status) qp.set("status", params.status);
+  if (params?.verification) qp.set("verification", params.verification);
   const qs = qp.toString() ? `?${qp.toString()}` : "";
   return http(`/api/findings${qs}`, undefined, z.array(FindingSchema));
+}
+
+export async function getFindingEvidence(id: string) {
+  return http(`/api/findings/${id}/evidence`, undefined, FindingEvidenceSchema);
 }
 
 export async function listServices(targetId: string) {

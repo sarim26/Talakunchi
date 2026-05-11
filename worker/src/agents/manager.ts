@@ -20,6 +20,34 @@ import type { MCPServer } from "../mcp/server.js";
 import type { ToolFinding } from "../mcp/types.js";
 import type { WordlistCatalog } from "./wordlists.js";
 
+export const PHASES = [
+  "network_discovery",
+  "service_fingerprint",
+  "web_surface",
+  "vulnerability_triage"
+] as const;
+export type Phase = (typeof PHASES)[number];
+
+/**
+ * Which tools naturally belong to which phase. Used by the phase-based
+ * parallel orchestration: when the manager picks `invoke_parallel`, every
+ * sub-tool should share a phase. The mapping is intentionally permissive — a
+ * tool can appear in more than one phase (e.g. spider in web_surface).
+ */
+export const PHASE_TOOLS: Record<Phase, string[]> = {
+  network_discovery: ["recon.nmap", "recon.dns_enum"],
+  service_fingerprint: ["recon.http_probe", "recon.tls_check", "recon.ssh_enum", "recon.smb_enum"],
+  web_surface: ["recon.spider", "recon.gobuster", "recon.ffuf", "recon.waybackurls"],
+  vulnerability_triage: ["recon.cve_enricher"]
+};
+
+export function phaseForTool(name: string): Phase | undefined {
+  for (const phase of PHASES) {
+    if (PHASE_TOOLS[phase].includes(name)) return phase;
+  }
+  return undefined;
+}
+
 export const ManagerDecisionSchema = z.union([
   z.object({
     action: z.literal("invoke"),
@@ -29,18 +57,73 @@ export const ManagerDecisionSchema = z.union([
     reasoning: z.string().optional()
   }),
   z.object({
+    action: z.literal("invoke_parallel"),
+    phase: z.enum(PHASES),
+    invocations: z
+      .array(
+        z.object({
+          tool: z.string().min(1),
+          intentGoal: z.string().min(1),
+          args: z.record(z.string(), z.any()).optional()
+        })
+      )
+      .min(1)
+      .max(4),
+    reasoning: z.string().optional()
+  }),
+  z.object({
     action: z.literal("stop"),
     reason: z.string().min(1)
   })
 ]);
 export type ManagerDecision = z.infer<typeof ManagerDecisionSchema>;
 
+function shouldSkipHttpProbe(ctx: ManagerContext): boolean {
+  // Allow http_probe when it has never succeeded yet, when it failed last time
+  // (recovery), or when it has outstanding verifier work to do.
+  const needsVerification = (ctx.pendingVerifications ?? []).some((v) => v.verifierTool === "recon.http_probe");
+  if (needsVerification) return false;
+
+  const history = ctx.invocationHistory ?? [];
+  const anySucceeded = history.some((h) => h.tool === "recon.http_probe" && h.status === "succeeded");
+  if (!anySucceeded) return false;
+
+  const last = [...history].reverse().find((h) => h.tool === "recon.http_probe");
+  if (last && last.status === "failed") return false;
+
+  // Otherwise: same probe again is pure waste; block it.
+  return true;
+}
+
 export type ManagerContext = {
   targetHost: string;
   stepsRemaining: number;
+  /**
+   * The phase the manager believes the run is currently in. Updated by the
+   * orchestrator after each step based on the latest decision; this is a
+   * hint, not a hard gate, but it lets us emit phase-scoped events for the UI
+   * and steer the deterministic fallback.
+   */
+  phase?: Phase;
   knownPorts: number[];
   knownServices: Array<{ port: number; protocol: string; name?: string; product?: string; version?: string }>;
   knownFindings: ToolFinding[];
+  /**
+   * URLs discovered by recon.spider (or its backup recon.waybackurls).
+   * Used by Layer 3 (endpoint amplification): the manager sees these
+   * directly and can target tools like recon.ffuf at concrete paths.
+   */
+  discoveredEndpoints: Array<{ url: string; method?: string; status?: number | null; sourceTool: string }>;
+  /**
+   * Outstanding fingerprints that still need corroboration. When the budget
+   * gets tight we prioritise running their verifier instead of starting new
+   * discovery (Situation 3 / end-of-run quality rule).
+   */
+  pendingVerifications: Array<{
+    fingerprint: string;
+    verifierTool: string;
+    args?: Record<string, unknown>;
+  }>;
   invocationHistory: Array<{
     tool: string;
     status: string;
@@ -139,10 +222,27 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
   }
 
   const llmDecision = await tryLlmDecision(server, ctx, signal);
-  if (llmDecision && server.has(llmDecision.action === "invoke" ? llmDecision.tool : "")) {
-    return llmDecision;
+  if (llmDecision) {
+    if (llmDecision.action === "invoke" && server.has(llmDecision.tool)) {
+      if (llmDecision.tool === "recon.http_probe" && shouldSkipHttpProbe(ctx)) {
+        // Prevent pointless repeats (same command thrice) when there's no new
+        // verifier work left for http_probe.
+        // Fall through to deterministic policy instead.
+      } else {
+        return llmDecision;
+      }
+    }
+    if (llmDecision.action === "stop") return llmDecision;
+    if (llmDecision.action === "invoke_parallel") {
+      // Filter out unknown tools but keep the rest as a parallel call.
+      const filtered = llmDecision.invocations.filter((i) => {
+        if (!server.has(i.tool)) return false;
+        if (i.tool === "recon.http_probe" && shouldSkipHttpProbe(ctx)) return false;
+        return true;
+      });
+      if (filtered.length >= 1) return { ...llmDecision, invocations: filtered };
+    }
   }
-  if (llmDecision && llmDecision.action === "stop") return llmDecision;
   return deterministicDecision(server, ctx);
 }
 
@@ -154,14 +254,25 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
     "",
     'Return ONLY a JSON object matching ONE of:',
     '  { "action": "invoke", "tool": "<tool-name>", "intentGoal": "<short english goal>", "args": { ... }, "reasoning": "<why>" }',
+    '  { "action": "invoke_parallel", "phase": "<phase>", "invocations": [{"tool":"...","intentGoal":"...","args":{...}}, ...], "reasoning":"<why>" }',
     '  { "action": "stop", "reason": "<short why we are stopping>" }',
     "",
+    "Phases & their parallelisable tools (use invoke_parallel for these):",
+    "  - network_discovery     : recon.nmap, recon.dns_enum",
+    "  - service_fingerprint   : recon.http_probe + recon.tls_check (run together once nmap shows web/TLS ports)",
+    "  - web_surface           : recon.spider + recon.ffuf + recon.gobuster (run together once an HTTP endpoint is reachable)",
+    "  - vulnerability_triage  : recon.cve_enricher",
+    "",
     "Rules:",
-    "- Choose tool from the manifest below.",
+    "- Choose tool(s) from the manifest below.",
     "- Do not pick a tool whose preconditions are not yet satisfied (e.g. recon.gobuster needs an HTTP endpoint).",
+    "- Prefer `invoke_parallel` ONLY for tools that share a phase and have no dependency on each other's output.",
+    "- Do NOT invoke recon.http_probe repeatedly with identical scope. Only re-run recon.http_probe when it is verifying new open-port claims (pendingVerifications contains verifierTool=recon.http_probe) or the last probe failed.",
     "- If a previous failure has meta.missingTool=<name>, choose `system.tool_installer` with args.tool=<name> next. If recentFailures[].missingToolInstallCommand is set, include args.installCommand with that exact string (non-apt installs). Otherwise omit installCommand to use apt. Then re-invoke the failed specialist on the following step.",
-    "- After `recon.http_probe` succeeds and a reachable endpoint exists, prefer `recon.spider` (Katana crawler) BEFORE `recon.gobuster` so brute-forcing has more context.",
-    "- If there are recentFailures, prefer safe recovery actions: retry with reduced scope (e.g. fewer threads), adjust timeouts, pick a different valid wordlist, or choose an alternative recon tool.",
+    "- After recon.http_probe succeeds and a reachable endpoint exists, run the web_surface phase as `invoke_parallel`.",
+    "- For discoveredEndpoints with API-ish paths (/api/, /graphql, /v1/, /v2/), prefer recon.ffuf with args.targetUrl ending in /FUZZ.",
+    "- pendingVerifications lists open-port claims still awaiting corroboration. If stepsRemaining <= 3, prioritise running their verifierTool before any new discovery.",
+    "- If there are recentFailures, prefer safe recovery actions: retry with reduced scope, adjust timeouts, pick a different valid wordlist, or choose an alternative recon tool.",
     "- Stop early if no productive next step is available."
   ].join("\n");
 
@@ -169,9 +280,12 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
     {
       manifest: server.manifest(),
       target: ctx.targetHost,
+      phase: ctx.phase ?? null,
       stepsRemaining: ctx.stepsRemaining,
       knownPorts: ctx.knownPorts,
       knownServices: ctx.knownServices.slice(0, 30),
+      discoveredEndpoints: (ctx.discoveredEndpoints ?? []).slice(-30),
+      pendingVerifications: (ctx.pendingVerifications ?? []).slice(-10),
       pendingRecommendations: ctx.pendingRecommendations.slice(0, 10),
       knownFindings: ctx.knownFindings.slice(-15).map((f) => ({ title: f.title, severity: f.severity })),
       history: ctx.invocationHistory.slice(-15),
@@ -210,6 +324,22 @@ function deterministicDecision(server: MCPServer, ctx: ManagerContext): ManagerD
   const hasOpenPort = (...ports: number[]) => ctx.knownServices.some((s) => ports.includes(s.port));
 
   if (ctx.stepsRemaining <= 0) return { action: "stop", reason: "Step budget exhausted" };
+
+  // End-of-run quality rule (plan): with <=3 steps left, prefer running any
+  // outstanding verifiers over starting new discovery, so unverified findings
+  // get a fair shot at promotion.
+  if (ctx.stepsRemaining <= 3) {
+    const pv = (ctx.pendingVerifications ?? []).find((v) => have(v.verifierTool));
+    if (pv) {
+      return {
+        action: "invoke",
+        tool: pv.verifierTool,
+        intentGoal: `Verify pending claim ${pv.fingerprint} before run ends`,
+        args: pv.args,
+        reasoning: "Budget low — prioritising pending verification over new discovery"
+      };
+    }
+  }
 
   // Never retry the installer itself. If it failed, stop to avoid an install loop
   // (the operator can fix sudo/apt and resume a new run).
@@ -277,11 +407,55 @@ function deterministicDecision(server: MCPServer, ctx: ManagerContext): ManagerD
     return { action: "invoke", tool: "recon.dns_enum", intentGoal: "Enumerate DNS records and subdomains" };
   }
 
+  // service_fingerprint phase: run http_probe + tls_check in parallel when
+  // we have both HTTP and TLS-capable ports open. Both consume the same
+  // service list and have no dependency on each other.
+  if (
+    hasOpenPort(80, 443, 8080, 8443) &&
+    hasOpenPort(443, 8443) &&
+    have("recon.http_probe") &&
+    have("recon.tls_check") &&
+    !hasInvoked("recon.http_probe") &&
+    !hasInvoked("recon.tls_check")
+  ) {
+    return {
+      action: "invoke_parallel",
+      phase: "service_fingerprint",
+      invocations: [
+        { tool: "recon.http_probe", intentGoal: "Probe HTTP/HTTPS endpoints" },
+        { tool: "recon.tls_check", intentGoal: "Inspect TLS certificate / supported protocols" }
+      ],
+      reasoning: "service_fingerprint phase: HTTP + TLS probing share the same target list"
+    };
+  }
+
   if (hasOpenPort(80, 443, 8080, 8443) && have("recon.http_probe") && !hasInvoked("recon.http_probe")) {
     return { action: "invoke", tool: "recon.http_probe", intentGoal: "Probe HTTP/HTTPS endpoints" };
   }
   if (hasOpenPort(443, 8443) && have("recon.tls_check") && !hasInvoked("recon.tls_check")) {
     return { action: "invoke", tool: "recon.tls_check", intentGoal: "Inspect TLS certificate / supported protocols" };
+  }
+  // web_surface phase (parallel): once an HTTP endpoint is reachable, run
+  // spider + ffuf together. Spider crawls in-page links; ffuf probes common
+  // paths simultaneously. Gobuster comes later (it does similar work and
+  // produces noise when run alongside ffuf).
+  if (
+    hasInvoked("recon.http_probe") &&
+    ctx.knownFindings.some((f) => /Reachable web endpoint:/i.test(f.title)) &&
+    have("recon.spider") &&
+    have("recon.ffuf") &&
+    !hasInvoked("recon.spider") &&
+    !hasInvoked("recon.ffuf")
+  ) {
+    return {
+      action: "invoke_parallel",
+      phase: "web_surface",
+      invocations: [
+        { tool: "recon.spider", intentGoal: "Crawl reachable web endpoint to enumerate URLs and JS routes" },
+        { tool: "recon.ffuf", intentGoal: "Fuzz common web paths in parallel with the spider" }
+      ],
+      reasoning: "web_surface phase: spider + ffuf attack different surfaces concurrently"
+    };
   }
   // Spider AFTER http_probe (so we know which endpoints are reachable) and
   // BEFORE gobuster (so brute-forcing has the spider's findings as context).

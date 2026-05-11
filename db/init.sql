@@ -62,11 +62,35 @@ create table if not exists findings (
   status finding_status not null default 'open',
   fingerprint text not null,
   evidence_redacted text not null default '',
+  -- Verification metadata (Layer 1). `confidence` = strength of the source
+  -- claim itself; `requires_verification` becomes false either at emit time
+  -- (high-confidence tools) or when a second tool corroborates the fingerprint.
+  confidence text not null default 'medium',
+  requires_verification boolean not null default true,
+  claim_type text,
   first_seen_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
   last_scan_run_id uuid references scan_runs(id) on delete set null,
   unique (fingerprint)
 );
+
+-- Per-tool evidence rows keyed by the finding's fingerprint. Powers the
+-- "verification chain" view and the confirmed/unverified/pending status
+-- computed by the API.
+create table if not exists finding_evidence (
+  id uuid primary key default uuid_generate_v4(),
+  fingerprint text not null,
+  target_id uuid references targets(id) on delete cascade,
+  agent_run_id uuid,
+  invocation_id uuid,
+  tool text not null,
+  status text not null default 'observed', -- observed | verifier_failed | verifier_no_response
+  evidence text not null default '',
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_finding_evidence_fp on finding_evidence(fingerprint, created_at asc);
+create index if not exists idx_finding_evidence_target on finding_evidence(target_id);
+create index if not exists idx_finding_evidence_run on finding_evidence(agent_run_id);
 
 create table if not exists finding_events (
   id uuid primary key default uuid_generate_v4(),

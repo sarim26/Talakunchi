@@ -334,9 +334,24 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
   const promptEvents = events.filter((e) => e.kind === "prompter.output");
   const wordlistEvent = events.find((e) => e.kind === "wordlist.catalog");
   const failureEvents = events.filter((e) => e.kind === "agent.failure");
+  const phaseStarted = events.filter((e) => e.kind === "phase.started");
+  const phaseFinished = events.filter((e) => e.kind === "phase.finished");
   const finishedCount = invocations.filter((i) => ["succeeded", "failed", "skipped"].includes(i.status)).length;
   const progress = run.maxSteps > 0 ? Math.min(100, Math.round((run.stepsTaken / run.maxSteps) * 100)) : 0;
   const summaryAvailable = run.status === "succeeded" || run.status === "failed";
+
+  // Reconstruct the current phase + which tools are running in parallel right
+  // now. A phase is "active" if it has been started but not yet finished, OR
+  // we're past the last started phase and no new one has begun.
+  const lastStarted = phaseStarted[phaseStarted.length - 1] ?? null;
+  const lastFinished = phaseFinished[phaseFinished.length - 1] ?? null;
+  const currentPhase =
+    lastStarted && (!lastFinished || new Date(lastStarted.createdAt as any) > new Date(lastFinished.createdAt as any))
+      ? ((lastStarted.payload ?? {}) as { phase?: string; tools?: string[] })
+      : null;
+  const latestDecision = (decisionEvents[decisionEvents.length - 1]?.payload ?? {}) as {
+    snapshot?: { phase?: string | null; pendingVerifications?: number; discoveredEndpoints?: number };
+  };
 
   return (
     <Stack spacing={2}>
@@ -382,6 +397,12 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
           </Box>
         </CardContent>
       </Card>
+
+      <PhaseCard
+        currentPhase={currentPhase}
+        latestSnapshot={latestDecision.snapshot ?? null}
+        phaseHistory={phaseFinished}
+      />
 
       {wordlistEvent ? <WordlistCatalogCard event={wordlistEvent} /> : null}
 
@@ -653,6 +674,98 @@ function InvocationCard(props: { inv: AgentInvocation; open: boolean; onToggle: 
         </>
       ) : null}
     </Box>
+  );
+}
+
+function PhaseCard(props: {
+  currentPhase: { phase?: string; tools?: string[] } | null;
+  latestSnapshot: { phase?: string | null; pendingVerifications?: number; discoveredEndpoints?: number } | null;
+  phaseHistory: AgentEvent[];
+}) {
+  const { currentPhase, latestSnapshot, phaseHistory } = props;
+  const activePhaseName = currentPhase?.phase ?? latestSnapshot?.phase ?? null;
+  const runningTools = currentPhase?.tools ?? [];
+  return (
+    <Card>
+      <CardContent>
+        <Stack direction={{ xs: "column", md: "row" }} alignItems={{ md: "center" }} justifyContent="space-between" spacing={1}>
+          <Typography variant="subtitle1">Phase &amp; parallel tools</Typography>
+          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+            <Chip
+              size="small"
+              label={`phase: ${activePhaseName ?? "—"}`}
+              color={currentPhase ? "primary" : "default"}
+              variant={currentPhase ? "filled" : "outlined"}
+            />
+            {typeof latestSnapshot?.discoveredEndpoints === "number" ? (
+              <Chip size="small" label={`endpoints: ${latestSnapshot.discoveredEndpoints}`} variant="outlined" />
+            ) : null}
+            {typeof latestSnapshot?.pendingVerifications === "number" ? (
+              <Chip
+                size="small"
+                label={`pending verifications: ${latestSnapshot.pendingVerifications}`}
+                color={latestSnapshot.pendingVerifications > 0 ? "warning" : "default"}
+                variant="outlined"
+              />
+            ) : null}
+          </Stack>
+        </Stack>
+        <Divider sx={{ my: 1.5 }} />
+        {currentPhase && runningTools.length > 0 ? (
+          <Box>
+            <Typography variant="caption" color="text.secondary">
+              Tools running in parallel right now:
+            </Typography>
+            <Stack direction="row" spacing={1} sx={{ mt: 0.5 }} flexWrap="wrap" useFlexGap>
+              {runningTools.map((t) => (
+                <Chip key={t} size="small" label={t} color="primary" />
+              ))}
+            </Stack>
+          </Box>
+        ) : (
+          <Typography variant="body2" color="text.secondary">
+            No phase is currently running in parallel.
+          </Typography>
+        )}
+        {phaseHistory.length > 0 ? (
+          <Box sx={{ mt: 1.5 }}>
+            <Typography variant="caption" color="text.secondary">
+              Recent phases
+            </Typography>
+            <Stack spacing={0.5} sx={{ mt: 0.5 }}>
+              {phaseHistory
+                .slice(-4)
+                .reverse()
+                .map((e) => {
+                  const p = (e.payload ?? {}) as {
+                    step?: number;
+                    phase?: string;
+                    outcomes?: Array<{ tool: string; status: string }>;
+                  };
+                  return (
+                    <Box key={e.id} sx={{ p: 1, border: "1px dashed", borderColor: "divider", borderRadius: 1 }}>
+                      <Typography variant="body2">
+                        <strong>step {p.step ?? "?"}</strong> · phase: {p.phase ?? "?"}
+                      </Typography>
+                      <Stack direction="row" spacing={0.5} sx={{ mt: 0.5 }} flexWrap="wrap" useFlexGap>
+                        {(p.outcomes ?? []).map((o, i) => (
+                          <Chip
+                            key={i}
+                            size="small"
+                            label={`${o.tool}: ${o.status}`}
+                            color={o.status === "succeeded" ? "success" : o.status === "failed" ? "error" : "default"}
+                            variant="outlined"
+                          />
+                        ))}
+                      </Stack>
+                    </Box>
+                  );
+                })}
+            </Stack>
+          </Box>
+        ) : null}
+      </CardContent>
+    </Card>
   );
 }
 

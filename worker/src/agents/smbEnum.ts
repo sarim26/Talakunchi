@@ -100,7 +100,11 @@ export const smbEnumTool: ToolDefinition = {
           port: 445,
           protocol: "tcp",
           evidence,
-          fingerprint: `smb-share|${host}|${shareName}`
+          fingerprint: `smb-share|${host}|${shareName}`,
+          // enum4linux-ng either listed the share or it didn't.
+          confidence: "high",
+          requiresVerification: false,
+          claimType: "smb_share"
         });
 
         if (/(^|[\s,])(ok|listable|read|rw|write)([\s,]|$)/i.test(mapping)) {
@@ -110,7 +114,10 @@ export const smbEnumTool: ToolDefinition = {
             port: 445,
             protocol: "tcp",
             evidence: `enum4linux-ng access=${mapping || "unknown"}`,
-            fingerprint: `smb-anon|${host}|${shareName}`
+            fingerprint: `smb-anon|${host}|${shareName}`,
+            confidence: "high",
+            requiresVerification: false,
+            claimType: "smb_anonymous_access"
           });
         }
       }
@@ -133,7 +140,10 @@ export const smbEnumTool: ToolDefinition = {
           port: 445,
           protocol: "tcp",
           evidence: bits.join(", "),
-          fingerprint: `smb-user|${host}|${rid}|${username}`
+          fingerprint: `smb-user|${host}|${rid}|${username}`,
+          confidence: "high",
+          requiresVerification: false,
+          claimType: "smb_user"
         });
       }
     }
@@ -157,7 +167,10 @@ export const smbEnumTool: ToolDefinition = {
           port: 445,
           protocol: "tcp",
           evidence: signingWeakEvidence(signing, dialectsObj),
-          fingerprint: `smb-signing|${host}`
+          fingerprint: `smb-signing|${host}`,
+          confidence: "high",
+          requiresVerification: false,
+          claimType: "smb_signing_weak"
         });
       }
     }

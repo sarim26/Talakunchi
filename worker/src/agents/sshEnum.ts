@@ -71,6 +71,23 @@ export const sshEnumTool: ToolDefinition = {
         source: "ssh-audit"
       });
 
+      // ssh-audit successfully negotiated a session and read the banner — this
+      // independently confirms nmap's open-port claim for this port.
+      if (raw || software) {
+        findings.push({
+          title: `SSH banner observed on ${host}:${port}`,
+          severity: "info",
+          port,
+          protocol: "tcp",
+          evidence: `Banner: ${raw ?? software ?? "(none)"}`,
+          fingerprint: `ssh-reachable|${host}|${port}`,
+          confidence: "high",
+          requiresVerification: false,
+          claimType: "ssh_reachable",
+          verifiesFingerprint: `open-port|${host}|tcp|${port}`
+        });
+      }
+
       for (const key of ["kex", "key", "mac", "enc", "compression"] as const) {
         const list = obj[key];
         if (Array.isArray(list)) {
@@ -95,7 +112,11 @@ export const sshEnumTool: ToolDefinition = {
           port,
           protocol: "tcp",
           evidence: `${description}${cvssv2 !== null ? ` (CVSSv2: ${cvssv2})` : ""}`,
-          fingerprint: `ssh-cve|${host}|${port}|${name}`
+          fingerprint: `ssh-cve|${host}|${port}|${name}`,
+          // CVE match against the ssh-audit fingerprint database is definitive.
+          confidence: "high",
+          requiresVerification: false,
+          claimType: "ssh_cve"
         });
       }
 
@@ -111,7 +132,12 @@ export const sshEnumTool: ToolDefinition = {
           port,
           protocol: "tcp",
           evidence: `ssh-audit recommends removing ${e.kind} ${e.algorithm}`,
-          fingerprint: `ssh-weak|${host}|${port}|${e.kind}|${e.algorithm}`
+          fingerprint: `ssh-weak|${host}|${port}|${e.kind}|${e.algorithm}`,
+          // The server negotiated/advertised this algorithm to ssh-audit; it
+          // is observed directly, no follow-up verifier needed.
+          confidence: "high",
+          requiresVerification: false,
+          claimType: "ssh_weak_algorithm"
         });
       }
     }
