@@ -127,7 +127,10 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
     invocationHistory: [],
     pendingRecommendations: [],
     wordlistCatalog,
-    recentFailures: []
+    recentFailures: [],
+    installedToolsAttempted: [],
+    installedToolsInstalled: [],
+    blockedOnMissingTool: null
   };
 
   const allFindings: ToolFinding[] = [];
@@ -163,6 +166,12 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
 
     const decisionArgs = "args" in decision ? (decision.args as Record<string, unknown> | undefined) : undefined;
     const selectedWordlist = typeof decisionArgs?.wordlist === "string" ? String(decisionArgs.wordlist) : undefined;
+
+    // If the manager is now re-invoking a tool that was previously blocked on a
+    // missing dependency, clear the block so we don't keep forcing retries.
+    if (ctx.blockedOnMissingTool && decision.action === "invoke" && decision.tool === ctx.blockedOnMissingTool.tool) {
+      ctx.blockedOnMissingTool = null;
+    }
 
     const prompt = await generatePrompt({
       agent: toolDef,
@@ -204,13 +213,21 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       const prev = attemptsByTool.get(toolDef.name) ?? 0;
       attemptsByTool.set(toolDef.name, prev + 1);
 
+      const meta = envelope.meta as Record<string, unknown> | undefined;
+      const missingTool =
+        typeof meta?.missingTool === "string" ? String(meta.missingTool) : undefined;
+      const missingToolInstallCommand =
+        typeof meta?.missingToolInstallCommand === "string" ? String(meta.missingToolInstallCommand) : undefined;
+
       const failure = {
         tool: toolDef.name,
         attempt: prev,
         args: (decisionArgs ?? {}) as Record<string, unknown>,
         error: envelope.error,
         stdoutSnippet: envelope.artifacts?.stdoutSnippet,
-        stderrSnippet: envelope.artifacts?.stderrSnippet
+        stderrSnippet: envelope.artifacts?.stderrSnippet,
+        missingTool,
+        missingToolInstallCommand
       };
       ctx.recentFailures = [...(ctx.recentFailures ?? []), failure].slice(-10);
 
@@ -221,14 +238,49 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
         );
       });
 
-      // Hint the manager to attempt a safe recovery on the next step. The manager
-      // will see recentFailures and can pick adjusted args or an alternative tool.
-      if (prev < 1) {
+      if (missingTool) {
+        // Track which specialist was blocked so we can re-run it after install.
+        ctx.blockedOnMissingTool = {
+          tool: toolDef.name,
+          args: (decisionArgs ?? {}) as Record<string, unknown>,
+          missingTool
+        };
+        // Self-heal path: queue the installer (priority 100) so the manager
+        // picks it next, and the failed specialist will be retried via the
+        // existing lastFail recovery branch on the step after that.
+        if (server.has("system.tool_installer") && !(ctx.installedToolsAttempted ?? []).includes(missingTool)) {
+          const installArgs: Record<string, unknown> = { tool: missingTool };
+          if (missingToolInstallCommand) installArgs.installCommand = missingToolInstallCommand;
+          ctx.pendingRecommendations.unshift({
+            agent: "system.tool_installer",
+            reason: `Install missing tool '${missingTool}' for ${toolDef.name}`,
+            priority: 100,
+            args: installArgs
+          });
+        }
+      } else if (prev < 1) {
+        // Hint the manager to attempt a safe recovery on the next step. The manager
+        // will see recentFailures and can pick adjusted args or an alternative tool.
         ctx.pendingRecommendations.unshift({
           agent: toolDef.name,
           reason: `Recover from failure: ${envelope.error ?? "unknown error"}`,
           priority: 95
         });
+      }
+    }
+
+    // After a tool_installer run (success or failure), record the attempt so
+    // we don't loop trying to install the same package over and over.
+    if (toolDef.name === "system.tool_installer") {
+      const installedTool = (decisionArgs as { tool?: string } | undefined)?.tool;
+      if (installedTool) {
+        const list = ctx.installedToolsAttempted ?? [];
+        if (!list.includes(installedTool)) ctx.installedToolsAttempted = [...list, installedTool];
+
+        if (envelope.status === "succeeded") {
+          const ok = ctx.installedToolsInstalled ?? [];
+          if (!ok.includes(installedTool)) ctx.installedToolsInstalled = [...ok, installedTool];
+        }
       }
     }
 

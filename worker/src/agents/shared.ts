@@ -3,8 +3,11 @@
  *  - executing tool commands over the SSH bastion
  *  - parsing nmap-like outputs
  *  - normalising service rows
+ *  - presence-checking remote CLI tools so the orchestrator can auto-install
+ *    missing dependencies via `system.tool_installer`
  */
 import { spawnBashScriptOverSsh, spawnWithRemotePolicy } from "../remoteExec.js";
+import type { ToolEnvelope } from "../mcp/types.js";
 
 export type SpecialistContextSummary = {
   host: string;
@@ -108,6 +111,55 @@ export function uniqStrings(arr: string[]) {
 export function safeNumber(v: unknown, fallback = 0): number {
   const n = typeof v === "string" ? Number(v) : (v as number);
   return Number.isFinite(n) ? n : fallback;
+}
+
+/**
+ * Result of a remote tool presence check. When `missing` is true, agents should
+ * return `envelope` directly so the orchestrator can detect the missing-tool
+ * signal (`meta.missingTool`) and auto-install it via `system.tool_installer`.
+ */
+export type ToolPresenceCheck =
+  | { missing: false }
+  | { missing: true; envelope: ToolEnvelope };
+
+/**
+ * Check whether a CLI binary is installed on the remote tools host. This is the
+ * preflight every specialist runs before invoking a heavy command — if the tool
+ * is missing, the orchestrator queues `system.tool_installer` and retries.
+ */
+export async function requireRemoteTool(
+  toolName: string,
+  signal?: AbortSignal,
+  opts?: { installCommand?: string }
+): Promise<ToolPresenceCheck> {
+  const safe = toolName.replace(/[^a-zA-Z0-9_.\-]/g, "");
+  if (!safe) {
+    return { missing: true, envelope: missingToolEnvelope(toolName, "Invalid tool name") };
+  }
+  const script = `if command -v ${safe} >/dev/null 2>&1; then echo PRESENT; else echo MISSING; fi`;
+  const r = await remoteScript(script, signal);
+  if (/PRESENT/.test(r.stdout)) return { missing: false };
+  return { missing: true, envelope: missingToolEnvelope(toolName, undefined, opts?.installCommand) };
+}
+
+/**
+ * Build a uniform `failed` envelope that signals to the orchestrator that the
+ * given tool is missing on the remote host. The orchestrator looks for
+ * `meta.missingTool` and queues the installer.
+ */
+export function missingToolEnvelope(toolName: string, reason?: string, installCommand?: string): ToolEnvelope {
+  const hint = typeof installCommand === "string" ? installCommand.trim() : "";
+  const meta: Record<string, unknown> = { missingTool: toolName };
+  if (hint) meta.missingToolInstallCommand = hint;
+  return {
+    status: "failed",
+    error: `Missing tool on remote host: ${toolName}${reason ? ` (${reason})` : ""}`,
+    facts: [],
+    findings: [],
+    recommendations: [],
+    artifacts: { commands: [`command -v ${toolName}`] },
+    meta
+  };
 }
 
 function extractCommandsFromScript(script: string): string[] {

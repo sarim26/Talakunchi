@@ -1,15 +1,21 @@
 import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
-import { remoteScript, snippet } from "./shared.js";
+import { remoteScript, requireRemoteTool, snippet } from "./shared.js";
+
+const HTTPX_BIN = "httpx-toolkit";
 
 /**
- * recon.http_probe — checks each candidate web port for a live HTTP/S response,
- * extracts status, server header, title, and basic redirects.
+ * recon.http_probe — JSON-native HTTP(S) probing using ProjectDiscovery's
+ * httpx (Kali package: httpx-toolkit). Candidate URLs are fed on stdin via
+ * `printf '%s\\n' … | httpx` and httpx emits one JSON object per live endpoint;
+ * we parse those into
+ * `http_endpoint` facts and `Reachable web endpoint:` findings.
  *
- * Uses curl on the SSH host (no external services).
+ * If `httpx-toolkit` is missing on the remote host we return a missing-tool
+ * envelope so the orchestrator can auto-install it via system.tool_installer.
  */
 export const httpProbeTool: ToolDefinition = {
   name: "recon.http_probe",
-  description: "Probe HTTP/HTTPS endpoints on a target to capture status code, server header and title.",
+  description: "Probe HTTP/HTTPS endpoints on a target with httpx and capture status, title, server header and detected tech.",
   tags: ["recon", "web"],
   requires: ["services"],
   defaultTimeoutMs: 5 * 60 * 1000,
@@ -35,65 +41,68 @@ export const httpProbeTool: ToolDefinition = {
         facts: [],
         findings: [],
         recommendations: [],
-        meta: { commandSummary: `Probe HTTP/HTTPS endpoints on ${input.target.host} to capture status, headers, and title.` }
+        meta: {
+          commandSummary: `Probe HTTP/HTTPS endpoints on ${input.target.host} with httpx and capture status, headers, and title.`
+        }
       };
     }
 
+    const presence = await requireRemoteTool(HTTPX_BIN, input.signal);
+    if (presence.missing) return presence.envelope;
+
     const host = input.target.host;
-    const lines: string[] = [
-      `set -euo pipefail`,
-      `HOST=${quote(host)}`,
-      `for ENTRY in ${knownPorts.map((p) => `${p.scheme}:${p.port}`).join(" ")}; do`,
-      `  SCHEME=\${ENTRY%%:*}`,
-      `  PORT=\${ENTRY##*:}`,
-      `  URL="$SCHEME://$HOST:$PORT/"`,
-      `  echo "==== $URL ===="`,
-      `  curl -k -sS -o /tmp/_t.body -D /tmp/_t.head -m 8 -w 'HTTPCODE:%{http_code}\\nFINAL:%{url_effective}\\n' "$URL" || echo "CURL_ERR"`,
-      `  head -c 4096 /tmp/_t.head || true`,
-      `  echo "---- body-head ----"`,
-      `  head -c 1024 /tmp/_t.body || true`,
-      `  echo`,
-      `done`
-    ];
+    // One pipeline so logs/artifacts show the real command (not a lone `} | httpx`).
+    const urlArgs = knownPorts.map((kp) => quote(`${kp.scheme}://${host}:${kp.port}/`)).join(" ");
+    const script = `printf '%s\\n' ${urlArgs} | ${HTTPX_BIN} -silent -json -title -status-code -web-server -tech-detect -follow-redirects -timeout 8 -no-color`;
 
-    emit.log(`Probing ${knownPorts.length} HTTP/S endpoints on ${host}`);
-    const r = await remoteScript(lines.join("\n"), input.signal, (s) => emit.log(s));
+    emit.log(`Probing ${knownPorts.length} HTTP/S endpoint(s) on ${host} via httpx`);
+    const r = await remoteScript(script, input.signal, (s) => emit.log(s));
 
-    const blocks = r.stdout.split(/^==== /m).slice(1);
     const facts: ToolEnvelope["facts"] = [];
     const findings: ToolEnvelope["findings"] = [];
 
-    for (const block of blocks) {
-      const headerLine = block.split("\n")[0];
-      const url = `==== ${headerLine}`.replace(/^====\s*/, "").replace(/\s*====\s*$/, "").trim();
-      const statusMatch = /HTTPCODE:(\d{3})/.exec(block);
-      const code = statusMatch ? Number(statusMatch[1]) : null;
-      const serverMatch = /^Server:\s*(.+)$/im.exec(block);
-      const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(block);
+    for (const line of r.stdout.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed[0] !== "{") continue;
+      let obj: Record<string, unknown>;
+      try {
+        obj = JSON.parse(trimmed) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+
+      const url = (obj.url as string) ?? (obj.input as string) ?? "";
+      if (!url) continue;
+      const statusRaw = (obj as Record<string, unknown>)["status-code"] ?? obj.status_code;
+      const status =
+        typeof statusRaw === "number"
+          ? (statusRaw as number)
+          : typeof statusRaw === "string" && Number.isFinite(Number(statusRaw))
+            ? Number(statusRaw)
+            : null;
+      const server = typeof obj.webserver === "string" ? (obj.webserver as string) : null;
+      const title = typeof obj.title === "string" ? (obj.title as string).slice(0, 200) : null;
+      const techRaw = (obj as Record<string, unknown>).technologies ?? obj.tech;
+      const tech = Array.isArray(techRaw) ? (techRaw as unknown[]).filter((t): t is string => typeof t === "string") : [];
 
       facts.push({
         type: "http_endpoint",
-        value: {
-          url,
-          status: code,
-          server: serverMatch ? serverMatch[1].trim() : null,
-          title: titleMatch ? titleMatch[1].trim().slice(0, 200) : null
-        },
-        source: "curl"
+        value: { url, status, server, title, tech },
+        source: "httpx"
       });
 
-      if (code && code >= 200 && code < 400) {
+      if (status !== null && status >= 200 && status < 400) {
         findings.push({
           title: `Reachable web endpoint: ${url}`,
-          severity: code >= 500 ? "low" : "info",
-          evidence: `HTTP ${code}${serverMatch ? ` Server: ${serverMatch[1].trim()}` : ""}`,
+          severity: "info",
+          evidence: `HTTP ${status}${server ? ` Server: ${server}` : ""}${tech.length ? ` Tech: ${tech.join(", ")}` : ""}`,
           fingerprint: `http|${url}`
         });
-      } else if (code && code >= 500) {
+      } else if (status !== null && status >= 500) {
         findings.push({
-          title: `Web endpoint returns ${code}: ${url}`,
+          title: `Web endpoint returns ${status}: ${url}`,
           severity: "low",
-          evidence: `HTTP ${code} from ${url}`,
+          evidence: `HTTP ${status} from ${url}`,
           fingerprint: `http5xx|${url}`
         });
       }
@@ -101,7 +110,8 @@ export const httpProbeTool: ToolDefinition = {
 
     const recs: ToolEnvelope["recommendations"] = [];
     if (facts.length > 0) {
-      recs.push({ agent: "recon.gobuster", reason: "Discovered web endpoints — enumerate paths", priority: 60 });
+      recs.push({ agent: "recon.spider", reason: "Discovered web endpoints — crawl them with katana", priority: 65 });
+      recs.push({ agent: "recon.gobuster", reason: "Discovered web endpoints — brute-force common paths", priority: 60 });
       if (knownPorts.some((kp) => kp.scheme === "https")) {
         recs.push({ agent: "recon.tls_check", reason: "Verify TLS configuration", priority: 70 });
       }
@@ -117,7 +127,8 @@ export const httpProbeTool: ToolDefinition = {
       meta: {
         exitCode: r.exitCode,
         probed: knownPorts.length,
-        commandSummary: `Probe ${knownPorts.length} HTTP/HTTPS endpoint(s) on ${host} to capture status, headers, and title.`
+        live: facts.length,
+        commandSummary: `Probe ${knownPorts.length} HTTP/HTTPS endpoint(s) on ${host} with httpx (JSON output) and emit live endpoints as facts.`
       }
     };
   }

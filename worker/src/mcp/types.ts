@@ -39,7 +39,13 @@ export const ToolRecommendationSchema = z.object({
   agent: z.string(),
   reason: z.string(),
   priority: z.number().int().min(0).max(100).default(50),
-  intent: z.string().optional()
+  intent: z.string().optional(),
+  /**
+   * Optional structured args the recommendation wants the next invocation to use.
+   * The manager forwards these through to the next ManagerDecision so that, for
+   * example, `system.tool_installer` knows which tool it should install.
+   */
+  args: z.record(z.string(), z.any()).optional()
 });
 export type ToolRecommendation = z.infer<typeof ToolRecommendationSchema>;
 

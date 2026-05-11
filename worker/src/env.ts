@@ -47,6 +47,8 @@ const EnvSchema = z.object({
     .pipe(z.string().min(1, "REMOTE_SSH_USER is required")),
   REMOTE_SSH_PORT: z.coerce.number().default(22),
   REMOTE_SSH_PASSWORD: z.string().optional(),
+  /** Optional sudo password for the remote Kali user (used by system.tool_installer). */
+  REMOTE_SSH_SUDO_PASSWORD: z.string().optional(),
   REMOTE_SSH_IDENTITY_FILE: z.string().optional(),
   REMOTE_SSH_STRICT_HOST_KEY_CHECKING: z.enum(["yes", "no", "accept-new"]).default("accept-new")
 }).superRefine((data, ctx) => {
