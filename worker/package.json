@@ -4,7 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "update:cve-db": "tsx src/scripts/updateCveDb.ts"
   },
   "dependencies": {
     "fast-xml-parser": "^5.2.5",

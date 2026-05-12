@@ -1,35 +1,36 @@
 import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
+import { loadCveHeuristics, type CompiledHeuristic } from "../cveDb/heuristics.js";
 
 /**
  * recon.cve_enricher — pure enrichment, no scanning. Maps observed
  * (product, version) tuples to a small built-in heuristic set of
- * known-bad versions / families. This is intentionally local-only;
- * a future iteration can wire it to an offline NVD mirror.
+ * known-bad versions / families.
+ *
+ * This tool is intentionally offline at runtime: it reads a local feed
+ * from `data/cve-heuristics.json` (or CVE_HEURISTICS_PATH) and falls back
+ * to a small built-in set when the feed is missing/invalid.
  */
-const HEURISTICS: Array<{
-  match: RegExp;
-  cves: string[];
-  severity: "info" | "low" | "medium" | "high" | "critical";
-  description: string;
-}> = [
-  { match: /OpenSSH[_ ]?7\.[0-3]/i, cves: ["CVE-2016-10009", "CVE-2016-10010"], severity: "medium", description: "OpenSSH 7.0–7.3 has known agent-related issues" },
-  { match: /Apache\/2\.4\.49/i, cves: ["CVE-2021-41773"], severity: "critical", description: "Apache 2.4.49 path traversal" },
-  { match: /Apache\/2\.4\.50/i, cves: ["CVE-2021-42013"], severity: "critical", description: "Apache 2.4.50 path traversal (incomplete fix)" },
-  { match: /nginx\/1\.(?:1[0-7]|[0-9])\b/i, cves: ["CVE-2019-9511"], severity: "medium", description: "Older nginx HTTP/2 DoS family" },
-  { match: /Microsoft IIS httpd\/?\s*(?:6|7|7\.5)\b/i, cves: ["EOL"], severity: "high", description: "End-of-life IIS — patches no longer issued" },
-  { match: /vsftpd 2\.3\.4/i, cves: ["CVE-2011-2523"], severity: "critical", description: "vsftpd 2.3.4 backdoor" },
-  { match: /\bJetty\b.*\b8\./i, cves: ["EOL"], severity: "medium", description: "Older Jetty 8.x is end-of-life; review upgrade path" },
-  { match: /\bProFTPD\b.*\b1\.3\.5\b/i, cves: ["CVE-2015-3306"], severity: "high", description: "ProFTPD 1.3.5 has known mod_copy file copy issues (context-dependent)" }
-];
+let heuristicsCache: { heuristics: CompiledHeuristic[]; source: string; path: string; error?: string } | null = null;
+async function getHeuristics(): Promise<typeof heuristicsCache> {
+  if (heuristicsCache) return heuristicsCache;
+  const p = process.env.CVE_HEURISTICS_PATH;
+  const r = await loadCveHeuristics({ path: p || undefined });
+  heuristicsCache =
+    r.source === "file"
+      ? { heuristics: r.heuristics, source: "file", path: r.path }
+      : { heuristics: r.heuristics, source: "default", path: r.path, error: r.error };
+  return heuristicsCache;
+}
 
 export const cveEnricherTool: ToolDefinition = {
   name: "recon.cve_enricher",
-  description: "Enrich detected services with known-vulnerable software heuristics (no remote scanning).",
+  description: "Enrich detected services with a local CVE heuristics feed (offline at runtime; no remote scanning).",
   tags: ["recon", "enrichment"],
   requires: ["services"],
   defaultTimeoutMs: 30_000,
   handler: async (input): Promise<ToolEnvelope> => {
     const services = input.context?.knownServices ?? [];
+    const cfg = await getHeuristics();
     const findings: ToolEnvelope["findings"] = [];
     const facts: ToolEnvelope["facts"] = [];
 
@@ -42,7 +43,7 @@ export const cveEnricherTool: ToolDefinition = {
         source: "enricher"
       });
       if (!banner) continue;
-      for (const h of HEURISTICS) {
+      for (const h of cfg?.heuristics ?? []) {
         if (h.match.test(banner)) {
           facts.push({ type: "cve_match", value: { port: svc.port, banner, cves: h.cves }, source: "heuristic" });
           findings.push({
@@ -69,9 +70,10 @@ export const cveEnricherTool: ToolDefinition = {
       recommendations: [],
       artifacts: { commands: [] },
       meta: {
+        cveFeed: { source: cfg?.source ?? "unknown", path: cfg?.path ?? null, error: cfg?.error ?? null },
         servicesScanned: services.length,
         matches: findings.length,
-        commandSummary: `Enrich discovered services with local CVE/version heuristics (no remote scanning).`
+        commandSummary: `Enrich discovered services with a local CVE heuristics feed (offline at runtime; no remote scanning).`
       }
     };
   }

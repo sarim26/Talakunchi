@@ -157,7 +157,8 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
     "Args discipline:",
     "- recon.http_probe: prefer `services` (from nmap) and/or explicit `urls`; optional `ports` when using context fallback.",
     "- recon.spider: pass `http_targets` (array of seed URLs on the target host) and/or `url`.",
-    "- recon.gobuster / recon.ffuf: pass `url` or `targetUrl` (with FUZZ) on the target host — do not rely on silent inference.",
+    "- recon.gobuster: pass `url` and/or `http_targets` (base URLs on the target host, e.g. http://TARGET:80/). Optional `targetUrl` without FUZZ is treated like `url`; do not use placeholder/example IPs.",
+    "- recon.ffuf: pass `targetUrl` with a FUZZ marker on the target host (e.g. http://TARGET:80/FUZZ).",
     "",
     "Rules:",
     "- Choose exactly one tool per step (no batching).",
@@ -268,7 +269,13 @@ function fallbackFromRecommendations(server: MCPServer, ctx: ManagerContext): Ma
 
 function recommendationHasRunnableArgs(p: { agent: string; args?: Record<string, unknown> }): boolean {
   const a = p.args ?? {};
-  if (p.agent === "recon.gobuster") return typeof a.url === "string" && a.url.length > 0;
+  if (p.agent === "recon.gobuster") {
+    if (typeof a.url === "string" && a.url.trim().length > 0) return true;
+    if (Array.isArray(a.http_targets) && a.http_targets.some((x) => typeof x === "string" && /^https?:\/\//i.test(x.trim())))
+      return true;
+    if (typeof a.targetUrl === "string" && /^https?:\/\//i.test(a.targetUrl.trim())) return true;
+    return false;
+  }
   if (p.agent === "recon.ffuf") return typeof a.targetUrl === "string" && /FUZZ/.test(a.targetUrl);
   return true;
 }
