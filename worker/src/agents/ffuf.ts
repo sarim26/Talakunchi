@@ -158,7 +158,7 @@ export const ffufTool: ToolDefinition = {
           if (
             status !== null &&
             [200, 301, 302, 401, 403].includes(status) &&
-            /(admin|login|api|graphql|swagger|openapi|actuator|wp-admin|wp-login|phpmyadmin|backup|config|setup|debug|jenkins|kibana|grafana)/i.test(path)
+            /(admin|login|api|graphql|swagger|openapi|actuator|wp-admin|wp-login|phpmyadmin|backup|config|setup|debug|jenkins|kibana|grafana|drupal|uploads)|(?:^|\/)chats?(?:\/|$)/i.test(path)
           ) {
             findings.push({
               title: `Interesting web path discovered: ${path}`,

@@ -174,9 +174,10 @@ export const gobusterTool: ToolDefinition = {
       facts.push({ type: "web_path", value: { url: fullUrl, status: code }, source: "gobuster" });
 
       // Promote high-signal paths into Findings so they show in the Findings tab.
-      const interesting = /(phpmyadmin|drupal|wp-admin|wp-login|admin|login|uploads|backup|config|setup|test|debug|api|graphql)/i.test(
-        path ?? fullUrl
-      );
+      const interesting =
+        /(phpmyadmin|drupal|wp-admin|wp-login|admin|login|uploads|backup|config|setup|test|debug|api|graphql)|(?:^|\/)chats?(?:\/|$)/i.test(
+          path ?? fullUrl
+        );
       if (interesting && [200, 301, 302, 401, 403].includes(code)) {
         findings.push({
           title: `Interesting web path discovered: ${path ?? fullUrl}`,

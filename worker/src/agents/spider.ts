@@ -10,7 +10,8 @@ const KATANA_INSTALL_COMMAND = [
   "go install github.com/projectdiscovery/katana/cmd/katana@latest"
 ].join(" && ");
 
-const INTERESTING_PATH = /(phpmyadmin|drupal|wp-admin|wp-login|admin|login|signin|signup|register|uploads?|backup|config|setup|test|debug|api|graphql|swagger|openapi|actuator|jenkins|kibana|grafana|metrics|console|jmx-console|server-status)/i;
+const INTERESTING_PATH =
+  /(phpmyadmin|drupal|wp-admin|wp-login|admin|login|signin|signup|register|uploads?|backup|config|setup|test|debug|api|graphql|swagger|openapi|actuator|jenkins|kibana|grafana|metrics|console|jmx-console|server-status)|(?:^|\/)chats?(?:\/|$)/i;
 
 type SpiderArgs = {
   url?: string;
