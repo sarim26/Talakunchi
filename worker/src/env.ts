@@ -19,6 +19,14 @@ const EnvSchema = z.object({
   OLLAMA_SPECIALIST_MODEL: z.string().min(1).default("qwen3:8b"),
   OLLAMA_PROMPTER_MODEL: z.string().min(1).default("qwen3:8b"),
   /**
+   * Optional model for turning `web_path` / `web_url` facts into security findings
+   * (replaces static keyword lists). Defaults to `OLLAMA_SPECIALIST_MODEL`.
+   */
+  OLLAMA_WEB_FINDINGS_MODEL: z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.string().min(1).optional()
+  ),
+  /**
    * Optional override for the execution-command-writer LLM. If unset or empty,
    * `OLLAMA_SPECIALIST_MODEL` is used (see `env.executionWriterModel`).
    */
@@ -79,5 +87,8 @@ export const env = {
   ..._parsed,
   get executionWriterModel(): string {
     return _parsed.OLLAMA_COMMAND_WRITER_MODEL ?? _parsed.OLLAMA_SPECIALIST_MODEL;
+  },
+  get webFindingsModel(): string {
+    return _parsed.OLLAMA_WEB_FINDINGS_MODEL ?? _parsed.OLLAMA_SPECIALIST_MODEL;
   }
 };
