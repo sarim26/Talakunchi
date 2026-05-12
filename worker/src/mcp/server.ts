@@ -38,6 +38,16 @@ export class MCPServer {
     }));
   }
 
+  /** Compact tool list for planner LLMs (avoids huge prompts from long descriptions). */
+  manifestCompact(): Array<{ name: string; requires?: string[]; tags?: string[]; summary: string }> {
+    return this.list().map((t) => ({
+      name: t.name,
+      requires: t.requires,
+      tags: t.tags,
+      summary: t.description.length > 110 ? `${t.description.slice(0, 107)}…` : t.description
+    }));
+  }
+
   has(name: string) {
     return this.tools.has(name);
   }

@@ -1,24 +1,31 @@
 import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
 import { remoteScript, requireRemoteTool, snippet } from "./shared.js";
 
-const TESTSSL_BIN = "testssl.sh";
+const TESTSSL_BIN = "testssl";
 
 type TestsslSeverity = "OK" | "INFO" | "DEBUG" | "WARN" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
 
 /**
- * recon.tls_check — JSON-native TLS posture check using testssl.sh.
+ * recon.tls_check — JSON-native TLS posture check using testssl.
  *
- * For each TLS port we run testssl.sh with --jsonfile-pretty, then read the
+ * For each TLS port we run testssl with --jsonfile-pretty, then read the
  * JSON result file. testssl emits an array of finding objects with a
  * standardized severity scale; we map LOW+ to our severities and emit the
  * cert details (subject/issuer/dates) as facts.
  */
 export const tlsCheckTool: ToolDefinition = {
   name: "recon.tls_check",
-  description: "Inspect TLS certificate, protocols and known vulnerabilities on TLS-enabled ports for the target host using testssl.sh.",
+  description: "Inspect TLS certificate, protocols and known vulnerabilities on TLS-enabled ports for the target host using testssl.",
   tags: ["recon", "tls"],
   requires: ["tls_targets"],
   defaultTimeoutMs: 10 * 60 * 1000,
+  argSchema: {
+    ports: {
+      type: "array",
+      items: { type: "number" },
+      description: "Optional TLS ports to scan; defaults to inferred TLS ports from services plus 443."
+    }
+  },
   handler: async (input, emit): Promise<ToolEnvelope> => {
     const tlsPorts = new Set<number>();
     for (const s of input.context?.knownServices ?? []) {
@@ -53,7 +60,7 @@ export const tlsCheckTool: ToolDefinition = {
       `done`
     ].join("\n");
 
-    emit.log(`testssl.sh on ${host} ports: ${portList.join(",")}`);
+    emit.log(`testssl on ${host} ports: ${portList.join(",")}`);
     const r = await remoteScript(script, input.signal, (s) => emit.log(s));
 
     const facts: ToolEnvelope["facts"] = [];
@@ -90,7 +97,7 @@ export const tlsCheckTool: ToolDefinition = {
           notBefore,
           notAfter
         },
-        source: "testssl.sh"
+        source: "testssl"
       });
 
       // Emit a "TLS reachable" finding that also verifies nmap's open-port
@@ -124,7 +131,7 @@ export const tlsCheckTool: ToolDefinition = {
           protocol: "tcp",
           evidence: `${finding}${cve ? ` (CVE: ${cve})` : ""}`,
           fingerprint: `testssl|${host}|${port}|${id}`,
-          // testssl.sh either negotiates a TLS session and reads the
+          // testssl either negotiates a TLS session and reads the
           // certificate / cipher list or it doesn't — no ambiguity.
           confidence: "high",
           requiresVerification: false,
@@ -143,7 +150,7 @@ export const tlsCheckTool: ToolDefinition = {
       meta: {
         exitCode: r.exitCode,
         ports: portList,
-        commandSummary: `Run testssl.sh JSON output against ${host} (ports: ${portList.join(",")}) and lift LOW+ findings into our severity scale.`
+        commandSummary: `Run testssl JSON output against ${host} (ports: ${portList.join(",")}) and lift LOW+ findings into our severity scale.`
       }
     };
   }

@@ -18,6 +18,7 @@ export type AgentRunSpec = {
   targetHost: string;
   status: "queued" | "running" | "succeeded" | "failed";
   managerModel: string;
+  /** Persisted as `specialist_model`: effective Ollama model for the execution-command-writer (arg filling). */
   specialistModel: string;
   prompterModel: string;
   maxSteps: number;

@@ -1,52 +1,19 @@
 /**
  * Manager agent.
  *
- * Receives:
- *   - the MCP server manifest (available tools)
- *   - facts gathered so far (services, findings, history of invocations)
- *   - budget (max steps remaining)
+ * Receives the MCP manifest, accumulated facts, and step budget. Returns either
+ * `invoke` (one tool + intent + optional args) or `stop`.
  *
- * Returns a structured decision:
- *   { action: "invoke", tool: string, intentGoal: string, args?: Record<string, unknown> }
- *   { action: "stop", reason: string }
- *
- * Uses an Ollama LLM (qwen3:8b by default) but always falls back to a
- * deterministic policy so a missing/down LLM never breaks the pipeline.
+ * Tool choice is **only** from the manager LLM, except for hard safety overrides:
+ * retry after dependency install, and forced `system.tool_installer` when a tool
+ * failed with `missingTool` and we have not attempted that install yet.
  */
 import { z } from "zod";
 import { env } from "../env.js";
-import { chatJSON } from "../llm/ollama.js";
+import { chatJSON, safeParseJson } from "../llm/ollama.js";
 import type { MCPServer } from "../mcp/server.js";
 import type { ToolFinding } from "../mcp/types.js";
 import type { WordlistCatalog } from "./wordlists.js";
-
-export const PHASES = [
-  "network_discovery",
-  "service_fingerprint",
-  "web_surface",
-  "vulnerability_triage"
-] as const;
-export type Phase = (typeof PHASES)[number];
-
-/**
- * Which tools naturally belong to which phase. Used by the phase-based
- * parallel orchestration: when the manager picks `invoke_parallel`, every
- * sub-tool should share a phase. The mapping is intentionally permissive — a
- * tool can appear in more than one phase (e.g. spider in web_surface).
- */
-export const PHASE_TOOLS: Record<Phase, string[]> = {
-  network_discovery: ["recon.nmap", "recon.dns_enum"],
-  service_fingerprint: ["recon.http_probe", "recon.tls_check", "recon.ssh_enum", "recon.smb_enum"],
-  web_surface: ["recon.spider", "recon.gobuster", "recon.ffuf", "recon.waybackurls"],
-  vulnerability_triage: ["recon.cve_enricher"]
-};
-
-export function phaseForTool(name: string): Phase | undefined {
-  for (const phase of PHASES) {
-    if (PHASE_TOOLS[phase].includes(name)) return phase;
-  }
-  return undefined;
-}
 
 export const ManagerDecisionSchema = z.union([
   z.object({
@@ -57,68 +24,26 @@ export const ManagerDecisionSchema = z.union([
     reasoning: z.string().optional()
   }),
   z.object({
-    action: z.literal("invoke_parallel"),
-    phase: z.enum(PHASES),
-    invocations: z
-      .array(
-        z.object({
-          tool: z.string().min(1),
-          intentGoal: z.string().min(1),
-          args: z.record(z.string(), z.any()).optional()
-        })
-      )
-      .min(1)
-      .max(4),
-    reasoning: z.string().optional()
-  }),
-  z.object({
     action: z.literal("stop"),
     reason: z.string().min(1)
   })
 ]);
 export type ManagerDecision = z.infer<typeof ManagerDecisionSchema>;
 
-function shouldSkipHttpProbe(ctx: ManagerContext): boolean {
-  // Allow http_probe when it has never succeeded yet, when it failed last time
-  // (recovery), or when it has outstanding verifier work to do.
-  const needsVerification = (ctx.pendingVerifications ?? []).some((v) => v.verifierTool === "recon.http_probe");
-  if (needsVerification) return false;
-
-  const history = ctx.invocationHistory ?? [];
-  const anySucceeded = history.some((h) => h.tool === "recon.http_probe" && h.status === "succeeded");
-  if (!anySucceeded) return false;
-
-  const last = [...history].reverse().find((h) => h.tool === "recon.http_probe");
-  if (last && last.status === "failed") return false;
-
-  // Otherwise: same probe again is pure waste; block it.
-  return true;
-}
+/** Optional hints from the agent run row (e.g. nmap profile) for the LLM to use if it picks `recon.nmap`. */
+export type ManagerRunHints = {
+  initialNmapProfile: string | null;
+  initialNmapPorts: number[] | null;
+  initialNmapExtraArgs: string | null;
+};
 
 export type ManagerContext = {
   targetHost: string;
   stepsRemaining: number;
-  /**
-   * The phase the manager believes the run is currently in. Updated by the
-   * orchestrator after each step based on the latest decision; this is a
-   * hint, not a hard gate, but it lets us emit phase-scoped events for the UI
-   * and steer the deterministic fallback.
-   */
-  phase?: Phase;
   knownPorts: number[];
   knownServices: Array<{ port: number; protocol: string; name?: string; product?: string; version?: string }>;
   knownFindings: ToolFinding[];
-  /**
-   * URLs discovered by recon.spider (or its backup recon.waybackurls).
-   * Used by Layer 3 (endpoint amplification): the manager sees these
-   * directly and can target tools like recon.ffuf at concrete paths.
-   */
   discoveredEndpoints: Array<{ url: string; method?: string; status?: number | null; sourceTool: string }>;
-  /**
-   * Outstanding fingerprints that still need corroboration. When the budget
-   * gets tight we prioritise running their verifier instead of starting new
-   * discovery (Situation 3 / end-of-run quality rule).
-   */
   pendingVerifications: Array<{
     fingerprint: string;
     verifierTool: string;
@@ -135,12 +60,7 @@ export type ManagerContext = {
     priority: number;
     args?: Record<string, unknown>;
   }>;
-  /** Optional wordlist catalog so the manager can include `args.wordlist` when invoking tools that accept one. */
   wordlistCatalog?: WordlistCatalog;
-  /**
-   * Bounded failure history so the manager can attempt safe recovery actions.
-   * This is intentionally compact (snippets only) to preserve context window.
-   */
   recentFailures?: Array<{
     tool: string;
     attempt: number;
@@ -148,42 +68,21 @@ export type ManagerContext = {
     error?: string;
     stdoutSnippet?: string;
     stderrSnippet?: string;
-    /**
-     * If set, the failure was caused by a missing CLI tool on the remote host.
-     * The orchestrator and manager use this to auto-invoke `system.tool_installer`.
-     */
     missingTool?: string;
-    /** When the specialist suggested a non-apt install (e.g. go install). */
     missingToolInstallCommand?: string;
   }>;
-  /**
-   * Tool names we have already attempted to install during this run via
-   * `system.tool_installer` (regardless of success). Prevents install-loops if
-   * apt cannot find the package.
-   */
   installedToolsAttempted?: string[];
-  /**
-   * Tools confirmed installed during this run (installer succeeded).
-   * This is used to decide when a blocked specialist can be retried.
-   */
   installedToolsInstalled?: string[];
-  /**
-   * When a specialist fails due to a missing CLI tool, the orchestrator sets
-   * this field so the manager can:
-   *   1) install the missing dependency once
-   *   2) then re-invoke the blocked specialist with the original args
-   */
   blockedOnMissingTool?: {
     tool: string;
     args: Record<string, unknown>;
     missingTool: string;
   } | null;
+  /** From `agent_runs` — not a policy; the LLM may ignore or apply when choosing `recon.nmap`. */
+  runHints?: ManagerRunHints;
 };
 
 export async function decideNextAction(server: MCPServer, ctx: ManagerContext, signal?: AbortSignal): Promise<ManagerDecision> {
-  // If a tool was blocked by a missing dependency and we have since confirmed
-  // the dependency is installed, immediately re-run the blocked tool with its
-  // original args. The orchestrator clears `blockedOnMissingTool` once invoked.
   const blocked = ctx.blockedOnMissingTool ?? null;
   if (
     blocked &&
@@ -199,10 +98,6 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
     };
   }
 
-  // Hard override: when the most recent failure carried a `missingTool` signal
-  // and we have not yet tried to install that tool in this run, ALWAYS invoke
-  // the installer next. This bypasses the LLM so we can never loop forever
-  // on a missing dependency.
   const lastFail = (ctx.recentFailures ?? []).slice(-1)[0];
   const missingTool = lastFail?.missingTool;
   if (
@@ -223,272 +118,210 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
 
   const llmDecision = await tryLlmDecision(server, ctx, signal);
   if (llmDecision) {
-    if (llmDecision.action === "invoke" && server.has(llmDecision.tool)) {
-      if (llmDecision.tool === "recon.http_probe" && shouldSkipHttpProbe(ctx)) {
-        // Prevent pointless repeats (same command thrice) when there's no new
-        // verifier work left for http_probe.
-        // Fall through to deterministic policy instead.
-      } else {
-        return llmDecision;
-      }
-    }
     if (llmDecision.action === "stop") return llmDecision;
-    if (llmDecision.action === "invoke_parallel") {
-      // Filter out unknown tools but keep the rest as a parallel call.
-      const filtered = llmDecision.invocations.filter((i) => {
-        if (!server.has(i.tool)) return false;
-        if (i.tool === "recon.http_probe" && shouldSkipHttpProbe(ctx)) return false;
-        return true;
-      });
-      if (filtered.length >= 1) return { ...llmDecision, invocations: filtered };
-    }
+    if (llmDecision.action === "invoke" && server.has(llmDecision.tool)) return llmDecision;
   }
-  return deterministicDecision(server, ctx);
+
+  const fromRec = fallbackFromRecommendations(server, ctx);
+  if (fromRec) return fromRec;
+
+  if (ctx.stepsRemaining <= 0) {
+    return { action: "stop", reason: "Step budget exhausted" };
+  }
+  return {
+    action: "stop",
+    reason:
+      "Manager LLM did not return usable JSON after retries, no runnable queued recommendation matched, and steps remain. Check Ollama; try a stronger JSON-capable model or OLLAMA_MANAGER_MODEL with more context."
+  };
 }
 
 async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: AbortSignal): Promise<ManagerDecision | null> {
   const systemMsg = [
     "You are the MANAGER agent of a multi-agent penetration testing system.",
-    "You decide which specialist tool to invoke next, or stop the run.",
+    "You alone decide which ONE specialist tool to invoke next, or whether to stop the run.",
     "Operate in read-only reconnaissance mode (no exploitation, no destructive operations).",
     "",
     'Return ONLY a JSON object matching ONE of:',
-    '  { "action": "invoke", "tool": "<tool-name>", "intentGoal": "<short english goal>", "args": { ... }, "reasoning": "<why>" }',
-    '  { "action": "invoke_parallel", "phase": "<phase>", "invocations": [{"tool":"...","intentGoal":"...","args":{...}}, ...], "reasoning":"<why>" }',
+    '  { "action": "invoke", "tool": "<exact tool name from tools[].name>", "intentGoal": "<short english goal>", "args": { ... }, "reasoning": "<why>" }',
     '  { "action": "stop", "reason": "<short why we are stopping>" }',
     "",
-    "Phases & their parallelisable tools (use invoke_parallel for these):",
-    "  - network_discovery     : recon.nmap, recon.dns_enum",
-    "  - service_fingerprint   : recon.http_probe + recon.tls_check (run together once nmap shows web/TLS ports)",
-    "  - web_surface           : recon.spider + recon.ffuf + recon.gobuster (run together once an HTTP endpoint is reachable)",
-    "  - vulnerability_triage  : recon.cve_enricher",
+    "Use the tools list as the authoritative registry. Pick the single best next step from context:",
+    "  - No open ports yet → usually start with recon.nmap (or recon.dns_enum if you already have enough host intel).",
+    "  - After services exist → choose the most informative specialist (http_probe, ssh_enum, smb_enum, tls_check, cve_enricher, spider, waybackurls, gobuster, ffuf, etc.).",
+    "  - Follow tool `requires` hints; do not invoke a tool whose preconditions are clearly unmet.",
+    "  - Prefer system.tool_installer only when a prior failure indicated a missing remote CLI (recentFailures.missingTool) — the orchestrator may force-install before you run again.",
+    "",
+    "Downstream: a prompter turns your intentGoal into prose; an execution-writer LLM fills JSON `args` per the tool's argSchema (not raw shell — the worker maps args → CLI safely).",
+    "You never see raw tool stdout. Use `knownFindings`, `discoveredEndpoints` (truncated sample), `discoveredEndpointCount`, and `history` as summaries.",
+    "",
+    "Args discipline:",
+    "- recon.http_probe: prefer `services` (from nmap) and/or explicit `urls`; optional `ports` when using context fallback.",
+    "- recon.spider: pass `http_targets` (array of seed URLs on the target host) and/or `url`.",
+    "- recon.gobuster / recon.ffuf: pass `url` or `targetUrl` (with FUZZ) on the target host — do not rely on silent inference.",
     "",
     "Rules:",
-    "- Choose tool(s) from the manifest below.",
-    "- Do not pick a tool whose preconditions are not yet satisfied (e.g. recon.gobuster needs an HTTP endpoint).",
-    "- Prefer `invoke_parallel` ONLY for tools that share a phase and have no dependency on each other's output.",
-    "- Do NOT invoke recon.http_probe repeatedly with identical scope. Only re-run recon.http_probe when it is verifying new open-port claims (pendingVerifications contains verifierTool=recon.http_probe) or the last probe failed.",
-    "- If a previous failure has meta.missingTool=<name>, choose `system.tool_installer` with args.tool=<name> next. If recentFailures[].missingToolInstallCommand is set, include args.installCommand with that exact string (non-apt installs). Otherwise omit installCommand to use apt. Then re-invoke the failed specialist on the following step.",
-    "- After recon.http_probe succeeds and a reachable endpoint exists, run the web_surface phase as `invoke_parallel`.",
-    "- For discoveredEndpoints with API-ish paths (/api/, /graphql, /v1/, /v2/), prefer recon.ffuf with args.targetUrl ending in /FUZZ.",
-    "- pendingVerifications lists open-port claims still awaiting corroboration. If stepsRemaining <= 3, prioritise running their verifierTool before any new discovery.",
-    "- If there are recentFailures, prefer safe recovery actions: retry with reduced scope, adjust timeouts, pick a different valid wordlist, or choose an alternative recon tool.",
-    "- Stop early if no productive next step is available."
+    "- Choose exactly one tool per step (no batching).",
+    "- Stop when diminishing returns, budget is low, or nothing safe remains.",
+    "- Use history to avoid useless repeats unless a retry is justified (e.g. after install or new evidence)."
   ].join("\n");
 
-  const userMsg = JSON.stringify(
-    {
-      manifest: server.manifest(),
-      target: ctx.targetHost,
-      phase: ctx.phase ?? null,
-      stepsRemaining: ctx.stepsRemaining,
-      knownPorts: ctx.knownPorts,
-      knownServices: ctx.knownServices.slice(0, 30),
-      discoveredEndpoints: (ctx.discoveredEndpoints ?? []).slice(-30),
-      pendingVerifications: (ctx.pendingVerifications ?? []).slice(-10),
-      pendingRecommendations: ctx.pendingRecommendations.slice(0, 10),
-      knownFindings: ctx.knownFindings.slice(-15).map((f) => ({ title: f.title, severity: f.severity })),
-      history: ctx.invocationHistory.slice(-15),
-      recentFailures: (ctx.recentFailures ?? []).slice(-5)
-    },
-    null,
-    2
-  );
+  const attempts: Array<{ mode: ManagerPayloadMode; temp: number; maxTokens: number }> = [
+    { mode: "full", temp: 0.15, maxTokens: 1600 },
+    { mode: "full", temp: 0.1, maxTokens: 1600 },
+    { mode: "minimal", temp: 0.05, maxTokens: 1200 }
+  ];
 
-  try {
-    const r = await chatJSON({
-      model: env.OLLAMA_MANAGER_MODEL,
-      messages: [
-        { role: "system", content: systemMsg },
-        { role: "user", content: userMsg }
-      ],
-      temperature: 0.2,
-      maxTokens: 600,
-      signal
-    });
-    const parsed = ManagerDecisionSchema.safeParse(r.value);
-    if (parsed.success) return parsed.data;
-  } catch {
-    // fallthrough
+  for (let i = 0; i < attempts.length; i += 1) {
+    const { mode, temp, maxTokens } = attempts[i]!;
+    const userMsg = JSON.stringify(buildManagerUserPayload(server, ctx, mode), null, 2);
+    try {
+      const r = await chatJSON({
+        model: env.OLLAMA_MANAGER_MODEL,
+        messages: [
+          { role: "system", content: systemMsg },
+          { role: "user", content: userMsg }
+        ],
+        temperature: temp,
+        maxTokens,
+        signal
+      });
+      const normalized = normalizeManagerDecisionRaw(r.value ?? safeParseJson<unknown>(r.raw));
+      const parsed = ManagerDecisionSchema.safeParse(normalized);
+      if (!parsed.success) {
+        if (i === attempts.length - 1) {
+          console.warn(`[manager] zod after ${attempts.length} tries: ${parsed.error.errors.slice(0, 4).map((e) => e.message).join("; ")}`);
+        }
+        continue;
+      }
+      const d = parsed.data;
+      if (d.action === "stop") return d;
+      const tool = resolveRegisteredTool(server, d.tool);
+      if (!tool) {
+        console.warn(`[manager] unknown tool "${d.tool}" (payload mode=${mode})`);
+        continue;
+      }
+      if (tool !== d.tool) {
+        return {
+          ...d,
+          tool,
+          reasoning: [d.reasoning, `(normalized tool id from "${d.tool}")`].filter(Boolean).join(" ")
+        };
+      }
+      return d;
+    } catch (e) {
+      console.warn(`[manager] Ollama attempt ${i + 1} (${mode}): ${(e as Error).message}`);
+    }
   }
   return null;
 }
 
-/**
- * Deterministic policy: chosen if LLM is unavailable / produces invalid output.
- * Mirrors the tag-based recommendation engine encoded in each specialist tool.
- */
-function deterministicDecision(server: MCPServer, ctx: ManagerContext): ManagerDecision {
-  const have = (name: string) => server.has(name);
-  const hasInvoked = (name: string) => ctx.invocationHistory.some((h) => h.tool === name);
-  const hasOpenPort = (...ports: number[]) => ctx.knownServices.some((s) => ports.includes(s.port));
+type ManagerPayloadMode = "full" | "minimal";
 
-  if (ctx.stepsRemaining <= 0) return { action: "stop", reason: "Step budget exhausted" };
-
-  // End-of-run quality rule (plan): with <=3 steps left, prefer running any
-  // outstanding verifiers over starting new discovery, so unverified findings
-  // get a fair shot at promotion.
-  if (ctx.stepsRemaining <= 3) {
-    const pv = (ctx.pendingVerifications ?? []).find((v) => have(v.verifierTool));
-    if (pv) {
-      return {
-        action: "invoke",
-        tool: pv.verifierTool,
-        intentGoal: `Verify pending claim ${pv.fingerprint} before run ends`,
-        args: pv.args,
-        reasoning: "Budget low — prioritising pending verification over new discovery"
-      };
-    }
+/** Unwrap { decision: {...} }, lowercase action, etc. */
+function normalizeManagerDecisionRaw(value: unknown): unknown {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object" || Array.isArray(value)) return value;
+  let o = value as Record<string, unknown>;
+  if (o.decision && typeof o.decision === "object" && !Array.isArray(o.decision)) {
+    o = o.decision as Record<string, unknown>;
   }
-
-  // Never retry the installer itself. If it failed, stop to avoid an install loop
-  // (the operator can fix sudo/apt and resume a new run).
-  const lastFail = (ctx.recentFailures ?? []).slice(-1)[0];
-  if (lastFail?.tool === "system.tool_installer") {
-    const missing = ctx.blockedOnMissingTool?.missingTool;
-    return {
-      action: "stop",
-      reason: `Tool installation failed${missing ? ` (missing: ${missing})` : ""}. Fix sudo/network/install recipe on the tools host and retry.`
-    };
+  if (o.result && typeof o.result === "object" && !Array.isArray(o.result)) {
+    o = o.result as Record<string, unknown>;
   }
+  const action = o.action;
+  if (typeof action === "string") o.action = action.toLowerCase().trim();
+  return o;
+}
 
-  if (lastFail && have(lastFail.tool) && lastFail.attempt < 1) {
-    // Safe deterministic recovery: retry once with reduced knobs for common tools.
-    const nextArgs: Record<string, unknown> = { ...(lastFail.args ?? {}) };
-    if (lastFail.tool === "recon.gobuster") {
-      const t = Number(nextArgs.threads ?? 20);
-      nextArgs.threads = Math.max(5, Math.min(20, Math.floor(t / 2) || 10));
-      // If the manager previously chose a bad wordlist, drop it to allow defaults.
-      delete nextArgs.wordlist;
-    }
+function resolveRegisteredTool(server: MCPServer, tool: string): string | null {
+  const t = tool.trim();
+  if (!t) return null;
+  if (server.has(t)) return t;
+  const names = server.list().map((x) => x.name);
+  const lower = t.toLowerCase();
+  const ci = names.find((n) => n.toLowerCase() === lower);
+  if (ci) return ci;
+  if (!t.includes(".")) {
+    if (server.has(`recon.${t}`)) return `recon.${t}`;
+    if (server.has(`system.${t}`)) return `system.${t}`;
+  }
+  return null;
+}
+
+/** When the manager model fails, continue with the best tool the last specialist already suggested. */
+function fallbackFromRecommendations(server: MCPServer, ctx: ManagerContext): ManagerDecision | null {
+  const list = [...(ctx.pendingRecommendations ?? [])].sort((a, b) => b.priority - a.priority);
+  for (const p of list) {
+    if (!server.has(p.agent)) continue;
+    if (!recommendationHasRunnableArgs(p)) continue;
     return {
       action: "invoke",
-      tool: lastFail.tool,
-      intentGoal: `Recover from previous failure of ${lastFail.tool} (attempt ${lastFail.attempt + 1})`,
-      args: nextArgs,
-      reasoning: "Deterministic recovery retry with reduced scope"
+      tool: p.agent,
+      intentGoal: p.reason.slice(0, 400),
+      args: p.args ?? {},
+      reasoning:
+        "Automatic fallback: manager model produced no usable JSON after retries; running highest-priority recommendation queued by a prior tool."
+    };
+  }
+  return null;
+}
+
+function recommendationHasRunnableArgs(p: { agent: string; args?: Record<string, unknown> }): boolean {
+  const a = p.args ?? {};
+  if (p.agent === "recon.gobuster") return typeof a.url === "string" && a.url.length > 0;
+  if (p.agent === "recon.ffuf") return typeof a.targetUrl === "string" && /FUZZ/.test(a.targetUrl);
+  return true;
+}
+
+/** Keep manager prompts small: long URL lists after spider blow up JSON size and break small models. */
+function truncateUrlForPlanner(url: string, max = 140): string {
+  if (url.length <= max) return url;
+  return `${url.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function buildManagerUserPayload(server: MCPServer, ctx: ManagerContext, mode: ManagerPayloadMode): Record<string, unknown> {
+  const epAll = ctx.discoveredEndpoints ?? [];
+  if (mode === "minimal") {
+    return {
+      tools: server.list().map((t) => ({ name: t.name, requires: t.requires })),
+      target: ctx.targetHost,
+      stepsRemaining: ctx.stepsRemaining,
+      knownPorts: ctx.knownPorts,
+      knownServices: ctx.knownServices.slice(0, 20),
+      discoveredEndpointCount: epAll.length,
+      pendingRecommendations: ctx.pendingRecommendations.slice(0, 10),
+      knownFindingsSample: ctx.knownFindings.slice(-6).map((f) => ({
+        title: f.title.length > 120 ? `${f.title.slice(0, 117)}…` : f.title,
+        severity: f.severity
+      })),
+      history: ctx.invocationHistory.slice(-10),
+      recentFailures: (ctx.recentFailures ?? []).slice(-3),
+      runHints: ctx.runHints ?? null
     };
   }
 
-  const top = [...ctx.pendingRecommendations]
-    .sort((a, b) => b.priority - a.priority)
-    .find((r) => {
-      if (!server.has(r.agent)) return false;
-      // Allow `system.tool_installer` to be picked multiple times (once per
-      // distinct missing tool). Other tools are gated by `hasInvoked`.
-      if (r.agent === "system.tool_installer") {
-        const t = (r.args as { tool?: string; installCommand?: string } | undefined)?.tool;
-        if (!t) return false;
-        return !(ctx.installedToolsAttempted ?? []).includes(t);
-      }
-      return !hasInvoked(r.agent);
-    });
-  if (top) {
-    return {
-      action: "invoke",
-      tool: top.agent,
-      intentGoal: top.reason,
-      args: top.args,
-      reasoning: `Following prior recommendation (priority ${top.priority})`
-    };
-  }
-
-  if (have("recon.nmap") && !hasInvoked("recon.nmap")) {
-    return {
-      action: "invoke",
-      tool: "recon.nmap",
-      intentGoal: "Discover open ports and detect basic service banners",
-      args: { profile: "fast" },
-      reasoning: "No port data yet; start with nmap fast profile"
-    };
-  }
-
-  if (have("recon.dns_enum") && !hasInvoked("recon.dns_enum")) {
-    return { action: "invoke", tool: "recon.dns_enum", intentGoal: "Enumerate DNS records and subdomains" };
-  }
-
-  // service_fingerprint phase: run http_probe + tls_check in parallel when
-  // we have both HTTP and TLS-capable ports open. Both consume the same
-  // service list and have no dependency on each other.
-  if (
-    hasOpenPort(80, 443, 8080, 8443) &&
-    hasOpenPort(443, 8443) &&
-    have("recon.http_probe") &&
-    have("recon.tls_check") &&
-    !hasInvoked("recon.http_probe") &&
-    !hasInvoked("recon.tls_check")
-  ) {
-    return {
-      action: "invoke_parallel",
-      phase: "service_fingerprint",
-      invocations: [
-        { tool: "recon.http_probe", intentGoal: "Probe HTTP/HTTPS endpoints" },
-        { tool: "recon.tls_check", intentGoal: "Inspect TLS certificate / supported protocols" }
-      ],
-      reasoning: "service_fingerprint phase: HTTP + TLS probing share the same target list"
-    };
-  }
-
-  if (hasOpenPort(80, 443, 8080, 8443) && have("recon.http_probe") && !hasInvoked("recon.http_probe")) {
-    return { action: "invoke", tool: "recon.http_probe", intentGoal: "Probe HTTP/HTTPS endpoints" };
-  }
-  if (hasOpenPort(443, 8443) && have("recon.tls_check") && !hasInvoked("recon.tls_check")) {
-    return { action: "invoke", tool: "recon.tls_check", intentGoal: "Inspect TLS certificate / supported protocols" };
-  }
-  // web_surface phase (parallel): once an HTTP endpoint is reachable, run
-  // spider + ffuf together. Spider crawls in-page links; ffuf probes common
-  // paths simultaneously. Gobuster comes later (it does similar work and
-  // produces noise when run alongside ffuf).
-  if (
-    hasInvoked("recon.http_probe") &&
-    ctx.knownFindings.some((f) => /Reachable web endpoint:/i.test(f.title)) &&
-    have("recon.spider") &&
-    have("recon.ffuf") &&
-    !hasInvoked("recon.spider") &&
-    !hasInvoked("recon.ffuf")
-  ) {
-    return {
-      action: "invoke_parallel",
-      phase: "web_surface",
-      invocations: [
-        { tool: "recon.spider", intentGoal: "Crawl reachable web endpoint to enumerate URLs and JS routes" },
-        { tool: "recon.ffuf", intentGoal: "Fuzz common web paths in parallel with the spider" }
-      ],
-      reasoning: "web_surface phase: spider + ffuf attack different surfaces concurrently"
-    };
-  }
-  // Spider AFTER http_probe (so we know which endpoints are reachable) and
-  // BEFORE gobuster (so brute-forcing has the spider's findings as context).
-  if (
-    hasInvoked("recon.http_probe") &&
-    have("recon.spider") &&
-    !hasInvoked("recon.spider") &&
-    ctx.knownFindings.some((f) => /Reachable web endpoint:/i.test(f.title))
-  ) {
-    return {
-      action: "invoke",
-      tool: "recon.spider",
-      intentGoal: "Crawl reachable web endpoint to enumerate URLs and JS routes"
-    };
-  }
-  if (hasOpenPort(445, 139) && have("recon.smb_enum") && !hasInvoked("recon.smb_enum")) {
-    return { action: "invoke", tool: "recon.smb_enum", intentGoal: "Enumerate SMB shares + signing posture" };
-  }
-  if (hasOpenPort(22) && have("recon.ssh_enum") && !hasInvoked("recon.ssh_enum")) {
-    return { action: "invoke", tool: "recon.ssh_enum", intentGoal: "Capture SSH banner + algorithms" };
-  }
-  if (ctx.knownServices.length > 0 && have("recon.cve_enricher") && !hasInvoked("recon.cve_enricher")) {
-    return { action: "invoke", tool: "recon.cve_enricher", intentGoal: "Match service banners to known-vulnerable software" };
-  }
-  if (ctx.knownServices.some((s) => /http/i.test(s.name ?? "")) && have("recon.gobuster") && !hasInvoked("recon.gobuster")) {
-    const wordlist = ctx.wordlistCatalog?.defaults.webContent ?? undefined;
-    return {
-      action: "invoke",
-      tool: "recon.gobuster",
-      intentGoal: "Discover common web content paths",
-      args: wordlist ? { wordlist } : undefined
-    };
-  }
-
-  return { action: "stop", reason: "No further productive recon steps in deterministic policy" };
+  const epTail = epAll.slice(-18);
+  return {
+    tools: server.manifestCompact(),
+    target: ctx.targetHost,
+    stepsRemaining: ctx.stepsRemaining,
+    knownPorts: ctx.knownPorts,
+    knownServices: ctx.knownServices.slice(0, 40),
+    discoveredEndpoints: epTail.map((e) => ({
+      url: truncateUrlForPlanner(e.url),
+      method: e.method ?? "GET",
+      status: e.status ?? null,
+      sourceTool: e.sourceTool
+    })),
+    discoveredEndpointCount: epAll.length,
+    pendingVerifications: (ctx.pendingVerifications ?? []).slice(-10),
+    pendingRecommendations: ctx.pendingRecommendations.slice(0, 12),
+    knownFindings: ctx.knownFindings.slice(-20).map((f) => ({
+      title: f.title.length > 180 ? `${f.title.slice(0, 177)}…` : f.title,
+      severity: f.severity
+    })),
+    history: ctx.invocationHistory.slice(-20),
+    recentFailures: (ctx.recentFailures ?? []).slice(-5),
+    runHints: ctx.runHints ?? null
+  };
 }

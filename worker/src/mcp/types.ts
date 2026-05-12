@@ -101,6 +101,15 @@ export type ToolInput = {
     knownServices?: Array<{ port: number; protocol: string; name?: string; product?: string; version?: string }>;
     knownDomains?: string[];
     priorFindings?: ToolFinding[];
+    /** URLs accumulated by the orchestrator for planners and web tools. */
+    discoveredEndpoints?: Array<{ url: string; method?: string; status?: number | null; sourceTool?: string }>;
+    /** Optional last remote shell outcome (reserved for future tools). */
+    lastKaliShell?: {
+      exitCode: number | null;
+      commandPreview?: string;
+      stdoutSnippet?: string;
+      stderrSnippet?: string;
+    };
     runId: string;
     invocationId: string;
   };

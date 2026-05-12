@@ -1,31 +1,34 @@
 import { createMCPServer, MCPServer } from "../mcp/server.js";
 import { nmapTool } from "./nmap.js";
-import { httpProbeTool } from "./httpProbe.js";
+import { toolInstallerTool } from "./toolInstaller.js";
 import { gobusterTool } from "./gobuster.js";
 import { ffufTool } from "./ffuf.js";
-import { dnsEnumTool } from "./dnsEnum.js";
-import { tlsCheckTool } from "./tlsCheck.js";
-import { smbEnumTool } from "./smbEnum.js";
-import { sshEnumTool } from "./sshEnum.js";
-import { cveEnricherTool } from "./cveEnricher.js";
+import { httpProbeTool } from "./httpProbe.js";
 import { spiderTool } from "./spider.js";
 import { waybackUrlsTool } from "./waybackurls.js";
-import { toolInstallerTool } from "./toolInstaller.js";
+import { dnsEnumTool } from "./dnsEnum.js";
+import { tlsCheckTool } from "./tlsCheck.js";
+import { sshEnumTool } from "./sshEnum.js";
+import { smbEnumTool } from "./smbEnum.js";
+import { cveEnricherTool } from "./cveEnricher.js";
 
-/** Builds the local MCP server with every recon specialist registered. */
+/**
+ * MCP recon tools. Flow: manager LLM → prompter → executionCommandWriter (when
+ * the tool has argSchema) → invoke.
+ */
 export function buildReconMCPServer(): MCPServer {
   const server = createMCPServer();
   server.register(nmapTool);
+  server.register(dnsEnumTool);
   server.register(httpProbeTool);
+  server.register(sshEnumTool);
+  server.register(smbEnumTool);
+  server.register(tlsCheckTool);
+  server.register(cveEnricherTool);
   server.register(spiderTool);
   server.register(waybackUrlsTool);
-  server.register(ffufTool);
   server.register(gobusterTool);
-  server.register(dnsEnumTool);
-  server.register(tlsCheckTool);
-  server.register(smbEnumTool);
-  server.register(sshEnumTool);
-  server.register(cveEnricherTool);
+  server.register(ffufTool);
   server.register(toolInstallerTool);
   return server;
 }

@@ -8,18 +8,27 @@ const EnvSchema = z.object({
 
   /**
    * MCP recon system: Ollama configuration.
-   * Models can be overridden via env; defaults match the design doc:
-   *   manager:    qwen3:8b
-   *   specialist: qwen3:8b
-   *   prompter:   qwen3:8b
+   * - manager: step planner
+   * - prompter: intent → specialist-facing prose
+   * - specialist: default model for the post-prompter **execution command writer**
+   *   (structured args) when `OLLAMA_COMMAND_WRITER_MODEL` is not set
+   * - command_writer: optional override for that same writer step only
    */
   OLLAMA_URL: z.string().min(1).default("http://localhost:11434"),
   OLLAMA_MANAGER_MODEL: z.string().min(1).default("qwen3:8b"),
   OLLAMA_SPECIALIST_MODEL: z.string().min(1).default("qwen3:8b"),
   OLLAMA_PROMPTER_MODEL: z.string().min(1).default("qwen3:8b"),
+  /**
+   * Optional override for the execution-command-writer LLM. If unset or empty,
+   * `OLLAMA_SPECIALIST_MODEL` is used (see `env.executionWriterModel`).
+   */
+  OLLAMA_COMMAND_WRITER_MODEL: z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.string().min(1).optional()
+  ),
   RECON_MAX_STEPS: z.coerce.number().int().positive().default(20),
 
-  /** Legacy classic-scan settings (still used by the deterministic nmap pipeline). */
+  /** Legacy classic-scan settings (non-MCP pipeline). */
   HYDRA_ENABLED: z.coerce.boolean().default(false),
   HYDRA_USERNAME: z.string().optional(),
   HYDRA_PASSWORD: z.string().optional(),
@@ -63,4 +72,12 @@ const EnvSchema = z.object({
   }
 });
 
-export const env = EnvSchema.parse(process.env);
+const _parsed = EnvSchema.parse(process.env);
+
+/** Effective model for `executionCommandWriter` (arg filling after prompter). */
+export const env = {
+  ..._parsed,
+  get executionWriterModel(): string {
+    return _parsed.OLLAMA_COMMAND_WRITER_MODEL ?? _parsed.OLLAMA_SPECIALIST_MODEL;
+  }
+};

@@ -65,6 +65,8 @@ services:
       OLLAMA_URL: "${OLLAMA_URL:-http://host.docker.internal:11434}"
       OLLAMA_MANAGER_MODEL: "${OLLAMA_MANAGER_MODEL:-qwen3:8b}"
       OLLAMA_SPECIALIST_MODEL: "${OLLAMA_SPECIALIST_MODEL:-qwen3:8b}"
+      # Optional: overrides specialist for the post-prompter execution-command-writer only.
+      OLLAMA_COMMAND_WRITER_MODEL: "${OLLAMA_COMMAND_WRITER_MODEL:-}"
       OLLAMA_PROMPTER_MODEL: "${OLLAMA_PROMPTER_MODEL:-qwen3:8b}"
       RECON_MAX_STEPS: "${RECON_MAX_STEPS:-20}"
       # Optional deterministic credential checks during scan stage (legacy hydra path)

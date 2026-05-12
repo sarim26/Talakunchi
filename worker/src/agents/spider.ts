@@ -12,24 +12,37 @@ const KATANA_INSTALL_COMMAND = [
 
 const INTERESTING_PATH = /(phpmyadmin|drupal|wp-admin|wp-login|admin|login|signin|signup|register|uploads?|backup|config|setup|test|debug|api|graphql|swagger|openapi|actuator|jenkins|kibana|grafana|metrics|console|jmx-console|server-status)/i;
 
+type SpiderArgs = {
+  url?: string;
+  http_targets?: unknown;
+  depth?: number;
+  jsCrawl?: boolean;
+  concurrency?: number;
+  timeoutSec?: number;
+  includeSubdomains?: boolean;
+};
+
 /**
- * recon.spider — Katana-based crawler. Starts from a reachable HTTP(S)
- * endpoint and walks the site (incl. JS endpoints + robots.txt + sitemap)
- * staying in scope of the target host by default.
- *
- * Parses Katana output into:
- *   - `web_url` facts (JSONL rows with status, or plain http(s) URL lines)
- *   - findings for high-signal paths (admin/login/api/swagger/etc.)
+ * recon.spider — Katana-based crawler. Seeds come **only** from structured
+ * `args` (`http_targets` and/or `url`); the manager + execution-command-writer
+ * are responsible for supplying them from context. Katana argv is built from
+ * those args (depth, concurrency, etc.), not from hidden defaults beyond
+ * schema defaults.
  */
 export const spiderTool: ToolDefinition = {
   name: "recon.spider",
   description:
-    "Crawl a discovered HTTP(S) endpoint with Katana to enumerate URLs, JS endpoints, robots.txt and sitemap entries.",
+    "Crawl discovered HTTP(S) seed URLs with Katana. Pass `http_targets` (array) and/or `url`; each seed must be on the run target host.",
   tags: ["recon", "web"],
   requires: ["http_targets"],
   defaultTimeoutMs: 8 * 60 * 1000,
   argSchema: {
-    url: { type: "string", description: "Seed URL (must match the run's target host)" },
+    http_targets: {
+      type: "array",
+      items: { type: "string" },
+      description: "Seed URLs to crawl (http/https, hostname must match target)"
+    },
+    url: { type: "string", description: "Single seed URL (alternative to http_targets)" },
     depth: { type: "number", default: 3 },
     jsCrawl: { type: "boolean", default: true },
     concurrency: { type: "number", default: 10 },
@@ -37,43 +50,13 @@ export const spiderTool: ToolDefinition = {
     includeSubdomains: { type: "boolean", default: false }
   },
   handler: async (input, emit): Promise<ToolEnvelope> => {
-    const args = (input.args ?? {}) as {
-      url?: string;
-      depth?: number;
-      jsCrawl?: boolean;
-      concurrency?: number;
-      timeoutSec?: number;
-      includeSubdomains?: boolean;
-    };
-
-    let url: string | undefined;
-    if (args.url) {
-      try {
-        const u = new URL(args.url);
-        if (u.hostname === input.target.host) url = args.url;
-      } catch {
-        // ignore
-      }
-    }
-    if (!url) {
-      const httpFact = (input.context?.priorFindings ?? []).find((f) => /Reachable web endpoint:/i.test(f.title));
-      if (httpFact) {
-        const m = /Reachable web endpoint:\s*(\S+)/.exec(httpFact.title);
-        if (m) url = m[1];
-      }
-    }
-    if (!url) {
-      const knownWeb = (input.context?.knownServices ?? []).find((s) => [80, 8080, 443, 8443].includes(s.port));
-      if (knownWeb) {
-        const scheme = knownWeb.port === 443 || knownWeb.port === 8443 ? "https" : "http";
-        url = `${scheme}://${input.target.host}:${knownWeb.port}/`;
-      }
-    }
-
-    if (!url) {
+    const args = (input.args ?? {}) as SpiderArgs;
+    const seeds = collectSeeds(args, input.target.host);
+    if (seeds.length === 0) {
       return {
         status: "skipped",
-        error: "No HTTP target available (run recon.http_probe first)",
+        error:
+          "No crawl seeds in args. Provide `http_targets` (non-empty URL strings) and/or `url` for this target host (manager + execution writer fill these from http_probe).",
         artifacts: { commands: [] },
         facts: [],
         findings: [],
@@ -91,71 +74,57 @@ export const spiderTool: ToolDefinition = {
     const jsCrawl = args.jsCrawl !== false;
     const fieldScope = args.includeSubdomains ? "rdn" : "fqdn";
 
-    const flags: string[] = [
-      `-u ${quote(url)}`,
-      `-d ${depth}`,
-      `-c ${concurrency}`,
-      `-timeout ${timeoutSec}`,
-      `-fs ${fieldScope}`,
-      `-kf robotstxt sitemapxml`,
-      `-iqp`,
-      `-jsonl`,
-      `-silent`,
-      `-no-color`
-    ];
-    if (jsCrawl) flags.push("-jc");
-
-    const script = [
-      `set +e`,
-      `${KATANA_BIN} ${flags.join(" ")}`
-    ].join("\n");
-
-    emit.log(`Running katana against ${url} (de=${depth}, concurrency=${concurrency}, jsCrawl=${jsCrawl})`);
-    const r = await remoteScript(script, input.signal, (s) => emit.log(s));
-
-    const facts: ToolEnvelope["facts"] = [];
-    const findings: ToolEnvelope["findings"] = [];
+    const allFacts: ToolEnvelope["facts"] = [];
+    const allFindings: ToolEnvelope["findings"] = [];
+    const allCommands: string[] = [];
+    let totalDuration = 0;
+    let worstExit: number | null = null;
     const seen = new Set<string>();
     const seenFindingFp = new Set<string>();
+    let stdoutAggregate = "";
 
-    const combined = `${r.stdout}\n${r.stderr}`;
-    for (const line of combined.split("\n")) {
-      const raw = stripAnsi(line).trim();
-      if (!raw || raw.startsWith("+")) continue;
+    for (const seedUrl of seeds) {
+      const flags = buildKatanaArgv(seedUrl, depth, concurrency, timeoutSec, fieldScope, jsCrawl);
+      const script = [`set +e`, `${KATANA_BIN} ${flags.join(" ")}`].join("\n");
+      emit.log(`Running katana against ${seedUrl} (depth=${depth}, concurrency=${concurrency}, jsCrawl=${jsCrawl})`);
+      const r = await remoteScript(script, input.signal, (s) => emit.log(s));
+      totalDuration += r.durationMs;
+      stdoutAggregate += r.stdout;
+      allCommands.push(...r.commands);
+      if (r.exitCode != null) worstExit = worstExit === null ? r.exitCode : Math.max(worstExit, r.exitCode);
 
-      if (raw.startsWith("{")) {
-        ingestJsonlLine(raw, url, facts, findings, seen, seenFindingFp);
-        continue;
+      const combined = `${r.stdout}\n${r.stderr}`;
+      for (const line of combined.split("\n")) {
+        const raw = stripAnsi(line).trim();
+        if (!raw || raw.startsWith("+")) continue;
+        if (raw.startsWith("{")) {
+          ingestJsonlLine(raw, seedUrl, allFacts, allFindings, seen, seenFindingFp);
+          continue;
+        }
+        const plain = parsePlainUrlLine(raw);
+        if (plain) ingestPlainUrlLine(plain, seedUrl, allFacts, allFindings, seen, seenFindingFp);
       }
-
-      const plain = parsePlainUrlLine(raw);
-      if (plain) ingestPlainUrlLine(plain, url, facts, findings, seen, seenFindingFp);
     }
 
     const recs: ToolEnvelope["recommendations"] = [];
-    if (facts.length > 0) {
+    if (allFacts.length > 0 && seeds.length > 0) {
       recs.push({
         agent: "recon.gobuster",
         reason: "Spider discovered URLs — brute-force common paths to find more",
-        priority: 55
+        priority: 55,
+        args: { url: seeds[0] }
       });
     }
 
-    // Layer 3: endpoint amplification.
-    //
-    // 1) For any discovered URL whose path matches API conventions, queue a
-    //    surgical recon.ffuf run pointed at that exact subtree. We pick at
-    //    most a handful so the manager isn't drowned in recommendations.
     const apiPathRegex = /\/(api|graphql|v\d+|rest|gql)(\/|$)/i;
     const ffufedTargets = new Set<string>();
-    for (const fact of facts) {
+    for (const fact of allFacts) {
       if (fact.type !== "web_url") continue;
       const v = (fact.value ?? {}) as { url?: string };
       if (!v.url) continue;
       try {
         const u = new URL(v.url);
         if (!apiPathRegex.test(u.pathname)) continue;
-        // Strip the trailing segment so we fuzz the directory, not the file.
         const dir = u.pathname.replace(/\/[^/]*$/, "/") || "/";
         const targetUrl = `${u.origin}${dir.endsWith("/") ? dir : dir + "/"}FUZZ`;
         if (ffufedTargets.has(targetUrl)) continue;
@@ -172,39 +141,91 @@ export const spiderTool: ToolDefinition = {
       }
     }
 
-    // 2) Backup amplifier: when katana's output is thin (<10 URLs), recommend
-    //    recon.waybackurls so the manager has historical paths to consider.
-    if (facts.length < 10) {
+    if (allFacts.length < 10) {
       recs.push({
         agent: "recon.waybackurls",
-        reason: `Katana returned only ${facts.length} URL(s) — query Wayback Machine for historical endpoints`,
+        reason: `Katana returned only ${allFacts.length} URL(s) — query Wayback Machine for historical endpoints`,
         priority: 65
       });
     }
 
     return {
-      status: facts.length > 0 ? "succeeded" : "partial",
-      durationMs: r.durationMs,
-      artifacts: { commands: r.commands, stdoutSnippet: snippet(r.stdout), stderrSnippet: snippet(r.stderr) },
-      facts,
-      findings,
+      status: allFacts.length > 0 ? "succeeded" : "partial",
+      durationMs: totalDuration,
+      artifacts: {
+        commands: allCommands,
+        stdoutSnippet: snippet(stdoutAggregate),
+        stderrSnippet: undefined
+      },
+      facts: allFacts,
+      findings: allFindings,
       recommendations: recs,
       meta: {
-        exitCode: r.exitCode,
-        seedUrl: url,
+        exitCode: worstExit,
+        seedUrls: seeds,
         depth,
-        urlsDiscovered: facts.length,
-        commandSummary: `Crawl ${url} with katana (depth=${depth}, scope=${fieldScope}) and emit discovered URLs as facts.`
+        urlsDiscovered: allFacts.length,
+        commandSummary: `Crawl ${seeds.length} seed URL(s) with katana (depth=${depth}, scope=${fieldScope}) and emit discovered URLs as facts`
       }
     };
   }
 };
 
+function collectSeeds(args: SpiderArgs, targetHost: string): string[] {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string) => {
+    const s = raw.trim();
+    if (!s) return;
+    try {
+      const u = new URL(s);
+      if (u.hostname !== targetHost) return;
+      if (u.protocol !== "http:" && u.protocol !== "https:") return;
+      const href = u.href;
+      if (seen.has(href)) return;
+      seen.add(href);
+      ordered.push(href);
+    } catch {
+      // skip invalid
+    }
+  };
+  if (Array.isArray(args.http_targets)) {
+    for (const t of args.http_targets) {
+      if (typeof t === "string") push(t);
+    }
+  }
+  if (typeof args.url === "string") push(args.url);
+  return ordered;
+}
+
+function buildKatanaArgv(
+  url: string,
+  depth: number,
+  concurrency: number,
+  timeoutSec: number,
+  fieldScope: string,
+  jsCrawl: boolean
+): string[] {
+  const flags: string[] = [
+    `-u ${quote(url)}`,
+    `-d ${depth}`,
+    `-c ${concurrency}`,
+    `-timeout ${timeoutSec}`,
+    `-fs ${fieldScope}`,
+    `-kf robotstxt sitemapxml`,
+    `-iqp`,
+    `-jsonl`,
+    `-silent`,
+    `-no-color`
+  ];
+  if (jsCrawl) flags.push("-jc");
+  return flags;
+}
+
 function stripAnsi(s: string): string {
   return s.replace(/\u001b\[[0-9;]*m/g, "");
 }
 
-/** Katana often prints one discovered URL per line; accept that in addition to JSONL. */
 function parsePlainUrlLine(line: string): string | undefined {
   const t = line.trim();
   if (!/^https?:\/\//i.test(t)) return undefined;
@@ -289,7 +310,6 @@ function recordDiscoveredUrl(
       severity: status === 200 ? "medium" : "low",
       evidence: `${endpoint} -> HTTP ${status} (${method})`,
       fingerprint: fp,
-      // Katana fetched the page and observed this status code — definitive.
       confidence: "high",
       requiresVerification: false,
       claimType: "web_path"
@@ -306,7 +326,6 @@ function recordDiscoveredUrl(
       severity: "low",
       evidence: `${endpoint} (Katana; HTTP status not captured in output)`,
       fingerprint: fp,
-      // No status captured — prefer corroboration by ffuf/gobuster.
       confidence: "medium",
       requiresVerification: true,
       claimType: "web_path"

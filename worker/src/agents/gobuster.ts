@@ -27,8 +27,6 @@ export const gobusterTool: ToolDefinition = {
   },
   handler: async (input, emit): Promise<ToolEnvelope> => {
     const args = (input.args ?? {}) as { url?: string; basePath?: string; wordlist?: string; threads?: number };
-    // Always prefer URLs derived from this run's target/services.
-    // Ignore arbitrary args.url unless it clearly matches the current target host.
     let url: string | undefined = undefined;
     if (args.url) {
       try {
@@ -36,22 +34,6 @@ export const gobusterTool: ToolDefinition = {
         if (u.hostname === input.target.host) url = args.url;
       } catch {
         // ignore invalid urls
-      }
-    }
-
-    if (!url) {
-      const httpFact = (input.context?.priorFindings ?? []).find((f) => /Reachable web endpoint:/i.test(f.title));
-      if (httpFact) {
-        const m = /Reachable web endpoint:\s*(\S+)/.exec(httpFact.title);
-        if (m) url = m[1];
-      }
-    }
-
-    if (!url) {
-      const knownWeb = (input.context?.knownServices ?? []).find((s) => [80, 8080, 443, 8443].includes(s.port));
-      if (knownWeb) {
-        const scheme = knownWeb.port === 443 || knownWeb.port === 8443 ? "https" : "http";
-        url = `${scheme}://${input.target.host}:${knownWeb.port}/`;
       }
     }
 
@@ -70,7 +52,7 @@ export const gobusterTool: ToolDefinition = {
     if (!url) {
       return {
         status: "skipped",
-        error: "No HTTP target available (run recon.http_probe first)",
+        error: "No HTTP target in args.url (manager + execution writer must supply a URL on the target host). Run recon.http_probe first.",
         artifacts: { commands: [] },
         facts: [],
         findings: [],

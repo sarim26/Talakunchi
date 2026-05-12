@@ -1,21 +1,18 @@
 /**
- * Recon orchestrator — drives the manager → prompter → specialist loop.
+ * Recon orchestrator — manager LLM → prompter → (execution writer) → tool invoke.
  *
- * This is the "agent that connects all agents" the CEO described. The flow:
- *   1. manager picks the next tool + intent
- *   2. prompter translates the intent into a specialist-flavoured prompt
- *      (logged to the event stream so the UI can show what each agent saw)
- *   3. MCPServer.invoke runs the tool with a timeout and emits live events
- *   4. envelope is normalized; new services + findings are persisted; the
- *      tool's recommendations are merged into the manager's queue
- *   5. loop until the manager says "stop" or the budget is exhausted
+ * The manager chooses the next tool from the manifest (see manager.ts for the
+ * only non-LLM overrides: blocked-tool retry and missing-tool installer).
+ * The prompter turns intent into prose; executionCommandWriter fills argSchema
+ * when present; then the MCP tool runs and results merge into context.
  */
 import { env } from "../env.js";
 import { withClient } from "../db.js";
 import { rebuildNeo4jForTarget, upsertNeo4jTarget } from "../neo4jSync.js";
 import { buildReconMCPServer } from "../agents/registry.js";
-import { decideNextAction, phaseForTool, type ManagerContext, type Phase } from "../agents/manager.js";
+import { decideNextAction, type ManagerContext } from "../agents/manager.js";
 import { generatePrompt } from "../agents/prompter.js";
+import { draftExecutionPayload, shouldUseExecutionWriter } from "../agents/executionCommandWriter.js";
 import { getWordlistCatalog } from "../agents/wordlists.js";
 import {
   createEventSink,
@@ -23,7 +20,6 @@ import {
   ensureAgentTables,
   persistDiscoveredServices,
   persistFindings,
-  recordVerifierAttempts,
   setAgentRunStatus
 } from "../persistence/agentEvents.js";
 import type { ToolEnvelope, ToolFinding } from "../mcp/types.js";
@@ -51,7 +47,7 @@ export async function startReconRun(input: StartReconRunInput): Promise<string> 
     targetId: target.id,
     targetHost: target.address,
     managerModel: env.OLLAMA_MANAGER_MODEL,
-    specialistModel: env.OLLAMA_SPECIALIST_MODEL,
+    specialistModel: env.executionWriterModel,
     prompterModel: env.OLLAMA_PROMPTER_MODEL,
     maxSteps: input.maxSteps ?? env.RECON_MAX_STEPS,
     notes: input.notes,
@@ -125,7 +121,6 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
   const ctx: ManagerContext = {
     targetHost: run.target_address,
     stepsRemaining: run.max_steps,
-    phase: "network_discovery",
     knownPorts: [],
     knownServices: [],
     knownFindings: [],
@@ -137,7 +132,12 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
     recentFailures: [],
     installedToolsAttempted: [],
     installedToolsInstalled: [],
-    blockedOnMissingTool: null
+    blockedOnMissingTool: null,
+    runHints: {
+      initialNmapProfile: run.initial_nmap_profile,
+      initialNmapPorts: run.initial_nmap_ports,
+      initialNmapExtraArgs: run.initial_nmap_extra_args
+    }
   };
 
   const allFindings: ToolFinding[] = [];
@@ -175,7 +175,8 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       knownPorts: ctx.knownPorts,
       knownServices: ctx.knownServices,
       wordlistCatalog,
-      selectedWordlist
+      selectedWordlist,
+      discoveredEndpoints: ctx.discoveredEndpoints
     });
     await withClient(async (c) => {
       await c.query(
@@ -184,30 +185,77 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       );
     });
 
+    // For tools with structured argSchema, run the execution-writer LLM after the prompter.
+    // It turns the prompter prose into a JSON args payload merged with what
+    // the manager already provided, then we hand off to the tool with a
+    // short execution-only intent (the rich text stays in telemetry).
+    let invokeArgs: Record<string, unknown> = args ?? {};
+    let invokeIntent: string = prompt;
+    if (shouldUseExecutionWriter(toolDef)) {
+      const writer = await draftExecutionPayload({
+        tool: toolDef,
+        prompterText: prompt,
+        intentGoal,
+        managerArgs: args,
+        context: {
+          target: { targetId: run.target_id, host: run.target_address },
+          knownPorts: ctx.knownPorts,
+          knownServices: ctx.knownServices,
+          discoveredEndpoints: ctx.discoveredEndpoints,
+          priorFindings: allFindings,
+          wordlistCatalog
+        }
+      });
+      invokeArgs = writer.finalArgs;
+      invokeIntent = `Execute ${toolDef.name} with the supplied args. Do not infer a different target or scope.`;
+      await withClient(async (c) => {
+        await c.query(
+          `insert into agent_events (agent_run_id, kind, payload) values ($1, 'execution_writer.output', $2::jsonb)`,
+          [
+            agentRunId,
+            JSON.stringify({
+              step,
+              tool: toolDef.name,
+              source: writer.source,
+              model: writer.modelUsed,
+              draftArgs: writer.draftArgs,
+              finalArgs: writer.finalArgs,
+              diag: writer.diag ?? null
+            })
+          ]
+        );
+      });
+    }
+
     const { invocationId, envelope } = await server.invoke(
       toolDef.name,
       {
         target: { targetId: run.target_id, host: run.target_address },
-        intent: prompt,
-        args: args ?? {},
+        intent: invokeIntent,
+        args: invokeArgs,
         context: {
           knownPorts: ctx.knownPorts,
           knownServices: ctx.knownServices,
           knownDomains: [],
           priorFindings: allFindings,
+          discoveredEndpoints: ctx.discoveredEndpoints.map((e) => ({
+            url: e.url,
+            method: e.method,
+            status: e.status,
+            sourceTool: e.sourceTool
+          })),
           runId: agentRunId,
           invocationId: ""
         }
       },
       sink
     );
-    return { toolName: toolDef.name, intentGoal, args, invocationId, envelope };
+    return { toolName: toolDef.name, intentGoal, args: invokeArgs, invocationId, envelope };
   }
 
   /**
    * Merge a single invocation's envelope into the shared `ctx` and persist
-   * services/findings. Runs serially so we don't have to worry about
-   * inter-tool races even when several tools ran via invoke_parallel.
+   * services/findings. Runs serially so we never race on shared state.
    */
   async function mergeEnvelope(
     step: number,
@@ -317,56 +365,6 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       });
     }
 
-    // Layer 1: queue verifier expectations.
-    // When a tool emits open-port findings that still need corroboration, ask
-    // recon.http_probe to attempt verification on the next step.
-    if (toolName === "recon.nmap") {
-      for (const f of envelope.findings ?? []) {
-        if (f.claimType === "open_port" && f.requiresVerification !== false && f.fingerprint) {
-          const probeable = [80, 443, 8080, 8443].includes(Number(f.port));
-          if (probeable && !ctx.pendingVerifications.some((v) => v.fingerprint === f.fingerprint)) {
-            ctx.pendingVerifications.push({
-              fingerprint: f.fingerprint,
-              verifierTool: "recon.http_probe"
-            });
-          }
-        }
-      }
-    }
-
-    // After recon.http_probe ran, any open-port fingerprint it didn't observe
-    // is marked as "verifier_no_response" so the original finding stays
-    // unverified permanently (Situation 3).
-    if (toolName === "recon.http_probe") {
-      const observedPorts = new Set<number>();
-      for (const f of envelope.findings ?? []) {
-        if (f.claimType === "http_reachable" && typeof f.port === "number") observedPorts.add(f.port);
-        if (f.verifiesFingerprint) {
-          // strip port out of fingerprint of form open-port|host|tcp|<port>
-          const m = /^open-port\|[^|]+\|[^|]+\|(\d+)$/.exec(f.verifiesFingerprint);
-          if (m) observedPorts.add(Number(m[1]));
-        }
-      }
-      const failures: Array<{ fingerprint: string; tool: string; status: "verifier_failed" | "verifier_no_response"; evidence?: string }> = [];
-      ctx.pendingVerifications = ctx.pendingVerifications.filter((v) => {
-        if (v.verifierTool !== "recon.http_probe") return true;
-        const m = /^open-port\|[^|]+\|[^|]+\|(\d+)$/.exec(v.fingerprint);
-        if (!m) return true;
-        const port = Number(m[1]);
-        if (observedPorts.has(port)) return false; // confirmed (handled by verifiesFingerprint path)
-        failures.push({
-          fingerprint: v.fingerprint,
-          tool: "recon.http_probe",
-          status: envelope.status === "failed" ? "verifier_failed" : "verifier_no_response",
-          evidence: `httpx attempted but did not corroborate port ${port}`
-        });
-        return false;
-      });
-      if (failures.length > 0) {
-        await recordVerifierAttempts(run.target_id, failures, { invocationId, agentRunId });
-      }
-    }
-
     ctx.invocationHistory.push({
       tool: toolName,
       status: envelope.status,
@@ -383,20 +381,7 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
   for (let step = 1; step <= run.max_steps; step += 1) {
     ctx.stepsRemaining = run.max_steps - step + 1;
 
-    // Step 1 is always recon.nmap (configurable per run).
-    const decision =
-      step === 1 && server.has("recon.nmap")
-        ? ({
-            action: "invoke" as const,
-            tool: "recon.nmap",
-            intentGoal: "Initial network scan (required first step)",
-            args: {
-              profile: run.initial_nmap_profile ?? "deep",
-              ports: run.initial_nmap_ports ?? undefined,
-              extraArgs: run.initial_nmap_extra_args ?? undefined
-            }
-          })
-        : await decideNextAction(server, ctx);
+    const decision = await decideNextAction(server, ctx);
 
     await sink.emitDecision({
       step,
@@ -405,7 +390,6 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
         knownPorts: ctx.knownPorts,
         services: ctx.knownServices.length,
         findings: allFindings.length,
-        phase: ctx.phase ?? null,
         pendingVerifications: ctx.pendingVerifications.length,
         discoveredEndpoints: ctx.discoveredEndpoints.length
       }
@@ -413,55 +397,10 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
 
     if (decision.action === "stop") break;
 
-    if (decision.action === "invoke_parallel") {
-      const phase: Phase = decision.phase;
-      ctx.phase = phase;
-      await withClient(async (c) => {
-        await c.query(
-          `insert into agent_events (agent_run_id, kind, payload) values ($1, 'phase.started', $2::jsonb)`,
-          [
-            agentRunId,
-            JSON.stringify({
-              step,
-              phase,
-              tools: decision.invocations.map((i) => i.tool),
-              reasoning: decision.reasoning ?? null
-            })
-          ]
-        );
-      });
-
-      // Run all tools in parallel. Each task does its own remoteScript over
-      // SSH; they share the same Kali host so we keep the parallel width
-      // bounded by the schema (max 4).
-      const results = await Promise.allSettled(
-        decision.invocations.map((inv) => runSingleTool(step, inv.tool, inv.intentGoal, inv.args))
-      );
-
-      const phaseOutcomes: Array<{ tool: string; status: string; error?: string }> = [];
-      for (const r of results) {
-        if (r.status === "rejected") {
-          phaseOutcomes.push({ tool: "unknown", status: "rejected", error: String(r.reason) });
-          continue;
-        }
-        const got = r.value;
-        if (!got) continue;
-        await mergeEnvelope(step, got.toolName, got.args, got.invocationId, got.envelope);
-        phaseOutcomes.push({ tool: got.toolName, status: got.envelope.status, error: got.envelope.error });
-      }
-
-      await withClient(async (c) => {
-        await c.query(
-          `insert into agent_events (agent_run_id, kind, payload) values ($1, 'phase.finished', $2::jsonb)`,
-          [agentRunId, JSON.stringify({ step, phase, outcomes: phaseOutcomes })]
-        );
-      });
-    } else {
-      // Single tool.
-      const args = "args" in decision ? (decision.args as Record<string, unknown> | undefined) : undefined;
-      ctx.phase = phaseForTool(decision.tool) ?? ctx.phase;
-      const got = await runSingleTool(step, decision.tool, decision.intentGoal, args);
-      if (got) await mergeEnvelope(step, got.toolName, got.args, got.invocationId, got.envelope);
+    const args = decision.args as Record<string, unknown> | undefined;
+    const got = await runSingleTool(step, decision.tool, decision.intentGoal, args);
+    if (got) {
+      await mergeEnvelope(step, got.toolName, got.args, got.invocationId, got.envelope);
     }
 
     await setAgentRunStatus(agentRunId, "running", {

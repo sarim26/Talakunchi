@@ -41,8 +41,6 @@ export const ffufTool: ToolDefinition = {
       timeoutSec?: number;
     };
 
-    // Build a default targetUrl if the manager didn't pass one: probe the
-    // root with `/FUZZ` against the reachable web endpoint we know about.
     let targetUrl = args.targetUrl;
     if (targetUrl) {
       try {
@@ -52,24 +50,10 @@ export const ffufTool: ToolDefinition = {
         targetUrl = undefined;
       }
     }
-    if (!targetUrl) {
-      const httpFact = (input.context?.priorFindings ?? []).find((f) => /Reachable web endpoint:/i.test(f.title));
-      if (httpFact) {
-        const m = /Reachable web endpoint:\s*(\S+)/.exec(httpFact.title);
-        if (m) targetUrl = `${m[1].replace(/\/$/, "")}/FUZZ`;
-      }
-    }
-    if (!targetUrl) {
-      const known = (input.context?.knownServices ?? []).find((s) => [80, 8080, 443, 8443].includes(s.port));
-      if (known) {
-        const scheme = known.port === 443 || known.port === 8443 ? "https" : "http";
-        targetUrl = `${scheme}://${input.target.host}:${known.port}/FUZZ`;
-      }
-    }
     if (!targetUrl || !/FUZZ/.test(targetUrl)) {
       return {
         status: "skipped",
-        error: "No targetUrl with FUZZ placeholder available; run recon.http_probe + recon.spider first.",
+        error: "No targetUrl with FUZZ in args (manager + execution writer must supply e.g. http://host:80/FUZZ).",
         artifacts: { commands: [] },
         facts: [],
         findings: [],

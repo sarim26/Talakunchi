@@ -1314,16 +1314,58 @@ app.get("/api/agent-tools", async () => {
   // Stable list: keep in lock-step with worker/src/agents/registry.ts
   return [
     { name: "recon.nmap", description: "Run an nmap scan to discover open ports and detect services on a target host.", tags: ["recon", "network"] },
-    { name: "recon.http_probe", description: "Probe HTTP/HTTPS endpoints for status code, server header and title.", tags: ["recon", "web"] },
-    { name: "recon.spider", description: "Crawl a discovered HTTP(S) endpoint with Katana to enumerate URLs, JS routes, robots.txt and sitemap entries.", tags: ["recon", "web"] },
-    { name: "recon.waybackurls", description: "Backup endpoint discovery via the Wayback Machine when katana's output is thin.", tags: ["recon", "web", "amplification"] },
-    { name: "recon.ffuf", description: "Surgical web path fuzzing with ffuf using a FUZZ placeholder in the target URL.", tags: ["recon", "web", "fuzz"] },
-    { name: "recon.gobuster", description: "Brute-force common content paths on a discovered HTTP(S) endpoint using gobuster.", tags: ["recon", "web"] },
-    { name: "recon.dns_enum", description: "Enumerate DNS records (A/AAAA/MX/NS/TXT), reverse PTR and attempt safe zone transfers.", tags: ["recon", "dns"] },
-    { name: "recon.tls_check", description: "Inspect TLS certificate and protocol versions on TLS-enabled ports.", tags: ["recon", "tls"] },
-    { name: "recon.smb_enum", description: "Enumerate SMB on the target: dialects, signing, anonymous share listing.", tags: ["recon", "smb"] },
-    { name: "recon.ssh_enum", description: "Capture SSH banner and offered algorithms for the target.", tags: ["recon", "ssh"] },
-    { name: "recon.cve_enricher", description: "Enrich detected services with known-vulnerable software heuristics (no remote scanning).", tags: ["recon", "enrichment"] },
+    {
+      name: "recon.dns_enum",
+      description: "Enumerate DNS records (A/AAAA/MX/NS/TXT/CNAME), reverse PTR and attempt safe zone transfers (dig + dnsx).",
+      tags: ["recon", "dns"]
+    },
+    {
+      name: "recon.http_probe",
+      description: "Probe HTTP/HTTPS endpoints on a target with httpx and capture status, title, server header and detected tech.",
+      tags: ["recon", "web"]
+    },
+    {
+      name: "recon.ssh_enum",
+      description: "Audit SSH banner, supported algorithms and known CVEs using ssh-audit (JSON output).",
+      tags: ["recon", "ssh"]
+    },
+    {
+      name: "recon.smb_enum",
+      description: "Enumerate SMB on the target with enum4linux-ng (JSON output): dialects, signing, anonymous share listing.",
+      tags: ["recon", "smb"]
+    },
+    {
+      name: "recon.tls_check",
+      description: "Inspect TLS certificate, protocols and known vulnerabilities on TLS-enabled ports using testssl.",
+      tags: ["recon", "tls"]
+    },
+    {
+      name: "recon.cve_enricher",
+      description: "Enrich detected services with known-vulnerable software heuristics (no remote scanning).",
+      tags: ["recon", "enrichment"]
+    },
+    {
+      name: "recon.spider",
+      description: "Crawl a discovered HTTP(S) endpoint with Katana to enumerate URLs, JS endpoints, robots.txt and sitemap entries.",
+      tags: ["recon", "web"]
+    },
+    {
+      name: "recon.waybackurls",
+      description: "Query the Wayback Machine for historical URLs of the target host (read-only to archive.org).",
+      tags: ["recon", "web", "amplification"]
+    },
+    {
+      name: "recon.gobuster",
+      description:
+        "Brute-force common web content paths on a discovered HTTP(S) endpoint. Structured args are merged from the execution-writer LLM after the prompter step.",
+      tags: ["recon", "web"]
+    },
+    {
+      name: "recon.ffuf",
+      description:
+        "Fuzz a specific web path with ffuf using a SecLists wordlist. Structured args are merged from the execution-writer LLM after the prompter step.",
+      tags: ["recon", "web", "fuzz"]
+    },
     {
       name: "system.tool_installer",
       description:

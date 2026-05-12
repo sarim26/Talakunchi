@@ -332,26 +332,23 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
 
   const decisionEvents = events.filter((e) => e.kind === "manager.decision");
   const promptEvents = events.filter((e) => e.kind === "prompter.output");
+  const writerEvents = events.filter((e) => e.kind === "execution_writer.output");
   const wordlistEvent = events.find((e) => e.kind === "wordlist.catalog");
   const failureEvents = events.filter((e) => e.kind === "agent.failure");
-  const phaseStarted = events.filter((e) => e.kind === "phase.started");
-  const phaseFinished = events.filter((e) => e.kind === "phase.finished");
   const finishedCount = invocations.filter((i) => ["succeeded", "failed", "skipped"].includes(i.status)).length;
   const progress = run.maxSteps > 0 ? Math.min(100, Math.round((run.stepsTaken / run.maxSteps) * 100)) : 0;
   const summaryAvailable = run.status === "succeeded" || run.status === "failed";
 
-  // Reconstruct the current phase + which tools are running in parallel right
-  // now. A phase is "active" if it has been started but not yet finished, OR
-  // we're past the last started phase and no new one has begun.
-  const lastStarted = phaseStarted[phaseStarted.length - 1] ?? null;
-  const lastFinished = phaseFinished[phaseFinished.length - 1] ?? null;
-  const currentPhase =
-    lastStarted && (!lastFinished || new Date(lastStarted.createdAt as any) > new Date(lastFinished.createdAt as any))
-      ? ((lastStarted.payload ?? {}) as { phase?: string; tools?: string[] })
-      : null;
   const latestDecision = (decisionEvents[decisionEvents.length - 1]?.payload ?? {}) as {
-    snapshot?: { phase?: string | null; pendingVerifications?: number; discoveredEndpoints?: number };
+    snapshot?: {
+      pendingVerifications?: number;
+      discoveredEndpoints?: number;
+      services?: number;
+      findings?: number;
+      knownPorts?: number[];
+    };
   };
+  const latestSnapshot = latestDecision.snapshot ?? null;
 
   return (
     <Stack spacing={2}>
@@ -363,7 +360,7 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
                 {run.target.name} <Typography component="span" color="text.secondary">({run.target.address})</Typography>
               </Typography>
               <Typography variant="caption" color="text.secondary">
-                Manager: {run.managerModel || "qwen3:8b"} · Specialist: {run.specialistModel || "qwen3:8b"} · Prompter: {run.prompterModel || "qwen3:8b"}
+                Manager: {run.managerModel || "qwen3:8b"} · Arg writer: {run.specialistModel || "qwen3:8b"} · Prompter: {run.prompterModel || "qwen3:8b"}
               </Typography>
             </Box>
             <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
@@ -398,11 +395,7 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
         </CardContent>
       </Card>
 
-      <PhaseCard
-        currentPhase={currentPhase}
-        latestSnapshot={latestDecision.snapshot ?? null}
-        phaseHistory={phaseFinished}
-      />
+      <RunContextCard latestSnapshot={latestSnapshot} />
 
       {wordlistEvent ? <WordlistCatalogCard event={wordlistEvent} /> : null}
 
@@ -464,6 +457,51 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
                   onToggle={() => setOpenInvocation((cur) => (cur === inv.id ? null : inv.id))}
                 />
               ))}
+            </Stack>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardContent>
+          <Typography variant="subtitle1" gutterBottom>
+            Execution writer (structured args)
+          </Typography>
+          {writerEvents.length === 0 ? (
+            <Typography variant="body2" color="text.secondary">
+              No execution-writer events yet (tools without argSchema skip this step).
+            </Typography>
+          ) : (
+            <Stack spacing={1}>
+              {writerEvents.slice(-8).map((e) => {
+                const p = (e.payload ?? {}) as {
+                  step?: number;
+                  tool?: string;
+                  source?: string;
+                  model?: string;
+                  draftArgs?: Record<string, unknown>;
+                  finalArgs?: Record<string, unknown>;
+                  diag?: string | null;
+                };
+                return (
+                  <Box key={e.id} sx={{ p: 1, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+                    <Typography variant="caption" color="text.secondary">
+                      step {p.step ?? "?"} · {p.tool ?? "?"} · source: {p.source ?? "?"} · model: {p.model ?? "?"}
+                    </Typography>
+                    {p.diag ? (
+                      <Typography variant="caption" sx={{ display: "block" }} color="warning.main">
+                        {p.diag}
+                      </Typography>
+                    ) : null}
+                    <Typography variant="caption" sx={{ display: "block", mt: 0.5 }} color="text.secondary">
+                      final args
+                    </Typography>
+                    <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.8rem", whiteSpace: "pre-wrap" }}>
+                      {JSON.stringify(p.finalArgs ?? {}, null, 2)}
+                    </Typography>
+                  </Box>
+                );
+              })}
             </Stack>
           )}
         </CardContent>
@@ -677,26 +715,28 @@ function InvocationCard(props: { inv: AgentInvocation; open: boolean; onToggle: 
   );
 }
 
-function PhaseCard(props: {
-  currentPhase: { phase?: string; tools?: string[] } | null;
-  latestSnapshot: { phase?: string | null; pendingVerifications?: number; discoveredEndpoints?: number } | null;
-  phaseHistory: AgentEvent[];
+function RunContextCard(props: {
+  latestSnapshot: {
+    pendingVerifications?: number;
+    discoveredEndpoints?: number;
+    services?: number;
+    findings?: number;
+    knownPorts?: number[];
+  } | null;
 }) {
-  const { currentPhase, latestSnapshot, phaseHistory } = props;
-  const activePhaseName = currentPhase?.phase ?? latestSnapshot?.phase ?? null;
-  const runningTools = currentPhase?.tools ?? [];
+  const { latestSnapshot } = props;
   return (
     <Card>
       <CardContent>
         <Stack direction={{ xs: "column", md: "row" }} alignItems={{ md: "center" }} justifyContent="space-between" spacing={1}>
-          <Typography variant="subtitle1">Phase &amp; parallel tools</Typography>
+          <Typography variant="subtitle1">Run context</Typography>
           <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-            <Chip
-              size="small"
-              label={`phase: ${activePhaseName ?? "—"}`}
-              color={currentPhase ? "primary" : "default"}
-              variant={currentPhase ? "filled" : "outlined"}
-            />
+            {typeof latestSnapshot?.services === "number" ? (
+              <Chip size="small" label={`services: ${latestSnapshot.services}`} variant="outlined" />
+            ) : null}
+            {typeof latestSnapshot?.findings === "number" ? (
+              <Chip size="small" label={`findings: ${latestSnapshot.findings}`} variant="outlined" />
+            ) : null}
             {typeof latestSnapshot?.discoveredEndpoints === "number" ? (
               <Chip size="small" label={`endpoints: ${latestSnapshot.discoveredEndpoints}`} variant="outlined" />
             ) : null}
@@ -710,60 +750,9 @@ function PhaseCard(props: {
             ) : null}
           </Stack>
         </Stack>
-        <Divider sx={{ my: 1.5 }} />
-        {currentPhase && runningTools.length > 0 ? (
-          <Box>
-            <Typography variant="caption" color="text.secondary">
-              Tools running in parallel right now:
-            </Typography>
-            <Stack direction="row" spacing={1} sx={{ mt: 0.5 }} flexWrap="wrap" useFlexGap>
-              {runningTools.map((t) => (
-                <Chip key={t} size="small" label={t} color="primary" />
-              ))}
-            </Stack>
-          </Box>
-        ) : (
-          <Typography variant="body2" color="text.secondary">
-            No phase is currently running in parallel.
-          </Typography>
-        )}
-        {phaseHistory.length > 0 ? (
-          <Box sx={{ mt: 1.5 }}>
-            <Typography variant="caption" color="text.secondary">
-              Recent phases
-            </Typography>
-            <Stack spacing={0.5} sx={{ mt: 0.5 }}>
-              {phaseHistory
-                .slice(-4)
-                .reverse()
-                .map((e) => {
-                  const p = (e.payload ?? {}) as {
-                    step?: number;
-                    phase?: string;
-                    outcomes?: Array<{ tool: string; status: string }>;
-                  };
-                  return (
-                    <Box key={e.id} sx={{ p: 1, border: "1px dashed", borderColor: "divider", borderRadius: 1 }}>
-                      <Typography variant="body2">
-                        <strong>step {p.step ?? "?"}</strong> · phase: {p.phase ?? "?"}
-                      </Typography>
-                      <Stack direction="row" spacing={0.5} sx={{ mt: 0.5 }} flexWrap="wrap" useFlexGap>
-                        {(p.outcomes ?? []).map((o, i) => (
-                          <Chip
-                            key={i}
-                            size="small"
-                            label={`${o.tool}: ${o.status}`}
-                            color={o.status === "succeeded" ? "success" : o.status === "failed" ? "error" : "default"}
-                            variant="outlined"
-                          />
-                        ))}
-                      </Stack>
-                    </Box>
-                  );
-                })}
-            </Stack>
-          </Box>
-        ) : null}
+        <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+          The manager LLM picks one tool per step; the worker runs it over SSH. No fixed phase ordering.
+        </Typography>
       </CardContent>
     </Card>
   );

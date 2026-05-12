@@ -665,7 +665,7 @@ async function main() {
     `[worker] starting (tools_ssh=${env.REMOTE_SSH_USER}@${env.REMOTE_SSH_HOST}:${env.REMOTE_SSH_PORT}, ollama=${env.OLLAMA_URL})`
   );
   console.log(
-    `[worker] mcp models: manager=${env.OLLAMA_MANAGER_MODEL} specialist=${env.OLLAMA_SPECIALIST_MODEL} prompter=${env.OLLAMA_PROMPTER_MODEL}`
+    `[worker] mcp models: manager=${env.OLLAMA_MANAGER_MODEL} specialistDefault=${env.OLLAMA_SPECIALIST_MODEL} prompter=${env.OLLAMA_PROMPTER_MODEL} executionWriter=${env.executionWriterModel}`
   );
   // eslint-disable-next-line no-constant-condition
   while (true) {

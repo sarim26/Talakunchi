@@ -76,27 +76,6 @@ export const nmapTool: ToolDefinition = {
 
     for (const svc of openServices) emit.fact({ type: "service", value: svc, source: "nmap" });
 
-    const recs: ToolEnvelope["recommendations"] = [];
-    const has = (port: number) => openServices.some((s) => s.port === port);
-    if (has(80) || has(8080) || has(443) || has(8443)) {
-      recs.push({ agent: "recon.http_probe", reason: "HTTP/HTTPS ports open", priority: 80 });
-    }
-    if (has(443) || has(8443)) {
-      recs.push({ agent: "recon.tls_check", reason: "TLS ports open", priority: 70 });
-    }
-    if (has(53)) {
-      recs.push({ agent: "recon.dns_enum", reason: "DNS port open", priority: 60 });
-    }
-    if (has(445) || has(139)) {
-      recs.push({ agent: "recon.smb_enum", reason: "SMB ports open", priority: 75 });
-    }
-    if (has(22)) {
-      recs.push({ agent: "recon.ssh_enum", reason: "SSH port open", priority: 60 });
-    }
-    if (openServices.length > 0) {
-      recs.push({ agent: "recon.cve_enricher", reason: "Enrich detected services with CVE matches", priority: 50 });
-    }
-
     return {
       status: "succeeded",
       durationMs: r.durationMs,
@@ -117,7 +96,7 @@ export const nmapTool: ToolDefinition = {
         requiresVerification: true,
         claimType: "open_port"
       })),
-      recommendations: recs,
+      recommendations: [],
       meta: {
         exitCode: r.exitCode,
         profile,

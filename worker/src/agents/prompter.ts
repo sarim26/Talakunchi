@@ -21,6 +21,8 @@ type PrompterInput = {
   wordlistCatalog?: WordlistCatalog;
   /** Wordlist path the manager already chose (if any) — surfaced to the agent. */
   selectedWordlist?: string;
+  /** URLs accumulated so far (e.g. from prior commands). */
+  discoveredEndpoints?: Array<{ url: string; method?: string; status?: number | null; sourceTool: string }>;
   signal?: AbortSignal;
 };
 
@@ -28,7 +30,7 @@ function wordlistLines(input: PrompterInput): string[] {
   if (!input.wordlistCatalog?.rootExists) return [];
   const cat = input.wordlistCatalog;
   const tag = (input.agent.tags ?? []).join(",");
-  const wantsWeb = /web|gobuster/i.test(input.agent.name) || /web/i.test(tag);
+  const wantsWeb = /web|gobuster|ffuf/i.test(input.agent.name) || /web|fuzz/i.test(tag);
   const wantsDns = /dns/i.test(input.agent.name) || /dns/i.test(tag);
   const wantsCreds = /hydra|brute|password|credential/i.test(input.agent.name + " " + tag);
 
@@ -73,6 +75,12 @@ export async function generatePrompt(input: PrompterInput): Promise<string> {
     "- Keep it under 8 sentences."
   ].join("\n");
 
+  const ep = (input.discoveredEndpoints ?? []).slice(-12);
+  const epLines =
+    ep.length > 0
+      ? ["", "Discovered URLs (recent):", ...ep.map((e) => `  - ${e.method ?? "GET"} ${e.url}`)].join("\n")
+      : "";
+
   const userMsg = [
     `Specialist agent: ${agent.name}`,
     `Capability: ${agent.description}`,
@@ -81,10 +89,13 @@ export async function generatePrompt(input: PrompterInput): Promise<string> {
     `Known open ports: ${knownPorts.length ? knownPorts.join(",") : "(none yet)"}`,
     `Known services: ${knownServices.map((s) => `${s.port}/${s.protocol}${s.name ? ` ${s.name}` : ""}`).join(", ") || "(none)"}`,
     `Manager intent: ${intentGoal}`,
+    epLines,
     ...wordlistLines(input),
     "",
     'Return ONLY the prompt text (no JSON, no markdown fences).'
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   try {
     const r = await chat({
