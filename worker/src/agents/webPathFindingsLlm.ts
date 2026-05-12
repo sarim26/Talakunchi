@@ -31,7 +31,7 @@ export async function findingsFromWebFactsLlm(opts: {
   targetHost: string;
   facts: ToolFact[];
   signal?: AbortSignal;
-  /** Max observations sent to the model (prioritized). Default 140. */
+  /** Max observations sent to the model (prioritized). Default 160. */
   maxObservations?: number;
   emitLog?: (s: string) => void;
 }): Promise<{
@@ -43,7 +43,7 @@ export async function findingsFromWebFactsLlm(opts: {
     return { findings: [], meta: { modelUsed: env.webFindingsModel, sentCount: 0, inputCount: 0 } };
   }
 
-  const maxSend = Math.min(opts.maxObservations ?? 140, 200);
+  const maxSend = Math.min(opts.maxObservations ?? 160, 260);
   const prioritized = prioritizeObservations(observations).slice(0, maxSend);
   const model = env.webFindingsModel;
 
@@ -62,8 +62,12 @@ export async function findingsFromWebFactsLlm(opts: {
     "- Observations with null httpStatus are often historical (e.g. Wayback) — still surface notable admin/API paths as informational clues when appropriate.",
     "- Prefer: auth misconfigs (403 on sensitive files), directory listings, admin/login panels, debug/test endpoints,",
     "  source/config backup paths, server-status, graphql/swagger exposure, redirects to sensitive areas, etc.",
+    "- If several **unrelated** sensitive surfaces appear (e.g. Apache directory index `?C=…;O=…`, phpMyAdmin, Drupal,",
+    "  a standalone `.php` app, `/chat/`, etc.), emit **separate findings with distinct titles** — do not merge unrelated",
+    "  themes into one generic “admin exposure” finding.",
+    "- In `evidence`, paste the **full exact** `observations[].url` string you rely on (verbatim from the input JSON).",
     "- severity: use \"info\" for minor; escalate only when impact is clear from the path/status alone.",
-    "- Cap at 50 findings; merge duplicates (same URL).",
+    "- Cap at 50 findings; merge only true duplicates (same URL **and** same underlying issue).",
     "",
     "Each finding object:",
     "- title: short imperative label",
@@ -90,7 +94,7 @@ export async function findingsFromWebFactsLlm(opts: {
         { role: "user", content: user }
       ],
       temperature: 0.15,
-      maxTokens: 3600,
+      maxTokens: 7200,
       signal: opts.signal
     });
 
@@ -129,10 +133,15 @@ export async function findingsFromWebFactsLlm(opts: {
       const matchedUrl = longestUrlContainedIn(f.evidence, urlPool);
       if (!matchedUrl) continue;
 
-      const fp =
+      const baseFp =
         f.fingerprint?.trim() ||
-        `llm-web|${opts.tool}|${matchedUrl}|${f.severity}`;
-      if (seenFp.has(fp)) continue;
+        `llm-web|${opts.tool}|${matchedUrl}|${f.severity}|${fingerprintTitlePart(f.title)}`;
+      let fp = baseFp;
+      let dup = 0;
+      while (seenFp.has(fp)) {
+        dup += 1;
+        fp = `${baseFp}#${dup}`;
+      }
       seenFp.add(fp);
 
       out.push({
@@ -192,7 +201,15 @@ function extractObservations(facts: ToolFact[]): WebObservation[] {
 function longestUrlContainedIn(evidence: string, urls: string[]): string | null {
   let best: string | null = null;
   for (const u of urls) {
-    if (!evidence.includes(u)) continue;
+    const variants = new Set<string>([u, u.replace(/\/+$/, ""), u.endsWith("/") ? u : `${u}/`]);
+    let hit = false;
+    for (const v of variants) {
+      if (v && evidence.includes(v)) {
+        hit = true;
+        break;
+      }
+    }
+    if (!hit) continue;
     if (!best || u.length > best.length) best = u;
   }
   return best;
@@ -220,9 +237,62 @@ function statusRank(s: number | null): number {
 
 function prioritizeObservations(rows: WebObservation[]): WebObservation[] {
   return [...rows].sort((a, b) => {
+    const sa = pathSignalScore(a.url);
+    const sb = pathSignalScore(b.url);
+    if (sa !== sb) return sb - sa;
     const ra = statusRank(a.httpStatus);
     const rb = statusRank(b.httpStatus);
     if (ra !== rb) return ra - rb;
-    return b.url.length - a.url.length;
+    const da = urlPathDepth(a.url);
+    const db = urlPathDepth(b.url);
+    if (da !== db) return da - db;
+    return a.url.length - b.url.length;
   });
+}
+
+/** Prefer shallow “theme” URLs so the LLM sees roots (phpMyAdmin, Drupal, `?C=` indexes) before deep static assets. */
+function pathSignalScore(rawUrl: string): number {
+  let s = 0;
+  try {
+    const u = new URL(rawUrl);
+    const path = u.pathname;
+    const search = u.search;
+
+    if (/[?&]c=[a-z];o=[a-z]/i.test(search)) s += 95;
+
+    const depth = urlPathDepth(rawUrl);
+    if (depth <= 1 && /\.php$/i.test(path)) s += 55;
+    else if (depth <= 2 && /\.php$/i.test(path)) s += 40;
+
+    if (/(^|\/)phpmyadmin(\/|$)/i.test(path)) s += depth <= 3 ? 45 : depth <= 6 ? 28 : 12;
+    if (/(^|\/)drupal(\/|$)/i.test(path)) s += depth <= 3 ? 42 : depth <= 6 ? 26 : 12;
+    if (/(^|\/)chat(\/|$)/i.test(path)) s += depth <= 3 ? 38 : 20;
+
+    if (/(^|\/)(wp-admin|wp-login|server-status|\.git|\.env|graphql|swagger)(\/|$)/i.test(path)) s += 50;
+
+    if (/\.(js|mjs|css|map|woff2?|ttf|eot|png|jpe?g|gif|svg|ico)(\?|$)/i.test(path)) s -= 35;
+    if (/\/(js|css|misc|themes|jquery|img|images|fonts|vendor)\//i.test(path)) s -= 25;
+    if (/\/jquery[^/]*\.js/i.test(path)) s -= 20;
+  } catch {
+    return 0;
+  }
+  return s;
+}
+
+function urlPathDepth(rawUrl: string): number {
+  try {
+    const segs = new URL(rawUrl).pathname.split("/").filter(Boolean);
+    return segs.length;
+  } catch {
+    return 99;
+  }
+}
+
+function fingerprintTitlePart(title: string): string {
+  const t = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return t || "finding";
 }

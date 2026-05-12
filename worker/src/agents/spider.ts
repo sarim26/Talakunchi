@@ -151,6 +151,7 @@ export const spiderTool: ToolDefinition = {
       targetHost: input.target.host,
       facts: allFacts,
       signal: input.signal,
+      maxObservations: 240,
       emitLog: (s) => emit.log(s)
     });
 
