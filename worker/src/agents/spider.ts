@@ -1,5 +1,6 @@
 import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
 import { remoteScript, requireRemoteTool, snippet } from "./shared.js";
+import { findingsFromWebFactsLlm } from "./webPathFindingsLlm.js";
 
 const KATANA_BIN = "katana";
 
@@ -9,9 +10,6 @@ const KATANA_INSTALL_COMMAND = [
   "export PATH=\"$PATH:$(go env GOPATH)/bin\"",
   "go install github.com/projectdiscovery/katana/cmd/katana@latest"
 ].join(" && ");
-
-const INTERESTING_PATH =
-  /(phpmyadmin|drupal|wp-admin|wp-login|admin|login|signin|signup|register|uploads?|backup|config|setup|test|debug|api|graphql|swagger|openapi|actuator|jenkins|kibana|grafana|metrics|console|jmx-console|server-status)|(?:^|\/)chats?(?:\/|$)/i;
 
 type SpiderArgs = {
   url?: string;
@@ -76,12 +74,10 @@ export const spiderTool: ToolDefinition = {
     const fieldScope = args.includeSubdomains ? "rdn" : "fqdn";
 
     const allFacts: ToolEnvelope["facts"] = [];
-    const allFindings: ToolEnvelope["findings"] = [];
     const allCommands: string[] = [];
     let totalDuration = 0;
     let worstExit: number | null = null;
     const seen = new Set<string>();
-    const seenFindingFp = new Set<string>();
     let stdoutAggregate = "";
 
     for (const seedUrl of seeds) {
@@ -99,11 +95,11 @@ export const spiderTool: ToolDefinition = {
         const raw = stripAnsi(line).trim();
         if (!raw || raw.startsWith("+")) continue;
         if (raw.startsWith("{")) {
-          ingestJsonlLine(raw, seedUrl, allFacts, allFindings, seen, seenFindingFp);
+          ingestJsonlLine(raw, allFacts, seen);
           continue;
         }
         const plain = parsePlainUrlLine(raw);
-        if (plain) ingestPlainUrlLine(plain, seedUrl, allFacts, allFindings, seen, seenFindingFp);
+        if (plain) ingestPlainUrlLine(plain, allFacts, seen);
       }
     }
 
@@ -150,6 +146,14 @@ export const spiderTool: ToolDefinition = {
       });
     }
 
+    const webLlm = await findingsFromWebFactsLlm({
+      tool: "recon.spider",
+      targetHost: input.target.host,
+      facts: allFacts,
+      signal: input.signal,
+      emitLog: (s) => emit.log(s)
+    });
+
     return {
       status: allFacts.length > 0 ? "succeeded" : "partial",
       durationMs: totalDuration,
@@ -159,13 +163,14 @@ export const spiderTool: ToolDefinition = {
         stderrSnippet: undefined
       },
       facts: allFacts,
-      findings: allFindings,
+      findings: webLlm.findings,
       recommendations: recs,
       meta: {
         exitCode: worstExit,
         seedUrls: seeds,
         depth,
         urlsDiscovered: allFacts.length,
+        webFindingsLlm: webLlm.meta,
         commandSummary: `Crawl ${seeds.length} seed URL(s) with katana (depth=${depth}, scope=${fieldScope}) and emit discovered URLs as facts`
       }
     };
@@ -240,14 +245,7 @@ function parsePlainUrlLine(line: string): string | undefined {
   }
 }
 
-function ingestJsonlLine(
-  trimmed: string,
-  seedUrl: string,
-  facts: ToolEnvelope["facts"],
-  findings: ToolEnvelope["findings"],
-  seen: Set<string>,
-  seenFindingFp: Set<string>
-): void {
+function ingestJsonlLine(trimmed: string, facts: ToolEnvelope["facts"], seen: Set<string>): void {
   let obj: Record<string, unknown>;
   try {
     obj = JSON.parse(trimmed) as Record<string, unknown>;
@@ -260,29 +258,19 @@ function ingestJsonlLine(
   if (!endpoint) return;
   const status = typeof res.status_code === "number" ? (res.status_code as number) : null;
   const method = typeof req.method === "string" ? (req.method as string) : "GET";
-  recordDiscoveredUrl(endpoint, method, status, seedUrl, facts, findings, seen, seenFindingFp);
+  recordDiscoveredUrl(endpoint, method, status, facts, seen);
 }
 
-function ingestPlainUrlLine(
-  endpoint: string,
-  seedUrl: string,
-  facts: ToolEnvelope["facts"],
-  findings: ToolEnvelope["findings"],
-  seen: Set<string>,
-  seenFindingFp: Set<string>
-): void {
-  recordDiscoveredUrl(endpoint, "GET", null, seedUrl, facts, findings, seen, seenFindingFp);
+function ingestPlainUrlLine(endpoint: string, facts: ToolEnvelope["facts"], seen: Set<string>): void {
+  recordDiscoveredUrl(endpoint, "GET", null, facts, seen);
 }
 
 function recordDiscoveredUrl(
   endpoint: string,
   method: string,
   status: number | null,
-  seedUrl: string,
   facts: ToolEnvelope["facts"],
-  findings: ToolEnvelope["findings"],
-  seen: Set<string>,
-  seenFindingFp: Set<string>
+  seen: Set<string>
 ): void {
   const key = `${method} ${endpoint}`;
   if (seen.has(key)) return;
@@ -293,45 +281,6 @@ function recordDiscoveredUrl(
     value: { url: endpoint, status, method },
     source: "katana"
   });
-
-  let path = "";
-  try {
-    path = new URL(endpoint).pathname || "";
-  } catch {
-    return;
-  }
-  if (!INTERESTING_PATH.test(path)) return;
-
-  if (status !== null && [200, 301, 302, 401, 403].includes(status)) {
-    const fp = `spider|${seedUrl}|${path || endpoint}|${status}`;
-    if (seenFindingFp.has(fp)) return;
-    seenFindingFp.add(fp);
-    findings.push({
-      title: `Interesting web path discovered: ${path || endpoint}`,
-      severity: status === 200 ? "medium" : "low",
-      evidence: `${endpoint} -> HTTP ${status} (${method})`,
-      fingerprint: fp,
-      confidence: "high",
-      requiresVerification: false,
-      claimType: "web_path"
-    });
-    return;
-  }
-
-  if (status === null) {
-    const fp = `spider|${seedUrl}|${path || endpoint}|plain`;
-    if (seenFindingFp.has(fp)) return;
-    seenFindingFp.add(fp);
-    findings.push({
-      title: `Interesting web path discovered: ${path || endpoint}`,
-      severity: "low",
-      evidence: `${endpoint} (Katana; HTTP status not captured in output)`,
-      fingerprint: fp,
-      confidence: "medium",
-      requiresVerification: true,
-      claimType: "web_path"
-    });
-  }
 }
 
 function clampInt(v: number, min: number, max: number): number {

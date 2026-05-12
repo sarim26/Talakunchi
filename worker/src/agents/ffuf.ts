@@ -1,5 +1,6 @@
 import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
 import { remoteScript, requireRemoteTool, snippet } from "./shared.js";
+import { findingsFromWebFactsLlm } from "./webPathFindingsLlm.js";
 import { getWordlistCatalog, isWordlistAllowed } from "./wordlists.js";
 
 const FFUF_BIN = "ffuf";
@@ -100,7 +101,6 @@ export const ffufTool: ToolDefinition = {
     const timeoutSec = Math.max(2, Math.min(30, Number(args.timeoutSec ?? 6)));
 
     const allFacts: ToolEnvelope["facts"] = [];
-    const allFindings: ToolEnvelope["findings"] = [];
     const allCommands: string[] = [];
     let totalDurationMs = 0;
     let stdoutAgg = "";
@@ -139,10 +139,9 @@ export const ffufTool: ToolDefinition = {
         continue;
       }
 
-      const { facts, findings } = parseFfufJson(r.stdout, targetUrl);
+      const facts = parseFfufJson(r.stdout);
       if (facts.length > 0) anyRunOk = true;
       allFacts.push(...facts);
-      allFindings.push(...findings);
     }
 
     if (anyWordlistMissing) {
@@ -157,12 +156,20 @@ export const ffufTool: ToolDefinition = {
       };
     }
 
+    const webLlm = await findingsFromWebFactsLlm({
+      tool: "recon.ffuf",
+      targetHost: input.target.host,
+      facts: allFacts,
+      signal: input.signal,
+      emitLog: (s) => emit.log(s)
+    });
+
     return {
       status: allFacts.length > 0 ? "succeeded" : anyRunOk ? "partial" : "partial",
       durationMs: totalDurationMs,
       artifacts: { commands: allCommands, stdoutSnippet: snippet(stdoutAgg), stderrSnippet: snippet(stderrAgg) },
       facts: allFacts,
-      findings: allFindings,
+      findings: webLlm.findings,
       recommendations: [],
       meta: {
         exitCode: null,
@@ -170,6 +177,7 @@ export const ffufTool: ToolDefinition = {
         wordlist,
         wordlistSource,
         matched: allFacts.length,
+        webFindingsLlm: webLlm.meta,
         commandSummary: `Fuzz ${targets.length} target URL(s) with ffuf (codes ${matchCodes}, threads ${threads}) and lift matches as web_path facts.`
       }
     };
@@ -270,13 +278,12 @@ function collectTargetUrls(
   return out;
 }
 
-function parseFfufJson(stdout: string, targetUrl: string): { facts: ToolEnvelope["facts"]; findings: ToolEnvelope["findings"] } {
+function parseFfufJson(stdout: string): ToolEnvelope["facts"] {
   const facts: ToolEnvelope["facts"] = [];
-  const findings: ToolEnvelope["findings"] = [];
 
   const jsonStart = stdout.indexOf("{", stdout.indexOf("==== FFUF_JSON ===="));
   const jsonEnd = stdout.lastIndexOf("}");
-  if (jsonStart < 0 || jsonEnd <= jsonStart) return { facts, findings };
+  if (jsonStart < 0 || jsonEnd <= jsonStart) return facts;
 
   try {
     const parsed = JSON.parse(stdout.slice(jsonStart, jsonEnd + 1)) as Record<string, unknown>;
@@ -291,34 +298,10 @@ function parseFfufJson(stdout: string, targetUrl: string): { facts: ToolEnvelope
         value: { url, status, length },
         source: "ffuf"
       });
-
-      let path = "";
-      try {
-        path = new URL(url).pathname || "";
-      } catch {
-        path = url;
-      }
-      if (
-        status !== null &&
-        [200, 301, 302, 401, 403].includes(status) &&
-        /(admin|login|api|graphql|swagger|openapi|actuator|wp-admin|wp-login|phpmyadmin|backup|config|setup|debug|jenkins|kibana|grafana|drupal|uploads)|(?:^|\/)chats?(?:\/|$)/i.test(
-          path
-        )
-      ) {
-        findings.push({
-          title: `Interesting web path discovered: ${path}`,
-          severity: status === 200 ? "medium" : "low",
-          evidence: `${url} → HTTP ${status}${length !== null ? ` (${length}b)` : ""}`,
-          fingerprint: `ffuf|${targetUrl}|${path}|${status}`,
-          confidence: "high",
-          requiresVerification: false,
-          claimType: "web_path"
-        });
-      }
     }
   } catch {
     // ignore
   }
 
-  return { facts, findings };
+  return facts;
 }

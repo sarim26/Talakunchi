@@ -3,13 +3,6 @@ import { env } from "../env.js";
 import { chatJSON } from "../llm/ollama.js";
 import type { ToolEnvelope, ToolFact } from "../mcp/types.js";
 
-const ObservationSchema = z.object({
-  url: z.string().min(1),
-  httpStatus: z.number().int().nullable(),
-  method: z.string().nullable().optional(),
-  responseBytes: z.number().int().nullable().optional()
-});
-
 const LlmFindingSchema = z.object({
   title: z.string().min(1),
   severity: z.enum(["info", "low", "medium", "high", "critical"]),
@@ -21,7 +14,12 @@ const LlmOutputSchema = z.object({
   findings: z.array(LlmFindingSchema).max(80)
 });
 
-export type WebObservation = z.infer<typeof ObservationSchema>;
+export type WebObservation = {
+  url: string;
+  httpStatus: number | null;
+  method?: string | null;
+  responseBytes?: number | null;
+};
 
 /**
  * Turn `web_path` / `web_url` facts into security findings using the specialist
@@ -61,6 +59,7 @@ export async function findingsFromWebFactsLlm(opts: {
     "- Do NOT invent URLs, ports, products, or CVEs — only use observations from the input.",
     "- Do NOT provide exploitation steps or payloads.",
     "- Skip noise: generic 200 OK on '/', favicon.ico, robots.txt alone, etc., unless clearly sensitive.",
+    "- Observations with null httpStatus are often historical (e.g. Wayback) — still surface notable admin/API paths as informational clues when appropriate.",
     "- Prefer: auth misconfigs (403 on sensitive files), directory listings, admin/login panels, debug/test endpoints,",
     "  source/config backup paths, server-status, graphql/swagger exposure, redirects to sensitive areas, etc.",
     "- severity: use \"info\" for minor; escalate only when impact is clear from the path/status alone.",
@@ -117,25 +116,22 @@ export async function findingsFromWebFactsLlm(opts: {
           modelUsed: model,
           sentCount: prioritized.length,
           inputCount: observations.length,
-          diag: parsed.error.errors.slice(0, 3).map((e) => `${e.path.join(".")}: ${e.message}`).join("; ")
+          diag: parsed.error.issues.slice(0, 3).map((e) => `${e.path.join(".")}: ${e.message}`).join("; ")
         }
       };
     }
 
-    const allowedUrls = new Set(prioritized.map((o) => o.url));
+    const urlPool = prioritized.map((o) => o.url);
     const out: ToolEnvelope["findings"] = [];
     const seenFp = new Set<string>();
 
     for (const f of parsed.data.findings) {
-      const urlInEvidence = prioritized.some((o) => f.evidence.includes(o.url));
-      if (!urlInEvidence) continue;
-
-      const matchedUrl = prioritized.find((o) => f.evidence.includes(o.url))?.url;
-      if (matchedUrl && !allowedUrls.has(matchedUrl)) continue;
+      const matchedUrl = longestUrlContainedIn(f.evidence, urlPool);
+      if (!matchedUrl) continue;
 
       const fp =
         f.fingerprint?.trim() ||
-        `llm-web|${opts.tool}|${matchedUrl ?? "unknown"}|${f.severity}`;
+        `llm-web|${opts.tool}|${matchedUrl}|${f.severity}`;
       if (seenFp.has(fp)) continue;
       seenFp.add(fp);
 
@@ -191,6 +187,15 @@ function extractObservations(facts: ToolFact[]): WebObservation[] {
     });
   }
   return dedupeObservations(out);
+}
+
+function longestUrlContainedIn(evidence: string, urls: string[]): string | null {
+  let best: string | null = null;
+  for (const u of urls) {
+    if (!evidence.includes(u)) continue;
+    if (!best || u.length > best.length) best = u;
+  }
+  return best;
 }
 
 function dedupeObservations(rows: WebObservation[]): WebObservation[] {

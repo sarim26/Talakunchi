@@ -1,6 +1,7 @@
 import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
 import { remoteScript, snippet } from "./shared.js";
 import { getWordlistCatalog, isWordlistAllowed } from "./wordlists.js";
+import { findingsFromWebFactsLlm } from "./webPathFindingsLlm.js";
 
 type GobusterArgs = {
   url?: string;
@@ -90,7 +91,6 @@ export const gobusterTool: ToolDefinition = {
     const threads = Math.max(1, Math.min(50, Number(args.threads ?? 20)));
 
     const allFacts: ToolEnvelope["facts"] = [];
-    const allFindings: ToolEnvelope["findings"] = [];
     const allCommands: string[] = [];
     let totalDurationMs = 0;
     let stdoutAgg = "";
@@ -137,9 +137,8 @@ export const gobusterTool: ToolDefinition = {
       }
 
       anyRunOk = true;
-      const { facts, findings } = collectGobusterFactsFindings(r.stdout, url);
+      const facts = collectGobusterFacts(r.stdout, url);
       allFacts.push(...facts);
-      allFindings.push(...findings);
     }
 
     if (anyWordlistMissing) {
@@ -183,18 +182,27 @@ export const gobusterTool: ToolDefinition = {
     const status: ToolEnvelope["status"] =
       (anyHardFailure && anyRunOk) || (anyFlagErr && anyRunOk) ? "partial" : "succeeded";
 
+    const webLlm = await findingsFromWebFactsLlm({
+      tool: "recon.gobuster",
+      targetHost: input.target.host,
+      facts: allFacts,
+      signal: input.signal,
+      emitLog: (s) => emit.log(s)
+    });
+
     return {
       status,
       durationMs: totalDurationMs,
       artifacts: { commands: allCommands, stdoutSnippet: snippet(stdoutAgg), stderrSnippet: snippet(stderrAgg) },
       facts: allFacts,
-      findings: allFindings,
+      findings: webLlm.findings,
       recommendations: [],
       meta: {
         wordlist,
         wordlistSource,
         count: allFacts.length,
         bases,
+        webFindingsLlm: webLlm.meta,
         commandSummary: `Brute-force common web paths on ${bases.length} base URL(s) using gobuster.`
       }
     };
@@ -258,11 +266,7 @@ function applyBasePath(url: string, basePath: string | undefined): string {
   }
 }
 
-function collectGobusterFactsFindings(
-  stdout: string,
-  url: string
-): { facts: ToolEnvelope["facts"]; findings: ToolEnvelope["findings"] } {
-  const findings: ToolEnvelope["findings"] = [];
+function collectGobusterFacts(stdout: string, url: string): ToolEnvelope["facts"] {
   const facts: ToolEnvelope["facts"] = [];
 
   const lines = stdout
@@ -302,25 +306,9 @@ function collectGobusterFactsFindings(
     if (!fullUrl) continue;
 
     facts.push({ type: "web_path", value: { url: fullUrl, status: code }, source: "gobuster" });
-
-    const interesting =
-      /(phpmyadmin|drupal|wp-admin|wp-login|admin|login|uploads|backup|config|setup|test|debug|api|graphql)|(?:^|\/)chats?(?:\/|$)/i.test(
-        path ?? fullUrl
-      );
-    if (interesting && [200, 301, 302, 401, 403].includes(code)) {
-      findings.push({
-        title: `Interesting web path discovered: ${path ?? fullUrl}`,
-        severity: code === 200 ? "medium" : "low",
-        evidence: `${fullUrl} → HTTP ${code}`,
-        fingerprint: `gobuster|${url}|${path ?? fullUrl}|${code}`,
-        confidence: "high",
-        requiresVerification: false,
-        claimType: "web_path"
-      });
-    }
   }
 
-  return { facts, findings };
+  return facts;
 }
 
 function quote(s: string) {

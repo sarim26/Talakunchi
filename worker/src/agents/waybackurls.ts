@@ -1,9 +1,8 @@
 import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
 import { remoteScript, requireRemoteTool, snippet } from "./shared.js";
+import { findingsFromWebFactsLlm } from "./webPathFindingsLlm.js";
 
 const WAYBACK_BIN = "waybackurls";
-const INTERESTING_PATH =
-  /(phpmyadmin|drupal|wp-admin|wp-login|admin|login|signin|signup|register|uploads?|backup|config|setup|test|debug|api|graphql|swagger|openapi|actuator|jenkins|kibana|grafana|metrics|console|jmx-console|server-status)|(?:^|\/)chats?(?:\/|$)/i;
 
 /**
  * Suggested non-apt install: golang + go install.
@@ -78,7 +77,6 @@ export const waybackUrlsTool: ToolDefinition = {
     const r = await remoteScript(script, input.signal, (s) => emit.log(s));
 
     const facts: ToolEnvelope["facts"] = [];
-    const findings: ToolEnvelope["findings"] = [];
     const seen = new Set<string>();
 
     for (const raw of r.stdout.split("\n")) {
@@ -101,24 +99,15 @@ export const waybackUrlsTool: ToolDefinition = {
         value: { url: href, status: null, method: "GET" },
         source: "waybackurls"
       });
-
-      // Promote high-signal historical paths so operators see them even if
-      // they 404 today — they're often great clues about removed admin UIs.
-      if (INTERESTING_PATH.test(url.pathname)) {
-        const fp = `waybackurls|${host}|${url.pathname}`;
-        if (!findings.some((f) => f.fingerprint === fp)) {
-          findings.push({
-            title: `Historical web path observed: ${url.pathname}`,
-            severity: "info",
-            evidence: `Archived URL: ${href}`,
-            fingerprint: fp,
-            confidence: "medium",
-            requiresVerification: true,
-            claimType: "historical_web_path"
-          });
-        }
-      }
     }
+
+    const webLlm = await findingsFromWebFactsLlm({
+      tool: "recon.waybackurls",
+      targetHost: input.target.host,
+      facts,
+      signal: input.signal,
+      emitLog: (s) => emit.log(s)
+    });
 
     const errTail = (r.stderr ?? "").trim();
     const privateIp = isPrivateOrReservedIp(host);
@@ -134,7 +123,7 @@ export const waybackUrlsTool: ToolDefinition = {
       durationMs: r.durationMs,
       artifacts: { commands: r.commands, stdoutSnippet: snippet(r.stdout), stderrSnippet: snippet(r.stderr) },
       facts,
-      findings,
+      findings: webLlm.findings,
       recommendations:
         facts.length > 0
           ? [
@@ -150,6 +139,7 @@ export const waybackUrlsTool: ToolDefinition = {
         host,
         urlsDiscovered: facts.length,
         noArchivedUrls: facts.length === 0,
+        webFindingsLlm: webLlm.meta,
         ...(noRowsHint ? { noRowsHint } : {}),
         ...(errTail ? { waybackStderrSnippet: snippet(errTail, 800) } : {}),
         commandSummary: `Pull Wayback Machine URLs for ${host} (limit ${limit}) and emit each unique URL as a web_url fact.`
