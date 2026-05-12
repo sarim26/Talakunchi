@@ -119,17 +119,27 @@ function sanitizeDraft(
       const ok: string[] = [];
       for (const item of v) {
         if (typeof item !== "string") continue;
-        try {
-          const u = new URL(item.trim());
-          if (u.hostname !== ctx.target.host) {
-            dropped.push(`urls item (host ${u.hostname} != target)`);
-            continue;
+        const t = item.trim();
+        if (!t) continue;
+        if (/^https?:\/\//i.test(t)) {
+          try {
+            const u = new URL(t);
+            if (u.hostname !== ctx.target.host) {
+              dropped.push(`urls item (host ${u.hostname} != target ${ctx.target.host})`);
+              continue;
+            }
+            if (u.protocol !== "http:" && u.protocol !== "https:") continue;
+            ok.push(u.href);
+          } catch {
+            dropped.push("urls item (invalid URL)");
           }
-          if (u.protocol !== "http:" && u.protocol !== "https:") continue;
-          ok.push(u.href);
-        } catch {
-          dropped.push("urls item (invalid URL)");
+          continue;
         }
+        if (t.length > 800 || /\s/.test(t) || t.includes("..")) {
+          dropped.push("urls item (unsafe or invalid path)");
+          continue;
+        }
+        ok.push(t.startsWith("/") ? t : `/${t}`);
       }
       if (ok.length) cleaned[k] = ok;
       continue;
@@ -206,7 +216,7 @@ export async function draftExecutionPayload(input: ExecutionWriterInput): Promis
     `- Tool: ${tool.name}.`,
     `- Tool description: ${tool.description}`,
     `- Tool argSchema (use ONLY these keys): ${JSON.stringify(tool.argSchema ?? {}, null, 0)}`,
-    `- Target host MUST equal: ${context.target.host}. Any url, urls[], http_targets[], or targetUrl must use this host.`,
+    `- Target host MUST equal: ${context.target.host}. Full URLs must use this host; \`urls\` may also use path-only strings (e.g. /uploads/) expanded per args.ports / context.`,
     "- If a wordlist is needed, choose an absolute path from the provided SecLists catalog.",
     "- Do not invent unknown keys. Omit fields you are unsure about (defaults will apply).",
     "- Do not include a 'tool' or 'name' field; just args.",

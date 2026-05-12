@@ -1321,7 +1321,8 @@ app.get("/api/agent-tools", async () => {
     },
     {
       name: "recon.http_probe",
-      description: "Probe HTTP/HTTPS endpoints on a target with httpx and capture status, title, server header and detected tech.",
+      description:
+        "Probe HTTP/HTTPS with httpx: full URLs on the target, path-only paths (e.g. /uploads/) expanded per ports/context, or nmap-style services rows.",
       tags: ["recon", "web"]
     },
     {
@@ -1351,7 +1352,8 @@ app.get("/api/agent-tools", async () => {
     },
     {
       name: "recon.waybackurls",
-      description: "Query the Wayback Machine for historical URLs of the target host (read-only to archive.org).",
+      description:
+        "Query the Wayback Machine (CDX) for historical URLs of the target host. Expect empty results for private RFC1918 IPs and hosts never crawled on the public web.",
       tags: ["recon", "web", "amplification"]
     },
     {

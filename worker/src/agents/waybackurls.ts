@@ -28,20 +28,24 @@ const WAYBACK_INSTALL_COMMAND = [
 export const waybackUrlsTool: ToolDefinition = {
   name: "recon.waybackurls",
   description:
-    "Backup endpoint discovery: query the Wayback Machine for historical URLs of the target host (used when katana finds few endpoints).",
+    "Backup endpoint discovery: query the Wayback CDX for historical URLs of the target host. Usually empty for private IPs (RFC1918) and hosts never archived on the public web.",
   tags: ["recon", "web", "amplification"],
   requires: ["target"],
   defaultTimeoutMs: 3 * 60 * 1000,
   argSchema: {
-    host: { type: "string", description: "Hostname to query (defaults to the run's target host)" },
+    host: {
+      type: "string",
+      description: "Host to query (must match run target). Wayback CDX is usually empty for RFC1918/private IPs and hosts never crawled on the public web."
+    },
     limit: { type: "number", default: 500 }
   },
   handler: async (input, emit): Promise<ToolEnvelope> => {
-    const args = (input.args ?? {}) as { host?: string; limit?: number };
-    const host = (args.host && args.host.trim()) || input.target.host;
+    const args = (input.args ?? {}) as { host?: string; limit?: number; target?: string };
+    const rawHost = (args.host && args.host.trim()) || input.target.host;
+    const host = rawHost.trim();
     const limit = Math.max(10, Math.min(2000, Number(args.limit ?? 500)));
 
-    if (host !== input.target.host) {
+    if (normHost(host) !== normHost(input.target.host)) {
       return {
         status: "skipped",
         error: `Refusing to query non-target host: ${host}`,
@@ -56,10 +60,17 @@ export const waybackUrlsTool: ToolDefinition = {
     const presence = await requireRemoteTool(WAYBACK_BIN, input.signal, { installCommand: WAYBACK_INSTALL_COMMAND });
     if (presence.missing) return presence.envelope;
 
+    // Write full waybackurls output to a temp file, then head(1) the file.
+    // `… | waybackurls | head` closes the pipe early → SIGPIPE on waybackurls and
+    // can yield empty stdout even when CDX returns rows; buffering to disk avoids that.
     const script = [
       `set +e`,
-      // waybackurls reads hostnames from stdin; we feed exactly one.
-      `printf '%s\\n' ${quote(host)} | ${WAYBACK_BIN} | head -n ${limit}`
+      `TMP=$(mktemp) || exit 1`,
+      `ERR=$(mktemp) || { rm -f "$TMP"; exit 1; }`,
+      `printf '%s\\n' ${quote(host)} | ${WAYBACK_BIN} >"$TMP" 2>"$ERR" || true`,
+      `head -n ${limit} "$TMP"`,
+      `if [ -s "$ERR" ]; then cat "$ERR" >&2; fi`,
+      `rm -f "$TMP" "$ERR"`
     ].join("\n");
 
     emit.log(`Pulling Wayback Machine URLs for ${host} (limit ${limit})`);
@@ -79,7 +90,7 @@ export const waybackUrlsTool: ToolDefinition = {
         continue;
       }
       // Keep only URLs on the run's target host (defence-in-depth).
-      if (url.hostname !== host) continue;
+      if (normHost(url.hostname) !== normHost(host)) continue;
       const href = url.href;
       if (seen.has(href)) continue;
       seen.add(href);
@@ -108,6 +119,15 @@ export const waybackUrlsTool: ToolDefinition = {
       }
     }
 
+    const errTail = (r.stderr ?? "").trim();
+    const privateIp = isPrivateOrReservedIp(host);
+    const noRowsHint =
+      facts.length === 0
+        ? privateIp
+          ? "CDX usually has no public crawl history for private (RFC1918) IPs like this target — Wayback is scoped to the public web."
+          : "CDX returned no URLs for this host (never publicly crawled, or archive gap). Check stderr for HTTP errors from archive.org."
+        : undefined;
+
     return {
       status: facts.length > 0 ? "succeeded" : "partial",
       durationMs: r.durationMs,
@@ -128,11 +148,33 @@ export const waybackUrlsTool: ToolDefinition = {
         exitCode: r.exitCode,
         host,
         urlsDiscovered: facts.length,
+        noArchivedUrls: facts.length === 0,
+        ...(noRowsHint ? { noRowsHint } : {}),
+        ...(errTail ? { waybackStderrSnippet: snippet(errTail, 800) } : {}),
         commandSummary: `Pull Wayback Machine URLs for ${host} (limit ${limit}) and emit each unique URL as a web_url fact.`
       }
     };
   }
 };
+
+function normHost(h: string): string {
+  return h.trim().replace(/\.$/, "").toLowerCase();
+}
+
+/** Rough check for addresses that almost never appear in public Wayback CDX. */
+function isPrivateOrReservedIp(host: string): boolean {
+  const h = normHost(host);
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return false;
+  const oct = h.split(".").map((x) => Number(x));
+  if (oct.some((n) => !Number.isFinite(n) || n > 255)) return false;
+  const [a, b] = oct;
+  if (a === 10) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 127) return true;
+  if (a === 0) return true;
+  return false;
+}
 
 function quote(s: string) {
   return `'${s.replace(/'/g, `'\\''`)}'`;
