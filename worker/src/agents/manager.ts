@@ -116,6 +116,11 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
     };
   }
 
+  // Deterministic coverage-first rule: if key services exist but their
+  // enumerators haven't run yet, prioritize them before web expansion loops.
+  const coverage = coverageFirstDecision(server, ctx);
+  if (coverage) return coverage;
+
   const llmDecision = await tryLlmDecision(server, ctx, signal);
   if (llmDecision) {
     if (llmDecision.action === "stop") return llmDecision;
@@ -133,6 +138,48 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
     reason:
       "Manager LLM did not return usable JSON after retries, no runnable queued recommendation matched, and steps remain. Check Ollama; try a stronger JSON-capable model or OLLAMA_MANAGER_MODEL with more context."
   };
+}
+
+function coverageFirstDecision(server: MCPServer, ctx: ManagerContext): ManagerDecision | null {
+  const services = ctx.knownServices ?? [];
+  const history = ctx.invocationHistory ?? [];
+  const ran = new Set(history.map((h) => (h.tool || "").trim()).filter(Boolean));
+
+  const hasSmb = services.some((s) => s.protocol === "tcp" && (s.port === 445 || s.port === 139 || /^smb/i.test(s.name ?? "") || /^netbios/i.test(s.name ?? "")));
+  if (hasSmb && server.has("recon.smb_enum") && !ran.has("recon.smb_enum")) {
+    return {
+      action: "invoke",
+      tool: "recon.smb_enum",
+      intentGoal: "Enumerate SMB shares, users, and signing posture (coverage-first)",
+      args: { services },
+      reasoning: "Coverage-first: SMB (139/445) is present but smb_enum has not been run yet"
+    };
+  }
+
+  const hasSsh = services.some((s) => s.protocol === "tcp" && (s.port === 22 || /^ssh$/i.test(s.name ?? "") || /openssh/i.test(`${s.product ?? ""} ${s.name ?? ""}`)));
+  if (hasSsh && server.has("recon.ssh_enum") && !ran.has("recon.ssh_enum")) {
+    return {
+      action: "invoke",
+      tool: "recon.ssh_enum",
+      intentGoal: "Audit SSH configuration and known CVEs with ssh-audit (coverage-first)",
+      args: { services },
+      reasoning: "Coverage-first: SSH is present but ssh_enum has not been run yet"
+    };
+  }
+
+  // If services exist but the enrich step hasn't run, do it once to attach
+  // vulnerability context before spending more steps on web brute force.
+  if (services.length > 0 && server.has("recon.cve_enricher") && !ran.has("recon.cve_enricher")) {
+    return {
+      action: "invoke",
+      tool: "recon.cve_enricher",
+      intentGoal: "Enrich discovered services with offline CVE heuristics (coverage-first)",
+      args: { services },
+      reasoning: "Coverage-first: services are known but cve_enricher has not been run yet"
+    };
+  }
+
+  return null;
 }
 
 async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: AbortSignal): Promise<ManagerDecision | null> {
