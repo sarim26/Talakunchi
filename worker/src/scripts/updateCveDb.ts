@@ -1,4 +1,4 @@
-import { writeFile, mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 
@@ -18,7 +18,9 @@ async function main() {
     process.exit(2);
   }
 
-  const outPath = path.resolve(process.env.CVE_HEURISTICS_PATH || path.resolve(process.cwd(), "data", "cve-heuristics.json"));
+  const outPath = path.resolve(
+    process.env.CVE_HEURISTICS_PATH || path.resolve(process.cwd(), "data", "cve-heuristics.json")
+  );
 
   const res = await fetch(url, { headers: { "user-agent": "talakunchi-worker/0.1" } });
   if (!res.ok) {

@@ -431,3 +431,16 @@ export async function explainAgentRun(id: string) {
   return http(`/api/agent-runs/${id}/explain`, { method: "POST", body: "{}" }, AgentRunSummarySchema);
 }
 
+export const AgentRunReportSchema = z.object({
+  mode: z.string(),
+  run: z.object({ id: z.string().uuid(), status: z.string() }).optional(),
+  title: z.string(),
+  markdown: z.string(),
+  error: z.string().optional()
+});
+export type AgentRunReport = z.infer<typeof AgentRunReportSchema>;
+
+export async function getAgentRunReport(id: string) {
+  return http(`/api/agent-runs/${id}/report`, { method: "POST", body: "{}" }, AgentRunReportSchema);
+}
+

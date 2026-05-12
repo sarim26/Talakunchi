@@ -28,8 +28,10 @@ import {
   AgentInvocation,
   AgentRun,
   AgentRunSummary,
+  AgentRunReport,
   AgentTool,
   explainAgentRun,
+  getAgentRunReport,
   getAgentRun,
   getAgentRunEvents,
   getAgentRunInvocations,
@@ -38,6 +40,7 @@ import {
   listTargets,
   startAgentRun
 } from "../../lib/api";
+import { jsPDF } from "jspdf";
 
 const STATUS_COLOR: Record<string, "default" | "primary" | "success" | "warning" | "error"> = {
   queued: "default",
@@ -306,6 +309,9 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
   const [summaryOpen, setSummaryOpen] = React.useState(false);
   const [summary, setSummary] = React.useState<AgentRunSummary | null>(null);
   const [summaryError, setSummaryError] = React.useState<string | null>(null);
+  const [reportOpen, setReportOpen] = React.useState(false);
+  const [report, setReport] = React.useState<AgentRunReport | null>(null);
+  const [reportError, setReportError] = React.useState<string | null>(null);
 
   const summaryM = useMutation({
     mutationFn: (id: string) => explainAgentRun(id),
@@ -316,6 +322,17 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
     },
     onSuccess: (data) => setSummary(data),
     onError: (err) => setSummaryError((err as Error)?.message ?? "Failed to generate summary")
+  });
+
+  const reportM = useMutation({
+    mutationFn: (id: string) => getAgentRunReport(id),
+    onMutate: () => {
+      setReport(null);
+      setReportError(null);
+      setReportOpen(true);
+    },
+    onSuccess: (data) => setReport(data),
+    onError: (err) => setReportError((err as Error)?.message ?? "Failed to generate report")
   });
 
   if (!run) {
@@ -376,6 +393,19 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
                     onClick={() => summaryM.mutate(run.id)}
                   >
                     {summaryM.isPending ? "Summarising…" : "AI Summary"}
+                  </Button>
+                </span>
+              </Tooltip>
+              <Tooltip title={summaryAvailable ? "Generate a detailed AI report + PDF export" : "Available once the run finishes"}>
+                <span>
+                  <Button
+                    size="small"
+                    variant="contained"
+                    color="error"
+                    disabled={!summaryAvailable || reportM.isPending}
+                    onClick={() => reportM.mutate(run.id)}
+                  >
+                    {reportM.isPending ? "Generating…" : "Detailed AI report"}
                   </Button>
                 </span>
               </Tooltip>
@@ -540,6 +570,36 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
         loading={summaryM.isPending}
         summary={summary}
         error={summaryError}
+      />
+
+      <ReportDialog
+        open={reportOpen}
+        onClose={() => setReportOpen(false)}
+        loading={reportM.isPending}
+        report={report}
+        error={reportError}
+        onDownloadPdf={() => {
+          const title = report?.title || `Security recon report`;
+          const md = report?.markdown || "";
+          const doc = new jsPDF({ unit: "pt", format: "a4" });
+          const margin = 40;
+          const pageWidth = doc.internal.pageSize.getWidth();
+          const maxWidth = pageWidth - margin * 2;
+          const text = toPlainText(md);
+          doc.setFont("helvetica", "normal");
+          doc.setFontSize(11);
+          const lines = doc.splitTextToSize(text, maxWidth);
+          let y = margin;
+          for (const line of lines) {
+            if (y > doc.internal.pageSize.getHeight() - margin) {
+              doc.addPage();
+              y = margin;
+            }
+            doc.text(line, margin, y);
+            y += 14;
+          }
+          doc.save(safeFilename(`${title}.pdf`));
+        }}
       />
     </Stack>
   );
@@ -974,6 +1034,66 @@ function Section(props: { title: string; items: string[] }) {
   );
 }
 
+function ReportDialog(props: {
+  open: boolean;
+  onClose: () => void;
+  loading: boolean;
+  report: AgentRunReport | null;
+  error: string | null;
+  onDownloadPdf: () => void;
+}) {
+  const { open, onClose, loading, report, error, onDownloadPdf } = props;
+  const friendlyError = React.useMemo(() => {
+    if (!error) return null;
+    const m = /Ollama HTTP \d+:\s*(.*)$/s.exec(error);
+    if (m?.[1]) return `Ollama error: ${m[1].slice(0, 240)}`;
+    if (/API 502/i.test(error) && /Ollama/i.test(error)) return "Detailed report failed (Ollama). Check Ollama RAM/model availability, then retry.";
+    return error.length > 260 ? `${error.slice(0, 260)}…` : error;
+  }, [error]);
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
+      <DialogTitle>Detailed AI report</DialogTitle>
+      <DialogContent>
+        {loading ? (
+          <Stack alignItems="center" spacing={1} sx={{ py: 4 }}>
+            <CircularProgress size={28} />
+            <Typography variant="caption" color="text.secondary">
+              Asking the local LLM to generate a detailed markdown report…
+            </Typography>
+          </Stack>
+        ) : null}
+
+        {friendlyError ? <Alert severity="error" sx={{ mb: 2 }}>{friendlyError}</Alert> : null}
+
+        {report?.error ? <Alert severity="warning" sx={{ mb: 2 }}>{report.error}</Alert> : null}
+
+        {report ? (
+          <Box sx={mono(520)}>
+            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
+              {report.title} · mode: {report.mode}
+            </Typography>
+            <Typography variant="caption" component="pre" sx={preSx}>
+              {report.markdown}
+            </Typography>
+          </Box>
+        ) : null}
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>Close</Button>
+        <Button
+          variant="contained"
+          color="error"
+          disabled={!report?.markdown}
+          onClick={onDownloadPdf}
+        >
+          Download PDF
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
 /* ------------------------------------------------------------------ *
  *  Helpers
  * ------------------------------------------------------------------ */
@@ -996,4 +1116,21 @@ function shortPath(p: string): string {
   if (p.length < 60) return p;
   const parts = p.split("/");
   return `…/${parts.slice(-3).join("/")}`;
+}
+
+function toPlainText(markdown: string): string {
+  // Minimal markdown → text conversion for PDF export.
+  // Keep headings and bullets readable without pulling in a full renderer.
+  return markdown
+    .replace(/\r\n/g, "\n")
+    .replace(/```[\s\S]*?```/g, (m) => m.replace(/```/g, "")) // keep code, drop fences
+    .replace(/#+\s*/g, "") // drop heading hashes
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[(.*?)\]\((.*?)\)/g, "$1 ($2)")
+    .trim();
+}
+
+function safeFilename(name: string): string {
+  return name.replace(/[<>:\"/\\|?*\u0000-\u001F]+/g, "_").slice(0, 180);
 }

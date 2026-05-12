@@ -271,3 +271,87 @@ function pickOverallRisk(findings: Array<{ severity: string }>): RunSummaryOutpu
   for (const lvl of order) if (findings.some((f) => f.severity === lvl)) return lvl;
   return "info";
 }
+
+/* ------------------------------------------------------------------ *
+ *  Run-level detailed report (markdown)
+ * ------------------------------------------------------------------ */
+
+export type RunReportInput = RunSummaryInput & {
+  /** Include more verbose evidence snippets if available. */
+  findings: Array<{ title: string; severity: string; evidence?: string | null }>;
+};
+
+export type RunReportOutput = {
+  title: string;
+  markdown: string;
+};
+
+export async function generateAgentRunReportWithOllama(input: RunReportInput): Promise<RunReportOutput> {
+  const system = [
+    "You are an internal security team assistant generating a DETAILED SCAN REPORT in Markdown.",
+    "Audience: security analyst + engineering owner. Be factual, structured, and actionable.",
+    "Constraints:",
+    "- Do NOT provide exploitation steps, payloads, or attacker tradecraft.",
+    "- Only use the data provided. Do not fabricate ports, products, versions, hostnames, or CVEs.",
+    "- Prefer tables/bullets. Include clear remediation guidance and verification steps.",
+    "",
+    "Output MUST be Markdown text (not JSON).",
+    "Structure:",
+    "1) Title + metadata (target, time/status, counts)",
+    "2) Executive summary",
+    "3) Attack surface overview (services table)",
+    "4) Findings (grouped by severity; include evidence snippets)",
+    "5) Recommended remediation plan (prioritized)",
+    "6) Verification checklist",
+    "7) Tooling / what was run (compact)",
+    "",
+    "Return ONLY the markdown body."
+  ].join("\n");
+
+  const compact = {
+    target: input.target,
+    status: input.status,
+    steps: input.steps,
+    counts: {
+      invocations: input.invocationCount,
+      findings: input.findingCount,
+      services: input.serviceCount
+    },
+    services: input.services.slice(0, 80),
+    findings: input.findings.slice(0, 120),
+    toolsUsed: input.toolsUsed.slice(0, 60),
+    decisions: input.decisions.slice(-60)
+  };
+
+  const user = `Scan data:\n${JSON.stringify(compact, null, 2)}`;
+
+  const body = {
+    model: env.OLLAMA_EXPLAIN_MODEL,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user }
+    ],
+    stream: false,
+    options: { temperature: 0.2, num_predict: 2200 }
+  };
+
+  let res: Response;
+  try {
+    res = await fetch(`${ollamaBase()}/api/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  } catch (err) {
+    throw new Error(`Ollama request failed (${ollamaBase()}): ${(err as Error).message}`);
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Ollama HTTP ${res.status}: ${text || res.statusText}`);
+  }
+  const data = (await res.json()) as { message?: { content?: string }; response?: string };
+  const markdown = String(data.message?.content ?? data.response ?? "").trim();
+
+  const title = `Security recon report: ${input.target.name || input.target.address}`;
+  return { title, markdown: markdown || `# ${title}\n\n(Empty report from AI.)\n` };
+}

@@ -5,9 +5,15 @@ const EnvSchema = z.object({
     NEO4J_URI: z.string().min(1),
     NEO4J_USER: z.string().min(1),
     NEO4J_PASSWORD: z.string().min(1),
-    AI_MODE: z.enum(["mock", "gemini"]).default("mock"),
-    GEMINI_API_KEY: z.string().optional(),
-    // Default to a commonly-available alias; can be overridden via .env
-    GEMINI_MODEL: z.string().optional().default("gemini-3.1-flash-lite-preview")
+    /** AI provider — Ollama only. Kept for compatibility with /api/ai/models clients. */
+    // Back-compat: some existing .env files may still set AI_MODE=gemini.
+    // We no longer support Gemini; treat it as "ollama" to keep the API booting.
+    AI_MODE: z
+        .enum(["mock", "ollama", "gemini"])
+        .default("ollama")
+        .transform((v) => (v === "gemini" ? "ollama" : v)),
+    OLLAMA_URL: z.string().min(1).default("http://localhost:11434"),
+    /** Default model used by /api/findings/:id/explain. */
+    OLLAMA_EXPLAIN_MODEL: z.string().min(1).default("qwen3:8b")
 });
 export const env = EnvSchema.parse(process.env);

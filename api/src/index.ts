@@ -5,7 +5,7 @@ import { env } from "./env.js";
 import { withClient } from "./db.js";
 import { withSession } from "./neo4j.js";
 import { CreateScanSchema, CreateTargetSchema, PipelineConfigSchema, UpdateFindingSchema } from "./schemas.js";
-import { explainWithOllama, listOllamaModels, summariseAgentRunWithOllama } from "./llm/ollama.js";
+import { explainWithOllama, generateAgentRunReportWithOllama, listOllamaModels, summariseAgentRunWithOllama } from "./llm/ollama.js";
 
 const app = Fastify({ logger: true });
 
@@ -1307,6 +1307,149 @@ app.post("/api/agent-runs/:id/explain", async (req, reply) => {
     ],
     whatWeDid: summaryInput.toolsUsed.slice(0, 8).map((t) => `${t.tool} (${t.status})`),
     verificationSteps: ["Re-run the agentic recon and confirm findings disappear or are downgraded."]
+  };
+});
+
+/**
+ * Run-level detailed AI report (markdown).
+ * Returns a long-form markdown report suitable for PDF export client-side.
+ */
+app.post("/api/agent-runs/:id/report", async (req, reply) => {
+  const id = z.string().uuid().parse((req.params as any).id);
+
+  const run = await withClient(async (c) => {
+    const r = await c.query(
+      `select ar.id, ar.status, ar.steps_taken, ar.invocation_count, ar.finding_count, ar.service_count,
+              t.name as target_name, t.address as target_address, t.id as target_id
+         from agent_runs ar join targets t on t.id = ar.target_id
+         where ar.id = $1`,
+      [id]
+    );
+    return r.rows[0];
+  });
+  if (!run) return reply.code(404).send({ error: "agent_run not found" });
+
+  const invocations = await withClient(async (c) => {
+    const r = await c.query(
+      `select tool, status, envelope, started_at, finished_at, args
+         from agent_invocations
+         where agent_run_id = $1
+         order by started_at asc`,
+      [id]
+    );
+    return r.rows;
+  });
+
+  const decisions = await withClient(async (c) => {
+    const r = await c.query(
+      `select payload, created_at
+         from agent_events
+         where agent_run_id = $1 and kind = 'manager.decision'
+         order by created_at asc
+         limit 80`,
+      [id]
+    );
+    return r.rows;
+  });
+
+  const services = await withClient(async (c) => {
+    const r = await c.query(
+      `select port, protocol, service_name, product, version
+         from services where target_id = $1
+         order by port asc`,
+      [run.target_id]
+    );
+    return r.rows;
+  });
+
+  const findings = await withClient(async (c) => {
+    const r = await c.query(
+      `select title, severity, evidence_redacted
+         from findings where target_id = $1
+         order by case severity
+                    when 'critical' then 0 when 'high' then 1
+                    when 'medium' then 2 when 'low' then 3 else 4 end asc,
+                  last_seen_at desc
+         limit 140`,
+      [run.target_id]
+    );
+    return r.rows;
+  });
+
+  const toolsUsed = invocations.map((i: any) => {
+    const env_ = (i.envelope ?? {}) as { artifacts?: { commands?: string[] }; durationMs?: number };
+    const cmd = Array.isArray(env_.artifacts?.commands) && env_.artifacts!.commands!.length > 0 ? String(env_.artifacts!.commands![0]) : null;
+    return {
+      tool: String(i.tool),
+      status: String(i.status),
+      durationMs: typeof env_.durationMs === "number" ? env_.durationMs : null,
+      commandSnippet: cmd ? cmd.slice(0, 240) : null
+    };
+  });
+
+  const reportInput = {
+    target: { name: String(run.target_name), address: String(run.target_address) },
+    status: String(run.status),
+    steps: Number(run.steps_taken ?? 0),
+    invocationCount: Number(run.invocation_count ?? 0),
+    findingCount: Number(run.finding_count ?? 0),
+    serviceCount: Number(run.service_count ?? 0),
+    toolsUsed,
+    services: services.map((s: any) => ({
+      port: Number(s.port),
+      protocol: String(s.protocol),
+      name: s.service_name ?? null,
+      product: s.product ?? null,
+      version: s.version ?? null
+    })),
+    findings: findings.map((f: any) => ({
+      title: String(f.title),
+      severity: String(f.severity),
+      evidence: f.evidence_redacted ? String(f.evidence_redacted).slice(0, 700) : null
+    })),
+    decisions: decisions.map((d: any, idx: number) => {
+      const p = (d.payload ?? {}) as { step?: number; decision?: { tool?: string; intentGoal?: string; reasoning?: string; action?: string; reason?: string } };
+      const dec = p.decision ?? {};
+      return {
+        step: typeof p.step === "number" ? p.step : idx + 1,
+        tool: dec.tool,
+        intent: dec.intentGoal,
+        reasoning: dec.reasoning,
+        reason: dec.action === "stop" ? dec.reason : undefined
+      };
+    })
+  };
+
+  if (env.AI_MODE === "ollama") {
+    try {
+      const out = await generateAgentRunReportWithOllama(reportInput);
+      return { mode: "ollama", run: { id: run.id, status: run.status }, ...out };
+    } catch (err) {
+      return reply.code(502).send({
+        mode: "ollama",
+        error: (err as Error).message,
+        title: `Security recon report: ${String(run.target_name)}`,
+        markdown: `# Security recon report: ${String(run.target_name)}\n\nAI report unavailable.\n\n- Error: ${(err as Error).message}\n`,
+        run: { id: run.id, status: run.status }
+      });
+    }
+  }
+
+  // Mock fallback
+  return {
+    mode: "mock",
+    run: { id: run.id, status: run.status },
+    title: `Security recon report: ${String(run.target_name)}`,
+    markdown:
+      `# Security recon report: ${String(run.target_name)}\\n\\n` +
+      `Target: ${String(run.target_address)}\\n\\n` +
+      `Findings: ${Number(run.finding_count ?? 0)}\\nServices: ${Number(run.service_count ?? 0)}\\n\\n` +
+      `## Findings (top)\\n` +
+      findings
+        .slice(0, 15)
+        .map((f: any) => `- **${String(f.severity).toUpperCase()}**: ${String(f.title)}`)
+        .join("\\n") +
+      `\\n`
   };
 });
 

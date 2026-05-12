@@ -41,9 +41,7 @@ export type LoadHeuristicsResult =
   | { source: "default"; path: string; heuristics: CompiledHeuristic[]; error?: string };
 
 export async function loadCveHeuristics(opts?: { path?: string }): Promise<LoadHeuristicsResult> {
-  const p = opts?.path
-    ? path.resolve(opts.path)
-    : path.resolve(process.cwd(), "data", "cve-heuristics.json");
+  const p = opts?.path ? path.resolve(opts.path) : path.resolve(process.cwd(), "data", "cve-heuristics.json");
 
   try {
     const raw = await readFile(p, "utf8");
