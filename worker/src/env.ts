@@ -16,7 +16,7 @@ const EnvSchema = z.object({
    */
   OLLAMA_URL: z.string().min(1).default("http://localhost:11434"),
   OLLAMA_MANAGER_MODEL: z.string().min(1).default("deepseek-r1:14b"),
-  OLLAMA_SPECIALIST_MODEL: z.string().min(1).default("qwen2.5-coder:14b"),
+  OLLAMA_SPECIALIST_MODEL: z.string().min(1).default("qwen2.5-coder:7b"),
   OLLAMA_PROMPTER_MODEL: z.string().min(1).default("qwen3:14b"),
   /**
    * Optional model for turning `web_path` / `web_url` facts into security findings

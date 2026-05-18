@@ -40,7 +40,7 @@ services:
       NEO4J_PASSWORD: "neo4jpassword"
       AI_MODE: "ollama"
       OLLAMA_URL: "${OLLAMA_URL:-http://host.docker.internal:11434}"
-      OLLAMA_EXPLAIN_MODEL: "${OLLAMA_EXPLAIN_MODEL:-qwen3:4b}"
+      OLLAMA_EXPLAIN_MODEL: "${OLLAMA_EXPLAIN_MODEL:-qwen3:14b}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -63,10 +63,10 @@ services:
       # MCP Recon system — Ollama models. The default URL points at the host
       # because Ollama is typically run on the developer's host, not inside Docker.
       OLLAMA_URL: "${OLLAMA_URL:-http://host.docker.internal:11434}"
-      OLLAMA_MANAGER_MODEL: "${OLLAMA_MANAGER_MODEL:-qwen3:14b}"
-      OLLAMA_SPECIALIST_MODEL: "${OLLAMA_SPECIALIST_MODEL:-qwen2.5-coder:14b}"
+      OLLAMA_MANAGER_MODEL: "${OLLAMA_MANAGER_MODEL:-deepseek-r1:14b}"
+      OLLAMA_SPECIALIST_MODEL: "${OLLAMA_SPECIALIST_MODEL:-qwen2.5-coder:7b}"
       # Post-prompter execution-command-writer (structured tool args). Defaults to specialist if unset.
-      OLLAMA_COMMAND_WRITER_MODEL: "${OLLAMA_COMMAND_WRITER_MODEL:-qwen2.5-coder:14b}"
+      OLLAMA_COMMAND_WRITER_MODEL: "${OLLAMA_COMMAND_WRITER_MODEL:-qwen2.5-coder:7b}"
       OLLAMA_PROMPTER_MODEL: "${OLLAMA_PROMPTER_MODEL:-qwen3:14b}"
       RECON_MAX_STEPS: "${RECON_MAX_STEPS:-20}"
       # Optional deterministic credential checks during scan stage (legacy hydra path)
