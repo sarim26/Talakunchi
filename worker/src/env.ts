@@ -15,9 +15,9 @@ const EnvSchema = z.object({
    * - command_writer: optional override for that same writer step only
    */
   OLLAMA_URL: z.string().min(1).default("http://localhost:11434"),
-  OLLAMA_MANAGER_MODEL: z.string().min(1).default("qwen3:8b"),
-  OLLAMA_SPECIALIST_MODEL: z.string().min(1).default("qwen3:8b"),
-  OLLAMA_PROMPTER_MODEL: z.string().min(1).default("qwen3:8b"),
+  OLLAMA_MANAGER_MODEL: z.string().min(1).default("deepseek-r1:14b"),
+  OLLAMA_SPECIALIST_MODEL: z.string().min(1).default("qwen2.5-coder:14b"),
+  OLLAMA_PROMPTER_MODEL: z.string().min(1).default("qwen3:14b"),
   /**
    * Optional model for turning `web_path` / `web_url` facts into security findings
    * (replaces static keyword lists). Defaults to `OLLAMA_SPECIALIST_MODEL`.
