@@ -48,7 +48,8 @@ export async function chat(opts: ChatOptions): Promise<ChatResponse> {
     format: opts.json ? "json" : undefined,
     options: {
       temperature: opts.temperature ?? 0.2,
-      num_predict: opts.maxTokens ?? 1024
+      num_predict: opts.maxTokens ?? 1024,
+      num_ctx: 8192
     }
   };
 

@@ -78,7 +78,7 @@ export async function explainWithOllama(input: ExplainInput): Promise<ExplainOut
     ],
     format: "json",
     stream: false,
-    options: { temperature: 0.2, num_predict: 700 }
+    options: { temperature: 0.2, num_predict: 700, num_ctx: 8192 }
   };
 
   let res: Response;
@@ -206,7 +206,7 @@ export async function summariseAgentRunWithOllama(input: RunSummaryInput): Promi
     ],
     format: "json",
     stream: false,
-    options: { temperature: 0.2, num_predict: 1100 }
+    options: { temperature: 0.2, num_predict: 1100, num_ctx: 8192 }
   };
 
   let res: Response;
@@ -332,7 +332,7 @@ export async function generateAgentRunReportWithOllama(input: RunReportInput): P
       { role: "user", content: user }
     ],
     stream: false,
-    options: { temperature: 0.2, num_predict: 2200 }
+    options: { temperature: 0.2, num_predict: 2200, num_ctx: 8192 }
   };
 
   let res: Response;
