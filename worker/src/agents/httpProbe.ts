@@ -1,22 +1,33 @@
 import { ToolDefinition, ToolEnvelope, type ToolInput } from "../mcp/types.js";
 import { remoteScript, requireRemoteTool, snippet } from "./shared.js";
+import {
+  buildOriginUrl,
+  detectCdnVendor,
+  emptyWebScanHints,
+  httpxExtraFlags,
+  isIpAddress,
+  looksLikeCdnBlock,
+  mergeWebScanHints,
+  parseCertHostnames,
+  resolveWebScanFromInput,
+  rewriteUrlsForVhost,
+  serializeWebScan,
+  shellQuote,
+  type WebScanHints
+} from "./webTarget.js";
 
 const HTTPX_BIN = "httpx-toolkit";
 
 /**
  * recon.http_probe — httpx JSON lines from explicit URLs or service rows.
  *
- * Resolution order:
- *   1) `args.urls` — full http(s) URLs on the target host, and/or **path-only**
- *      strings (e.g. `/uploads/`) expanded per `args.ports` and/or inferred web
- *      ports from `context.knownServices` (default port 80 if none).
- *   2) `args.services` — nmap-style rows (port + name); builds URLs for web-ish ports
- *   3) Legacy: infer candidate ports from `context.knownServices` plus optional `args.ports`
+ * When the target is an IP and the edge returns CDN 400 (e.g. AkamaiGHost),
+ * discovers TLS cert SAN names and retries with vhost URL + `-ip <target>`.
  */
 export const httpProbeTool: ToolDefinition = {
   name: "recon.http_probe",
   description:
-    "Probe HTTP/HTTPS with httpx: full URLs on the target, path-only paths (e.g. /uploads/) expanded per ports/context, or nmap-style services rows.",
+    "Probe HTTP/HTTPS with httpx. For IP targets behind CDN/WAF, auto-discovers vhost from TLS cert and retries with Host/SNI routing.",
   tags: ["recon", "web"],
   requires: ["services"],
   defaultTimeoutMs: 5 * 60 * 1000,
@@ -44,28 +55,29 @@ export const httpProbeTool: ToolDefinition = {
       services?: unknown;
     };
     const host = input.target.host;
+    let webScan = resolveWebScanFromInput(host, input.target.vhost, input.context?.webScan);
 
     const fromArgsPorts = (args.ports ?? []).filter((p): p is number => typeof p === "number" && Number.isFinite(p)).map((p) => Math.floor(p));
     const expansionPorts = webCandidatePortsForProbe(input.context?.knownServices, fromArgsPorts);
 
-    const fromUrls = buildProbeUrlsFromUrlsArg(args.urls, host, expansionPorts);
+    const fromUrls = buildProbeUrlsFromUrlsArg(args.urls, host, expansionPorts, webScan.vhost);
     if (fromUrls.length > 0) {
-      return runHttpx(fromUrls, host, input, emit, fromUrls.length, "urls");
+      return runHttpxWithVhostFallback(fromUrls, host, input, emit, fromUrls.length, "urls", webScan);
     }
 
     const fromServices = probeRowsFromServices(args.services, host);
     if (fromServices.length > 0) {
-      const urls = fromServices.map((kp) => `${kp.scheme}://${host}:${kp.port}/`);
-      return runHttpx(urls, host, input, emit, fromServices.length, "services");
+      const urls = fromServices.map((kp) => originUrlForProbe(host, kp.port, kp.scheme as "http" | "https", webScan));
+      return runHttpxWithVhostFallback(urls, host, input, emit, fromServices.length, "services", webScan, fromServices);
     }
 
     const knownPorts = (input.context?.knownServices ?? [])
       .filter((s) => /^http|^https|^web/i.test(s.name ?? "") || [80, 443, 8080, 8443].includes(s.port))
-      .map((s) => ({ port: s.port, scheme: s.port === 443 || s.port === 8443 ? "https" : "http" }));
+      .map((s) => ({ port: s.port, scheme: (s.port === 443 || s.port === 8443 ? "https" : "http") as "http" | "https" }));
 
     for (const p of fromArgsPorts) {
       const scheme = p === 443 || p === 8443 ? "https" : "http";
-      if (!knownPorts.some((kp) => kp.port === p)) knownPorts.push({ port: p, scheme });
+      if (!knownPorts.some((kp) => kp.port === p)) knownPorts.push({ port: p, scheme: scheme as "http" | "https" });
     }
 
     if (knownPorts.length === 0) {
@@ -77,19 +89,24 @@ export const httpProbeTool: ToolDefinition = {
         findings: [],
         recommendations: [],
         meta: {
-          commandSummary: `Probe HTTP/HTTPS endpoints on ${host} with httpx and capture status, headers, and title.`
+          commandSummary: `Probe HTTP/HTTPS endpoints on ${host} with httpx and capture status, headers, and title.`,
+          webScan: serializeWebScan(webScan)
         }
       };
     }
 
-    const urls = knownPorts.map((kp) => `${kp.scheme}://${host}:${kp.port}/`);
-    return runHttpx(urls, host, input, emit, knownPorts.length, "context", knownPorts);
+    const urls = knownPorts.map((kp) => originUrlForProbe(host, kp.port, kp.scheme, webScan));
+    return runHttpxWithVhostFallback(urls, host, input, emit, knownPorts.length, "context", webScan, knownPorts);
   }
 };
 
-type ProbeRow = { port: number; scheme: string };
+type ProbeRow = { port: number; scheme: "http" | "https" };
 
-/** Ports used to expand path-only `urls` (explicit ports ∪ inferred web ports from context). */
+function originUrlForProbe(host: string, port: number, scheme: "http" | "https", webScan: WebScanHints): string {
+  if (webScan.connectIp && webScan.vhost) return buildOriginUrl(webScan.vhost, port, scheme);
+  return buildOriginUrl(host, port, scheme);
+}
+
 function webCandidatePortsForProbe(
   knownServices: Array<{ port: number; protocol: string; name?: string }> | undefined,
   explicitPorts: number[]
@@ -106,18 +123,11 @@ function webCandidatePortsForProbe(
   return [...set].sort((a, b) => a - b);
 }
 
-function originBaseUrl(host: string, port: number): string {
-  const https = port === 443 || port === 8443;
-  const scheme = https ? "https" : "http";
-  const def = https ? 443 : 80;
-  if (port === def) return `${scheme}://${host}/`;
-  return `${scheme}://${host}:${port}/`;
-}
-
-function tryAbsoluteProbeUrl(s: string, host: string): string | null {
+function tryAbsoluteProbeUrl(s: string, host: string, vhost: string | null): string | null {
   try {
     const parsed = new URL(s.trim());
-    if (parsed.hostname !== host) return null;
+    const allowed = parsed.hostname === host || (vhost ? parsed.hostname === vhost : false);
+    if (!allowed) return null;
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
     return parsed.href;
   } catch {
@@ -125,7 +135,6 @@ function tryAbsoluteProbeUrl(s: string, host: string): string | null {
   }
 }
 
-/** Path segment(s) under the host — not a full URL; rejects traversal and odd whitespace. */
 function toPathForProbe(s: string): string | null {
   const t = s.trim();
   if (!t || t.length > 800) return null;
@@ -135,11 +144,7 @@ function toPathForProbe(s: string): string | null {
   return t.startsWith("/") ? t : `/${t}`;
 }
 
-/**
- * Build absolute probe URLs from `args.urls`: each entry is either a full URL on
- * `host`, or a path expanded across `expansionPorts` (falls back to `[80]`).
- */
-function buildProbeUrlsFromUrlsArg(urls: unknown, host: string, expansionPorts: number[]): string[] {
+function buildProbeUrlsFromUrlsArg(urls: unknown, host: string, expansionPorts: number[], vhost: string | null): string[] {
   if (!Array.isArray(urls) || urls.length === 0) return [];
   const ports = expansionPorts.length > 0 ? expansionPorts : [80];
   const out: string[] = [];
@@ -155,7 +160,7 @@ function buildProbeUrlsFromUrlsArg(urls: unknown, host: string, expansionPorts: 
     const s = raw.trim();
     if (!s) continue;
 
-    const absolute = tryAbsoluteProbeUrl(s, host);
+    const absolute = tryAbsoluteProbeUrl(s, host, vhost);
     if (absolute) {
       add(absolute);
       continue;
@@ -164,11 +169,12 @@ function buildProbeUrlsFromUrlsArg(urls: unknown, host: string, expansionPorts: 
     const path = toPathForProbe(s);
     if (!path) continue;
     for (const port of ports) {
-      const base = originBaseUrl(host, port);
+      const scheme = port === 443 || port === 8443 ? "https" : "http";
+      const base = buildOriginUrl(vhost ?? host, port, scheme);
       try {
         add(new URL(path, base).href);
       } catch {
-        // skip invalid combination
+        // skip
       }
     }
   }
@@ -195,32 +201,186 @@ function probeRowsFromServices(services: unknown, _host: string): ProbeRow[] {
   return rows;
 }
 
-async function runHttpx(
+type HttpxParseResult = {
+  facts: ToolEnvelope["facts"];
+  findings: ToolEnvelope["findings"];
+  cdnDetected: boolean;
+  cdnVendor: string | null;
+  hasLive: boolean;
+};
+
+async function discoverCertHostnames(connectIp: string, signal?: AbortSignal): Promise<string[]> {
+  const script = [
+    `set +e`,
+    `IP=${shellQuote(connectIp)}`,
+    `openssl s_client -connect "$IP:443" -servername "$IP" </dev/null 2>/dev/null | openssl x509 -noout -text 2>/dev/null || true`
+  ].join("\n");
+  const r = await remoteScript(script, signal);
+  return parseCertHostnames(r.stdout);
+}
+
+async function runHttpxWithVhostFallback(
   urls: string[],
   host: string,
   input: ToolInput,
   emit: { log: (s: string) => void },
   probedCount: number,
   mode: "urls" | "services" | "context",
+  webScan: WebScanHints,
   knownPorts?: ProbeRow[]
 ): Promise<ToolEnvelope> {
-  const presence = await requireRemoteTool(HTTPX_BIN, input.signal);
-  if (presence.missing) return presence.envelope;
+  let first = await runHttpxOnce(urls, host, input, emit, mode, webScan);
 
-  const urlArgs = urls.map((u) => quote(u)).join(" ");
-  const script = `printf '%s\\n' ${urlArgs} | ${HTTPX_BIN} -silent -json -title -status-code -web-server -tech-detect -follow-redirects -timeout 8 -no-color`;
+  const needsVhost =
+    isIpAddress(host) &&
+    !webScan.vhost &&
+    (first.cdnDetected || !first.hasLive);
+
+  if (needsVhost) {
+    emit.log(`CDN/IP-direct probe inconclusive — discovering vhost from TLS cert on ${host}`);
+    const candidates = new Set<string>();
+    if (input.target.vhost?.trim()) candidates.add(input.target.vhost.trim());
+    for (const d of input.context?.knownDomains ?? []) {
+      if (typeof d === "string" && d.trim()) candidates.add(d.trim());
+    }
+    for (const n of await discoverCertHostnames(host, input.signal)) candidates.add(n);
+
+    for (const name of [...candidates].slice(0, 10)) {
+      if (isIpAddress(name)) continue;
+      const vhostUrls = rewriteUrlsForVhost(urls, name);
+      const hints = mergeWebScanHints(webScan, {
+        connectIp: host,
+        vhost: name,
+        cdnDetected: first.cdnDetected,
+        cdnVendor: first.cdnVendor
+      });
+      emit.log(`Retrying httpx with vhost ${name} (connect ${host})`);
+      const retry = await runHttpxOnce(vhostUrls, host, input, emit, mode, hints);
+      if (retry.hasLive) {
+        webScan = hints;
+        first = retry;
+        break;
+      }
+    }
+  } else if (webScan.vhost && isIpAddress(host)) {
+    webScan = mergeWebScanHints(webScan, { connectIp: host, cdnDetected: first.cdnDetected, cdnVendor: first.cdnVendor });
+  }
+
+  const recs: ToolEnvelope["recommendations"] = [];
+  if (first.facts.length > 0) {
+    const gobusterArgs: Record<string, unknown> = {};
+    if (webScan.vhost) {
+      gobusterArgs.http_targets = first.facts
+        .map((f) => (f.value as { url?: string })?.url)
+        .filter((u): u is string => typeof u === "string")
+        .slice(0, 5);
+    }
+    recs.push({ agent: "recon.spider", reason: "Discovered web endpoints — crawl them with katana", priority: 65 });
+    recs.push({
+      agent: "recon.gobuster",
+      reason: webScan.vhost
+        ? `Discovered web endpoints via vhost ${webScan.vhost} — brute-force common paths`
+        : "Discovered web endpoints — brute-force common paths",
+      priority: 60,
+      args: Object.keys(gobusterArgs).length ? gobusterArgs : undefined
+    });
+    const https =
+      mode === "context"
+        ? (knownPorts ?? []).some((kp) => kp.scheme === "https")
+        : urls.some((u) => u.startsWith("https://"));
+    if (https) {
+      recs.push({ agent: "recon.tls_check", reason: "Verify TLS configuration", priority: 70 });
+    }
+    if (webScan.cdnDetected) {
+      recs.push({ agent: "recon.waf_detect", reason: "CDN/WAF edge detected — fingerprint protection", priority: 55 });
+    }
+  }
+
+  const extraFacts: ToolEnvelope["facts"] = [];
+  if (webScan.vhost && isIpAddress(host)) {
+    extraFacts.push({
+      type: "virtual_host",
+      value: { vhost: webScan.vhost, connectIp: host, cdnVendor: webScan.cdnVendor },
+      source: "http_probe"
+    });
+  }
+
+  return {
+    status: first.facts.length > 0 ? "succeeded" : "partial",
+    durationMs: first.durationMs,
+    artifacts: first.artifacts,
+    facts: [...first.facts, ...extraFacts],
+    findings: first.findings,
+    recommendations: recs,
+    meta: {
+      exitCode: first.exitCode,
+      probed: probedCount,
+      live: first.facts.length,
+      resolutionMode: mode,
+      vhostResolved: Boolean(webScan.vhost && isIpAddress(host)),
+      webScan: serializeWebScan(webScan),
+      commandSummary: webScan.vhost
+        ? `Probe HTTP/S on ${host} using vhost ${webScan.vhost} (CDN-aware).`
+        : `Probe ${probedCount} HTTP/HTTPS endpoint(s) on ${host} with httpx.`
+    }
+  };
+}
+
+async function runHttpxOnce(
+  urls: string[],
+  host: string,
+  input: ToolInput,
+  emit: { log: (s: string) => void },
+  mode: string,
+  webScan: WebScanHints
+): Promise<
+  HttpxParseResult & {
+    durationMs?: number;
+    exitCode: number | null;
+    artifacts: ToolEnvelope["artifacts"];
+  }
+> {
+  const presence = await requireRemoteTool(HTTPX_BIN, input.signal);
+  if (presence.missing) {
+    return {
+      facts: [],
+      findings: [],
+      cdnDetected: false,
+      cdnVendor: null,
+      hasLive: false,
+      exitCode: null,
+      artifacts: { commands: [] }
+    };
+  }
+
+  const extra = httpxExtraFlags(webScan);
+  const urlArgs = urls.map((u) => shellQuote(u)).join(" ");
+  const script = `printf '%s\\n' ${urlArgs} | ${HTTPX_BIN} -silent -json -title -status-code -web-server -tech-detect -follow-redirects -timeout 8 -no-color ${extra}`;
 
   emit.log(
-    mode === "urls"
-      ? `Probing ${urls.length} explicit URL(s) on ${host} via httpx`
-      : `Probing ${urls.length} HTTP/S endpoint(s) on ${host} via httpx (${mode})`
+    webScan.vhost && webScan.connectIp
+      ? `Probing ${urls.length} URL(s) via vhost ${webScan.vhost} → ${webScan.connectIp}`
+      : `Probing ${urls.length} HTTP/S endpoint(s) on ${host} (${mode})`
   );
   const r = await remoteScript(script, input.signal, (s) => emit.log(s));
 
+  const parsed = parseHttpxStdout(r.stdout, input.target.host, webScan.vhost);
+  return {
+    ...parsed,
+    durationMs: r.durationMs,
+    exitCode: r.exitCode,
+    artifacts: { commands: r.commands, stdoutSnippet: snippet(r.stdout), stderrSnippet: snippet(r.stderr) }
+  };
+}
+
+function parseHttpxStdout(stdout: string, targetHost: string, vhost: string | null): HttpxParseResult {
   const facts: ToolEnvelope["facts"] = [];
   const findings: ToolEnvelope["findings"] = [];
+  let cdnDetected = false;
+  let cdnVendor: string | null = null;
+  let hasLive = false;
 
-  for (const line of r.stdout.split("\n")) {
+  for (const line of stdout.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || trimmed[0] !== "{") continue;
     let obj: Record<string, unknown>;
@@ -244,9 +404,19 @@ async function runHttpx(
     const techRaw = (obj as Record<string, unknown>).technologies ?? obj.tech;
     const tech = Array.isArray(techRaw) ? (techRaw as unknown[]).filter((t): t is string => typeof t === "string") : [];
 
+    const vendor = detectCdnVendor(server);
+    if (vendor) {
+      cdnDetected = true;
+      cdnVendor = vendor;
+    }
+    if (looksLikeCdnBlock(status, server)) {
+      cdnDetected = true;
+      cdnVendor = vendor ?? cdnVendor;
+    }
+
     facts.push({
       type: "http_endpoint",
-      value: { url, status, server, title, tech },
+      value: { url, status, server, title, tech, vhost: vhost ?? undefined },
       source: "httpx"
     });
 
@@ -258,13 +428,14 @@ async function runHttpx(
       probedPort = null;
     }
     const verifiesFp =
-      probedPort !== null ? `open-port|${input.target.host}|tcp|${probedPort}` : undefined;
+      probedPort !== null ? `open-port|${targetHost}|tcp|${probedPort}` : undefined;
 
     if (status !== null && status >= 200 && status < 400) {
+      hasLive = true;
       findings.push({
         title: `Reachable web endpoint: ${url}`,
         severity: "info",
-        evidence: `HTTP ${status}${server ? ` Server: ${server}` : ""}${tech.length ? ` Tech: ${tech.join(", ")}` : ""}`,
+        evidence: `HTTP ${status}${server ? ` Server: ${server}` : ""}${tech.length ? ` Tech: ${tech.join(", ")}` : ""}${vhost ? ` (vhost ${vhost})` : ""}`,
         fingerprint: `http|${url}`,
         confidence: "high",
         requiresVerification: false,
@@ -285,36 +456,5 @@ async function runHttpx(
     }
   }
 
-  const recs: ToolEnvelope["recommendations"] = [];
-  if (facts.length > 0) {
-    recs.push({ agent: "recon.spider", reason: "Discovered web endpoints — crawl them with katana", priority: 65 });
-    recs.push({ agent: "recon.gobuster", reason: "Discovered web endpoints — brute-force common paths", priority: 60 });
-    const https =
-      mode === "context"
-        ? (knownPorts ?? []).some((kp) => kp.scheme === "https")
-        : urls.some((u) => u.startsWith("https://"));
-    if (https) {
-      recs.push({ agent: "recon.tls_check", reason: "Verify TLS configuration", priority: 70 });
-    }
-  }
-
-  return {
-    status: facts.length > 0 ? "succeeded" : "partial",
-    durationMs: r.durationMs,
-    artifacts: { commands: r.commands, stdoutSnippet: snippet(r.stdout), stderrSnippet: snippet(r.stderr) },
-    facts,
-    findings,
-    recommendations: recs,
-    meta: {
-      exitCode: r.exitCode,
-      probed: probedCount,
-      live: facts.length,
-      resolutionMode: mode,
-      commandSummary: `Probe ${probedCount} HTTP/HTTPS endpoint(s) on ${host} with httpx (JSON output) and emit live endpoints as facts.`
-    }
-  };
-}
-
-function quote(s: string) {
-  return `'${s.replace(/'/g, `'\\''`)}'`;
+  return { facts, findings, cdnDetected, cdnVendor, hasLive };
 }

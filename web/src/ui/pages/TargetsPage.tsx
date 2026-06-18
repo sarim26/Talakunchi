@@ -19,6 +19,7 @@ export function TargetsPage() {
   const targetsQ = useQuery({ queryKey: ["targets"], queryFn: listTargets });
   const [name, setName] = useState("WIN-LAB-01");
   const [address, setAddress] = useState("10.0.0.10");
+  const [vhost, setVhost] = useState("");
   const [tags, setTags] = useState("lab,staging");
 
   const createM = useMutation({
@@ -57,6 +58,13 @@ export function TargetsPage() {
               fullWidth
             />
             <TextField
+              label="HTTP vhost (optional)"
+              placeholder="www.example.com — for CDN/IP targets"
+              value={vhost}
+              onChange={(e) => setVhost(e.target.value)}
+              fullWidth
+            />
+            <TextField
               label="Tags (comma separated)"
               value={tags}
               onChange={(e) => setTags(e.target.value)}
@@ -64,7 +72,7 @@ export function TargetsPage() {
             />
             <Button
               variant="contained"
-              onClick={() => createM.mutate({ name, address, tags: tagList })}
+              onClick={() => createM.mutate({ name, address, vhost: vhost.trim() || undefined, tags: tagList })}
               disabled={createM.isPending}
               sx={{ minWidth: 150 }}
             >
@@ -89,6 +97,7 @@ export function TargetsPage() {
                     <Typography variant="body1">{t.name}</Typography>
                     <Typography variant="body2" color="text.secondary">
                       {t.address}
+                      {t.vhost ? ` · vhost ${t.vhost}` : ""}
                     </Typography>
                   </Box>
                   <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>

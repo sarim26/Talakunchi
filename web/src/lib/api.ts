@@ -27,6 +27,7 @@ export const TargetSchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
   address: z.string(),
+  vhost: z.string().nullable().optional(),
   tags: z.array(z.string()),
   owner: z.string().nullable().optional(),
   createdAt: z.string().or(z.date())
@@ -174,7 +175,7 @@ export async function listTargets() {
   return http("/api/targets", undefined, z.array(TargetSchema));
 }
 
-export async function createTarget(input: { name: string; address: string; tags?: string[]; owner?: string }) {
+export async function createTarget(input: { name: string; address: string; vhost?: string; tags?: string[]; owner?: string }) {
   return http("/api/targets", { method: "POST", body: JSON.stringify(input) }, TargetSchema);
 }
 

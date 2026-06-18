@@ -3,6 +3,8 @@ import { z } from "zod";
 export const CreateTargetSchema = z.object({
   name: z.string().min(1),
   address: z.string().min(1),
+  /** Canonical HTTP hostname when `address` is an IP behind CDN/WAF (optional). */
+  vhost: z.string().min(1).optional(),
   tags: z.array(z.string()).optional().default([]),
   owner: z.string().optional()
 });

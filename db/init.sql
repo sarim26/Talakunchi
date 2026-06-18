@@ -6,6 +6,7 @@ create table if not exists targets (
   id uuid primary key default uuid_generate_v4(),
   name text not null,
   address text not null, -- ip or hostname
+  vhost text, -- canonical HTTP hostname when address is an IP behind CDN
   tags text[] not null default '{}',
   owner text,
   created_at timestamptz not null default now()

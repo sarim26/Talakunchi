@@ -16,6 +16,7 @@ import { draftExecutionPayload, shouldUseExecutionWriter } from "../agents/execu
 import { getWordlistCatalog } from "../agents/wordlists.js";
 import { pickVerifierFor } from "../agents/verification.js";
 import { parseScopeList, isHostInScope } from "../scope.js";
+import { emptyWebScanHints, mergeWebScanHints, webScanFromEnvelopeMeta, type WebScanHints } from "../agents/webTarget.js";
 import {
   createEventSink,
   createAgentRun,
@@ -91,12 +92,15 @@ async function resolveScope(): Promise<{ enforce: boolean; entries: string[] }> 
 
 export async function runReconLoop(agentRunId: string): Promise<void> {
   await ensureAgentTables();
+  await withClient(async (c) => {
+    await c.query(`alter table targets add column if not exists vhost text`);
+  });
 
   const data = await withClient(async (c) => {
     const r = await c.query(
       `select ar.id, ar.target_id, ar.max_steps,
               ar.initial_nmap_profile, ar.initial_nmap_ports, ar.initial_nmap_extra_args,
-              t.name as target_name, t.address as target_address
+              t.name as target_name, t.address as target_address, t.vhost as target_vhost
        from agent_runs ar
        join targets t on t.id = ar.target_id
        where ar.id = $1`,
@@ -112,6 +116,7 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
           initial_nmap_extra_args: string | null;
           target_name: string;
           target_address: string;
+          target_vhost: string | null;
         }
       | undefined;
   });
@@ -168,13 +173,18 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
     );
   });
 
+  const targetVhost = run.target_vhost?.trim() || null;
+  const webScan: WebScanHints = emptyWebScanHints(run.target_address, targetVhost);
+
   const ctx: ManagerContext = {
     targetHost: run.target_address,
     stepsRemaining: run.max_steps,
     knownPorts: [],
     knownServices: [],
     knownFindings: [],
+    knownDomains: [],
     discoveredEndpoints: [],
+    webScan,
     pendingVerifications: [],
     invocationHistory: [],
     pendingRecommendations: [],
@@ -280,14 +290,14 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
     const { invocationId, envelope } = await server.invoke(
       toolDef.name,
       {
-        target: { targetId: run.target_id, host: run.target_address },
+        target: { targetId: run.target_id, host: run.target_address, vhost: targetVhost ?? undefined },
         intent: invokeIntent,
         args: invokeArgs,
         signal: ac.signal,
         context: {
           knownPorts: ctx.knownPorts,
           knownServices: ctx.knownServices,
-          knownDomains: [],
+          knownDomains: ctx.knownDomains ?? [],
           priorFindings: allFindings,
           discoveredEndpoints: ctx.discoveredEndpoints.map((e) => ({
             url: e.url,
@@ -295,6 +305,7 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
             status: e.status,
             sourceTool: e.sourceTool
           })),
+          webScan: ctx.webScan,
           runId: agentRunId,
           invocationId: ""
         }
@@ -402,7 +413,9 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
 
     // Layer 3: merge web URLs into discoveredEndpoints so the manager sees
     // them on subsequent steps. We dedupe on URL+method.
-    const webFacts = (envelope.facts ?? []).filter((f) => f.type === "web_url" || f.type === "web_path");
+    const webFacts = (envelope.facts ?? []).filter(
+      (f) => f.type === "web_url" || f.type === "web_path" || f.type === "http_endpoint"
+    );
     for (const wf of webFacts) {
       const v = (wf.value ?? {}) as { url?: string; method?: string; status?: number | null };
       if (!v.url) continue;
@@ -414,6 +427,31 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
         status: typeof v.status === "number" ? v.status : null,
         sourceTool: toolName
       });
+    }
+
+    for (const f of envelope.facts ?? []) {
+      if (f.type === "subdomain" && typeof f.value === "string") {
+        const sd = f.value.trim();
+        if (sd && !(ctx.knownDomains ?? []).includes(sd)) {
+          ctx.knownDomains = [...(ctx.knownDomains ?? []), sd];
+        }
+      }
+      if (f.type === "virtual_host" && f.value && typeof f.value === "object") {
+        const vv = f.value as { vhost?: string; connectIp?: string; cdnVendor?: string };
+        if (vv.vhost) {
+          ctx.webScan = mergeWebScanHints(ctx.webScan, {
+            vhost: vv.vhost,
+            connectIp: vv.connectIp ?? ctx.webScan.connectIp,
+            cdnVendor: vv.cdnVendor ?? ctx.webScan.cdnVendor,
+            cdnDetected: true
+          });
+        }
+      }
+    }
+
+    const metaPatch = webScanFromEnvelopeMeta(envelope.meta as Record<string, unknown> | undefined);
+    if (metaPatch) {
+      ctx.webScan = mergeWebScanHints(ctx.webScan, metaPatch);
     }
 
     ctx.invocationHistory.push({

@@ -2,6 +2,13 @@ import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
 import { remoteScript, snippet } from "./shared.js";
 import { getWordlistCatalog, isWordlistAllowed } from "./wordlists.js";
 import { findingsFromWebFactsLlm } from "./webPathFindingsLlm.js";
+import {
+  gobusterBaseUrl,
+  gobusterConnectFlag,
+  hostAllowed,
+  normHost,
+  resolveWebScanFromInput
+} from "./webTarget.js";
 
 type GobusterArgs = {
   url?: string;
@@ -47,7 +54,23 @@ export const gobusterTool: ToolDefinition = {
   },
   handler: async (input, emit): Promise<ToolEnvelope> => {
     const args = (input.args ?? {}) as GobusterArgs;
-    const bases = collectGobusterBaseUrls(args, input.target.host).map((u) => applyBasePath(u, args.basePath));
+    const webScan = resolveWebScanFromInput(input.target.host, input.target.vhost, input.context?.webScan);
+    const bases = collectGobusterBaseUrls(args, input.target.host, webScan.vhost).map((u) =>
+      applyBasePath(gobusterBaseUrl(u, webScan), args.basePath)
+    );
+
+    if (bases.length === 0 && webScan.connectIp && !webScan.vhost) {
+      return {
+        status: "skipped",
+        error:
+          "CDN/IP target: no vhost resolved yet. Run recon.http_probe first (or set target vhost) before gobuster on a bare IP.",
+        artifacts: { commands: [] },
+        facts: [],
+        findings: [],
+        recommendations: [{ agent: "recon.http_probe", reason: "Resolve vhost from TLS cert before directory brute-force", priority: 90 }],
+        meta: { webScan }
+      };
+    }
 
     if (bases.length === 0) {
       return {
@@ -100,6 +123,8 @@ export const gobusterTool: ToolDefinition = {
     let anyHardFailure = false;
     let anyRunOk = false;
 
+    const ipFlag = gobusterConnectFlag(webScan);
+
     for (const url of bases) {
       const script = [
         `set -euo pipefail`,
@@ -109,10 +134,14 @@ export const gobusterTool: ToolDefinition = {
         `  echo "WORDLIST_MISSING: $WORDLIST"`,
         `  exit 0`,
         `fi`,
-        `gobuster dir -u "$URL" -w "$WORDLIST" -k --no-error --quiet -t ${threads} -b 404,403`
+        `gobuster dir -u "$URL" -w "$WORDLIST" -k --no-error --quiet -t ${threads} -b 404,403${ipFlag ? ` ${ipFlag}` : ""}`
       ].join("\n");
 
-      emit.log(`Running gobuster against ${url} (wordlist=${wordlistSource}: ${wordlist})`);
+      emit.log(
+        webScan.vhost && webScan.connectIp
+          ? `Running gobuster against ${url} (connect ${webScan.connectIp}, vhost ${webScan.vhost})`
+          : `Running gobuster against ${url} (wordlist=${wordlistSource}: ${wordlist})`
+      );
       const r = await remoteScript(script, input.signal, (s) => emit.log(s));
       totalDurationMs += r.durationMs ?? 0;
       allCommands.push(...r.commands);
@@ -175,7 +204,7 @@ export const gobusterTool: ToolDefinition = {
         facts: [],
         findings: [],
         recommendations: [],
-        meta: { wordlist, wordlistSource, threads, bases }
+        meta: { wordlist, wordlistSource, threads, bases, webScan: { vhost: webScan.vhost, connectIp: webScan.connectIp } }
       };
     }
 
@@ -209,10 +238,6 @@ export const gobusterTool: ToolDefinition = {
   }
 };
 
-function normHost(h: string): string {
-  return h.trim().replace(/\.$/, "").toLowerCase();
-}
-
 /** Strip ffuf-style FUZZ marker and trailing slashes so `new URL` succeeds. */
 function fuzzToBaseUrl(raw: string): string {
   let s = raw.trim();
@@ -224,13 +249,13 @@ function fuzzToBaseUrl(raw: string): string {
   return s.trim();
 }
 
-function tryAddBaseUrl(raw: string | undefined, targetHost: string, seen: Set<string>, out: string[]): void {
+function tryAddBaseUrl(raw: string | undefined, targetHost: string, vhost: string | null, seen: Set<string>, out: string[]): void {
   if (!raw || typeof raw !== "string") return;
   const candidate = fuzzToBaseUrl(raw);
   if (!candidate) return;
   try {
     const u = new URL(candidate);
-    if (normHost(u.hostname) !== normHost(targetHost)) return;
+    if (!hostAllowed(u.hostname, targetHost, vhost)) return;
     if (u.protocol !== "http:" && u.protocol !== "https:") return;
     const key = u.toString();
     if (seen.has(key)) return;
@@ -241,14 +266,14 @@ function tryAddBaseUrl(raw: string | undefined, targetHost: string, seen: Set<st
   }
 }
 
-function collectGobusterBaseUrls(args: GobusterArgs, targetHost: string): string[] {
+function collectGobusterBaseUrls(args: GobusterArgs, targetHost: string, vhost: string | null): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
-  tryAddBaseUrl(args.url, targetHost, seen, out);
-  tryAddBaseUrl(args.targetUrl, targetHost, seen, out);
+  tryAddBaseUrl(args.url, targetHost, vhost, seen, out);
+  tryAddBaseUrl(args.targetUrl, targetHost, vhost, seen, out);
   if (Array.isArray(args.http_targets)) {
     for (const item of args.http_targets) {
-      if (typeof item === "string") tryAddBaseUrl(item, targetHost, seen, out);
+      if (typeof item === "string") tryAddBaseUrl(item, targetHost, vhost, seen, out);
     }
   }
   return out;

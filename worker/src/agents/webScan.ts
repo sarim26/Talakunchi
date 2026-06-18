@@ -1,5 +1,6 @@
 import { ToolDefinition, ToolEnvelope, ToolFinding, ToolInput, Severity } from "../mcp/types.js";
 import { remoteScript, requireRemoteTool, snippet } from "./shared.js";
+import { hostAllowed, resolveWebScanFromInput } from "./webTarget.js";
 
 function quote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
@@ -9,13 +10,14 @@ function quote(s: string): string {
 function collectHttpSeeds(input: ToolInput, max = 25): string[] {
   const args = (input.args ?? {}) as { http_targets?: unknown; url?: string };
   const host = input.target.host;
+  const webScan = resolveWebScanFromInput(host, input.target.vhost, input.context?.webScan);
   const ordered: string[] = [];
   const seen = new Set<string>();
   const push = (raw: unknown) => {
     if (typeof raw !== "string") return;
     try {
       const u = new URL(raw.trim());
-      if (u.hostname !== host) return;
+      if (!hostAllowed(u.hostname, host, webScan.vhost)) return;
       if (u.protocol !== "http:" && u.protocol !== "https:") return;
       if (seen.has(u.href)) return;
       seen.add(u.href);

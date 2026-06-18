@@ -2,6 +2,14 @@ import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
 import { remoteScript, requireRemoteTool, snippet } from "./shared.js";
 import { findingsFromWebFactsLlm } from "./webPathFindingsLlm.js";
 import { getWordlistCatalog, isWordlistAllowed } from "./wordlists.js";
+import {
+  ffufConnectUrl,
+  ffufHostHeaderArgs,
+  hostAllowed,
+  isIpAddress,
+  normHost,
+  resolveWebScanFromInput
+} from "./webTarget.js";
 
 const FFUF_BIN = "ffuf";
 
@@ -55,8 +63,20 @@ export const ffufTool: ToolDefinition = {
       timeoutSec?: number;
     };
 
-    const targets = collectTargetUrls(args, input.target.host);
+    const webScan = resolveWebScanFromInput(input.target.host, input.target.vhost, input.context?.webScan);
+    const targets = collectTargetUrls(args, input.target.host, webScan.vhost);
     if (targets.length === 0) {
+      if (isIpAddress(input.target.host) && !webScan.vhost) {
+        return {
+          status: "skipped",
+          error: "CDN/IP target: run recon.http_probe to resolve vhost before ffuf on a bare IP.",
+          artifacts: { commands: [] },
+          facts: [],
+          findings: [],
+          recommendations: [{ agent: "recon.http_probe", reason: "Resolve vhost from TLS cert", priority: 90 }],
+          meta: {}
+        };
+      }
       return {
         status: "skipped",
         error:
@@ -108,16 +128,19 @@ export const ffufTool: ToolDefinition = {
     let anyWordlistMissing = false;
     let anyRunOk = false;
 
+    const hostHeader = ffufHostHeaderArgs(webScan);
+
     for (const targetUrl of targets) {
+      const connectUrl = ffufConnectUrl(targetUrl, webScan);
       const outPath = `/tmp/_ffuf_$$.json`;
       const script = [
         `set -euo pipefail`,
-        `URL=${quote(targetUrl)}`,
+        `URL=${quote(connectUrl)}`,
         `WORDLIST=${quote(wordlist)}`,
         `OUT=${outPath}`,
         `rm -f "$OUT"`,
         `if [ ! -f "$WORDLIST" ]; then echo "WORDLIST_MISSING: $WORDLIST"; exit 0; fi`,
-        `${FFUF_BIN} -u "$URL" -w "$WORDLIST" -mc ${matchCodes} -t ${threads} -timeout ${timeoutSec} -of json -o "$OUT" -s 2>&1 || true`,
+        `${FFUF_BIN} -u "$URL" -w "$WORDLIST" -mc ${matchCodes} -t ${threads} -timeout ${timeoutSec} -of json -o "$OUT" -s ${hostHeader} 2>&1 || true`,
         `if [ -f "$OUT" ]; then`,
         `  echo "==== FFUF_JSON ===="`,
         `  cat "$OUT"`,
@@ -127,7 +150,11 @@ export const ffufTool: ToolDefinition = {
         `fi`
       ].join("\n");
 
-      emit.log(`Running ffuf against ${targetUrl} (wordlist=${wordlistSource})`);
+      emit.log(
+        webScan.vhost && webScan.connectIp
+          ? `Running ffuf ${connectUrl} Host:${webScan.vhost} (wordlist=${wordlistSource})`
+          : `Running ffuf against ${targetUrl} (wordlist=${wordlistSource})`
+      );
       const r = await remoteScript(script, input.signal, (s) => emit.log(s));
       totalDurationMs += r.durationMs ?? 0;
       allCommands.push(...r.commands);
@@ -188,10 +215,6 @@ function quote(s: string) {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-function normHost(h: string): string {
-  return h.trim().replace(/\.$/, "").toLowerCase();
-}
-
 function toBaseFromTargetUrl(raw: string): string | null {
   const t = raw.trim();
   if (!t) return null;
@@ -222,7 +245,8 @@ function ensureFuzz(u: string): string {
 
 function collectTargetUrls(
   args: { http_targets?: unknown; targetUrl?: string; basePath?: string },
-  targetHost: string
+  targetHost: string,
+  vhost: string | null
 ): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -232,7 +256,7 @@ function collectTargetUrls(
     if (!/FUZZ/.test(t)) return;
     try {
       const u = new URL(t.replace(/FUZZ/g, "x"));
-      if (normHost(u.hostname) !== normHost(targetHost)) return;
+      if (!hostAllowed(u.hostname, targetHost, vhost)) return;
       const href = t;
       if (seen.has(href)) return;
       seen.add(href);
@@ -249,7 +273,7 @@ function collectTargetUrls(
       if (typeof item !== "string") continue;
       try {
         const base = new URL(item.trim());
-        if (normHost(base.hostname) !== normHost(targetHost)) continue;
+        if (!hostAllowed(base.hostname, targetHost, vhost)) continue;
         if (base.protocol !== "http:" && base.protocol !== "https:") continue;
         const withPath = joinPath(base.toString(), args.basePath);
         const final = ensureFuzz(withPath);
@@ -262,13 +286,12 @@ function collectTargetUrls(
     }
   }
 
-  // If targetUrl was provided but lacked FUZZ, try to convert to a base and append FUZZ.
   if (out.length === 0 && typeof args.targetUrl === "string") {
     const base = toBaseFromTargetUrl(args.targetUrl);
     if (base) {
       try {
         const u = new URL(base);
-        if (normHost(u.hostname) === normHost(targetHost)) out.push(ensureFuzz(joinPath(base, args.basePath)));
+        if (hostAllowed(u.hostname, targetHost, vhost)) out.push(ensureFuzz(joinPath(base, args.basePath)));
       } catch {
         // ignore
       }

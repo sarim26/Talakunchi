@@ -14,9 +14,19 @@ export type Severity = "info" | "low" | "medium" | "high" | "critical";
 export const TargetCtxSchema = z.object({
   targetId: z.string().uuid(),
   host: z.string().min(1),
-  ip: z.string().optional()
+  ip: z.string().optional(),
+  /** Optional canonical HTTP hostname when `host` is an IP behind CDN/vhost routing. */
+  vhost: z.string().optional()
 });
 export type TargetCtx = z.infer<typeof TargetCtxSchema>;
+
+export const WebScanHintsSchema = z.object({
+  connectIp: z.string().nullable(),
+  vhost: z.string().nullable(),
+  cdnDetected: z.boolean(),
+  cdnVendor: z.string().nullable()
+});
+export type WebScanHintsCtx = z.infer<typeof WebScanHintsSchema>;
 
 export const ToolFactSchema = z.object({
   type: z.string(),
@@ -103,6 +113,8 @@ export type ToolInput = {
     priorFindings?: ToolFinding[];
     /** URLs accumulated by the orchestrator for planners and web tools. */
     discoveredEndpoints?: Array<{ url: string; method?: string; status?: number | null; sourceTool?: string }>;
+    /** CDN/vhost routing state (IP connect + Host header) for web specialists. */
+    webScan?: WebScanHintsCtx;
     /** Optional last remote shell outcome (reserved for future tools). */
     lastKaliShell?: {
       exitCode: number | null;

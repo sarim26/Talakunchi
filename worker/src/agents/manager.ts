@@ -14,6 +14,8 @@ import { chatJSON, safeParseJson } from "../llm/ollama.js";
 import type { MCPServer } from "../mcp/server.js";
 import type { ToolFinding } from "../mcp/types.js";
 import type { WordlistCatalog } from "./wordlists.js";
+import { isIpAddress } from "./webTarget.js";
+import type { WebScanHints } from "./webTarget.js";
 
 export const ManagerDecisionSchema = z.union([
   z.object({
@@ -43,7 +45,10 @@ export type ManagerContext = {
   knownPorts: number[];
   knownServices: Array<{ port: number; protocol: string; name?: string; product?: string; version?: string }>;
   knownFindings: ToolFinding[];
+  knownDomains?: string[];
   discoveredEndpoints: Array<{ url: string; method?: string; status?: number | null; sourceTool: string }>;
+  /** CDN/vhost routing discovered during http_probe (IP connect + Host header). */
+  webScan: WebScanHints;
   pendingVerifications: Array<{
     fingerprint: string;
     verifierTool: string;
@@ -120,6 +125,9 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
   // enumerators haven't run yet, prioritize them before web expansion loops.
   const coverage = coverageFirstDecision(server, ctx);
   if (coverage) return coverage;
+
+  const cdnGuard = cdnVhostGuardDecision(server, ctx);
+  if (cdnGuard) return cdnGuard;
 
   // Drain pending verifications before exploratory LLM steps so unconfirmed
   // findings get corroborated (or marked unverified) deterministically.
@@ -205,6 +213,55 @@ function fallbackInitialNmap(server: MCPServer, ctx: ManagerContext): ManagerDec
     reasoning:
       "Automatic fallback: manager LLM unavailable; starting with recon.nmap (no ports or services known yet)."
   };
+}
+
+/** When the target is an IP behind CDN, resolve vhost via http_probe before fuzzing. */
+function cdnVhostGuardDecision(server: MCPServer, ctx: ManagerContext): ManagerDecision | null {
+  if (!isIpAddress(ctx.targetHost)) return null;
+  const ws = ctx.webScan;
+  const history = ctx.invocationHistory ?? [];
+  const ran = new Set(history.map((h) => h.tool));
+  const probeRuns = history.filter((h) => h.tool === "recon.http_probe").length;
+
+  const needsVhost = !ws.vhost;
+  const cdnLikely = ws.cdnDetected || isIpAddress(ctx.targetHost);
+
+  if (needsVhost && cdnLikely && server.has("recon.http_probe") && probeRuns === 0) {
+    return {
+      action: "invoke",
+      tool: "recon.http_probe",
+      intentGoal: `Probe HTTP/S on ${ctx.targetHost} and resolve CDN virtual host from TLS certificate`,
+      args: { services: ctx.knownServices },
+      reasoning: "IP/CDN target: discover vhost (Host header) before gobuster/ffuf/spider"
+    };
+  }
+
+  const lastFail = (ctx.recentFailures ?? []).slice(-1)[0];
+  const webFuzzTools = new Set(["recon.gobuster", "recon.ffuf", "recon.spider"]);
+  if (
+    needsVhost &&
+    ws.cdnDetected &&
+    lastFail &&
+    webFuzzTools.has(lastFail.tool) &&
+    server.has("recon.http_probe") &&
+    probeRuns < 2
+  ) {
+    return {
+      action: "invoke",
+      tool: "recon.http_probe",
+      intentGoal: "Re-run HTTP probe after CDN-blocked web fuzzing to recover vhost from TLS cert",
+      args: { services: ctx.knownServices },
+      reasoning: `${lastFail.tool} failed on IP-direct CDN edge; retry vhost discovery`
+    };
+  }
+
+  if (needsVhost && ws.cdnDetected && ran.has("recon.http_probe") && probeRuns >= 2) {
+    const hasWeb = ctx.knownServices.some((s) => [80, 443, 8080, 8443].includes(s.port));
+    if (!hasWeb) return null;
+    // Avoid infinite gobuster/ffuf loops — skip if we already tried http_probe twice
+  }
+
+  return null;
 }
 
 function coverageFirstDecision(server: MCPServer, ctx: ManagerContext): ManagerDecision | null {
@@ -299,6 +356,8 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
     "  - After services exist → choose the most informative specialist (http_probe, ssh_enum, smb_enum, tls_check, cve_enricher, spider, waybackurls, gobuster, ffuf, etc.).",
     "  - Infra services map to dedicated specialists: 3389→rdp_enum, 21→ftp_enum, 25/587/465→smtp_enum, 389/636→ldap_enum, 2049→nfs_enum, 6379→redis_enum, 161/udp→snmp_enum, 3306/5432/1433→db_banner. Run these when the matching port is open.",
     "  - recon.nuclei (safe tags) and recon.waf_detect operate on web origins: run recon.http_probe first so HTTP seeds/discoveredEndpoints exist, then use them.",
+    "  - IP targets behind CDN/WAF (Akamai, Cloudflare): NEVER fuzz http://<ip>/ directly. Run recon.http_probe first — it discovers the vhost from TLS cert and retries with Host/SNI routing. Use discoveredEndpoints hostnames in gobuster/ffuf args.",
+    "  - If webScan.vhost is set in context, pass http_targets using that hostname (worker connects to connectIp automatically).",
     "  - recon.hydra (only present in gated mode) is a credentialed check on auth services; it pauses for human approval before running. Choose it only when an auth service (ssh/ftp/rdp/smb/db) is open and credential testing is in scope.",
     "  - Follow tool `requires` hints; do not invoke a tool whose preconditions are clearly unmet.",
     "  - Prefer system.tool_installer only when a prior failure indicated a missing remote CLI (recentFailures.missingTool) — the orchestrator may force-install before you run again.",
@@ -457,7 +516,8 @@ function buildManagerUserPayload(server: MCPServer, ctx: ManagerContext, mode: M
       })),
       history: ctx.invocationHistory.slice(-10),
       recentFailures: (ctx.recentFailures ?? []).slice(-3),
-      runHints: ctx.runHints ?? null
+      runHints: ctx.runHints ?? null,
+      webScan: ctx.webScan
     };
   }
 
@@ -483,6 +543,8 @@ function buildManagerUserPayload(server: MCPServer, ctx: ManagerContext, mode: M
     })),
     history: ctx.invocationHistory.slice(-20),
     recentFailures: (ctx.recentFailures ?? []).slice(-5),
-    runHints: ctx.runHints ?? null
+    runHints: ctx.runHints ?? null,
+    webScan: ctx.webScan,
+    knownDomains: (ctx.knownDomains ?? []).slice(0, 15)
   };
 }

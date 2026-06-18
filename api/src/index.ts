@@ -57,6 +57,7 @@ async function ensureWorkflowTables() {
       )
     `);
     await c.query(`create index if not exists idx_recon_assets_target on recon_assets(target_id)`);
+    await c.query(`alter table targets add column if not exists vhost text`);
 
     await c.query(`
       create table if not exists command_approvals (
@@ -318,10 +319,10 @@ app.post("/api/targets", async (req, reply) => {
   const body = CreateTargetSchema.parse(req.body);
   const row = await withClient(async (c) => {
     const res = await c.query(
-      `insert into targets (name, address, tags, owner)
-       values ($1, $2, $3, $4)
-       returning id, name, address, tags, owner, created_at`,
-      [body.name, body.address, body.tags, body.owner ?? null]
+      `insert into targets (name, address, tags, owner, vhost)
+       values ($1, $2, $3, $4, $5)
+       returning id, name, address, tags, owner, vhost, created_at`,
+      [body.name, body.address, body.tags, body.owner ?? null, body.vhost?.trim() || null]
     );
     return res.rows[0];
   });
@@ -337,6 +338,7 @@ app.post("/api/targets", async (req, reply) => {
     id: row.id,
     name: row.name,
     address: row.address,
+    vhost: row.vhost,
     tags: row.tags,
     owner: row.owner,
     createdAt: row.created_at
@@ -346,7 +348,7 @@ app.post("/api/targets", async (req, reply) => {
 app.get("/api/targets", async () => {
   const rows = await withClient(async (c) => {
     const res = await c.query(
-      `select id, name, address, tags, owner, created_at
+      `select id, name, address, tags, owner, vhost, created_at
        from targets
        order by created_at desc`
     );
@@ -356,6 +358,7 @@ app.get("/api/targets", async () => {
     id: r.id,
     name: r.name,
     address: r.address,
+    vhost: r.vhost,
     tags: r.tags,
     owner: r.owner,
     createdAt: r.created_at
