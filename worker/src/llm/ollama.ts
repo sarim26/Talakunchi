@@ -80,10 +80,26 @@ export async function chat(opts: ChatOptions): Promise<ChatResponse> {
   };
 }
 
-/** Tries to parse model output as JSON. Strips ```json fences if present. */
+/**
+ * Strip reasoning-model wrappers before JSON parsing.
+ *
+ * Reasoning models (DeepSeek-R1, Qwen "thinking" variants, etc.) emit a
+ * `<think>...</think>` (or `<reasoning>...</reasoning>`) block before the
+ * actual answer. Ollama's `format:"json"` mode does not always suppress it,
+ * so we remove it here to keep `safeParseJson` robust.
+ */
+export function stripModelReasoning(text: string): string {
+  if (!text) return "";
+  return text
+    .replace(/[\s\S]*?<\/think>/gi, "")
+    .replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, "")
+    .trim();
+}
+
+/** Tries to parse model output as JSON. Strips reasoning blocks and ```json fences if present. */
 export function safeParseJson<T = unknown>(text: string): T | null {
   if (!text) return null;
-  const cleaned = text
+  const cleaned = stripModelReasoning(text)
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/```$/i, "")
     .trim();

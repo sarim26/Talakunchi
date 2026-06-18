@@ -148,7 +148,7 @@ export type RunSummaryInput = {
   /** Compact list of services discovered. */
   services: Array<{ port: number; protocol: string; name?: string | null; product?: string | null; version?: string | null }>;
   /** Subset of findings, sorted by severity desc. */
-  findings: Array<{ title: string; severity: string; evidence?: string | null }>;
+  findings: Array<{ title: string; severity: string; evidence?: string | null; mitreTechniques?: string[] }>;
   /** Manager decisions trace (compact). */
   decisions: Array<{ step: number; tool?: string; intent?: string; reasoning?: string; reason?: string }>;
 };
@@ -278,8 +278,17 @@ function pickOverallRisk(findings: Array<{ severity: string }>): RunSummaryOutpu
 
 export type RunReportInput = RunSummaryInput & {
   /** Include more verbose evidence snippets if available. */
-  findings: Array<{ title: string; severity: string; evidence?: string | null }>;
+  findings: Array<{ title: string; severity: string; evidence?: string | null; mitreTechniques?: string[] }>;
 };
+
+/** Aggregate MITRE technique IDs across findings, with counts, for the report. */
+function summariseMitre(findings: Array<{ mitreTechniques?: string[] }>): Array<{ technique: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const f of findings) {
+    for (const t of f.mitreTechniques ?? []) counts.set(t, (counts.get(t) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([technique, count]) => ({ technique, count })).sort((a, b) => b.count - a.count);
+}
 
 export type RunReportOutput = {
   title: string;
@@ -301,9 +310,10 @@ export async function generateAgentRunReportWithOllama(input: RunReportInput): P
     "2) Executive summary",
     "3) Attack surface overview (services table)",
     "4) Findings (grouped by severity; include evidence snippets)",
-    "5) Recommended remediation plan (prioritized)",
-    "6) Verification checklist",
-    "7) Tooling / what was run (compact)",
+    "5) MITRE ATT&CK mapping (table of technique IDs → finding count; use ONLY the provided mitreSummary / per-finding technique IDs, do not invent techniques)",
+    "6) Recommended remediation plan (prioritized)",
+    "7) Verification checklist",
+    "8) Tooling / what was run (compact)",
     "",
     "Return ONLY the markdown body."
   ].join("\n");
@@ -319,6 +329,7 @@ export async function generateAgentRunReportWithOllama(input: RunReportInput): P
     },
     services: input.services.slice(0, 80),
     findings: input.findings.slice(0, 120),
+    mitreSummary: summariseMitre(input.findings),
     toolsUsed: input.toolsUsed.slice(0, 60),
     decisions: input.decisions.slice(-60)
   };

@@ -36,6 +36,41 @@ const EnvSchema = z.object({
   ),
   RECON_MAX_STEPS: z.coerce.number().int().positive().default(20),
 
+  /**
+   * Engagement scope: comma/space separated IPv4 addresses, IPv4 CIDRs, or exact
+   * hostnames. When non-empty, agentic recon runs are restricted to these targets
+   * (enforced regardless of the pipeline `enforceScope` flag). Empty = unrestricted.
+   */
+  AGENT_SCOPE: z.string().optional().default(""),
+
+  /**
+   * Recon policy. `readonly` (default) never exposes exploitation tools to the
+   * manager. `gated_exploit` registers recon.hydra and the exploit job handler,
+   * but every destructive action still requires an approved command_approvals row.
+   */
+  RECON_MODE: z.enum(["readonly", "gated_exploit"]).default("readonly"),
+  /** Max time a gated tool waits for a command approval before skipping. */
+  APPROVAL_WAIT_MS: z.coerce.number().int().nonnegative().default(120_000),
+  /** Allowlist (comma/space separated) of exploit command prefixes permitted in gated mode. */
+  EXPLOIT_COMMAND_ALLOWLIST: z.string().optional().default(""),
+  /** Allowlist of LHOST values usable by exploit/post-ex handlers. */
+  EXPLOIT_LHOST_ALLOWLIST: z.string().optional().default(""),
+
+  /**
+   * Optional online CVE enrichment. When `CVE_FEED_URL` is set, the enricher
+   * queries `${CVE_FEED_URL}?keyword=<banner>` expecting a JSON array of
+   * `{ id, summary?, severity? }`. When only `NVD_API_KEY` is set, the NVD 2.0
+   * keyword API is used. Offline heuristics remain the default.
+   */
+  CVE_FEED_URL: z.string().optional(),
+  NVD_API_KEY: z.string().optional(),
+
+  /** Optional OSINT connector credentials. Tools no-op (and log) when unset. */
+  SHODAN_API_KEY: z.string().optional(),
+  CENSYS_API_ID: z.string().optional(),
+  CENSYS_API_SECRET: z.string().optional(),
+  SECURITYTRAILS_API_KEY: z.string().optional(),
+
   /** Legacy classic-scan settings (non-MCP pipeline). */
   HYDRA_ENABLED: z.coerce.boolean().default(false),
   HYDRA_USERNAME: z.string().optional(),

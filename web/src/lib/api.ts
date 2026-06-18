@@ -3,10 +3,15 @@ import { z } from "zod";
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8080";
 
 async function http<T>(path: string, init?: RequestInit, schema?: z.ZodType<T>): Promise<T> {
+  const method = (init?.method ?? "GET").toUpperCase();
+  const needsBody = method === "POST" || method === "PUT" || method === "PATCH";
+  const body = init?.body ?? (needsBody ? "{}" : undefined);
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
+    method,
+    body,
     headers: {
-      "content-type": "application/json",
+      ...(body !== undefined ? { "content-type": "application/json" } : {}),
       ...(init?.headers ?? {})
     }
   });
@@ -34,6 +39,7 @@ export const ScanRunSchema = z.object({
   target: z.object({ name: z.string(), address: z.string() }),
   profile: z.string(),
   status: z.string(),
+  cancelRequested: z.boolean().optional(),
   requestedBy: z.string().nullable().optional(),
   startedAt: z.any().optional().nullable(),
   finishedAt: z.any().optional().nullable(),
@@ -126,7 +132,10 @@ export const PipelineConfigSchema = z.object({
   maxConcurrentScans: z.number(),
   requestRatePerMinute: z.number(),
   auditEnabled: z.boolean(),
-  allowedWordlists: z.array(z.string())
+  allowedWordlists: z.array(z.string()),
+  allowedCidrs: z.array(z.string()),
+  enforceScope: z.boolean(),
+  maxConcurrentAgentRuns: z.number()
 });
 export type PipelineConfig = z.infer<typeof PipelineConfigSchema>;
 
@@ -312,6 +321,34 @@ export async function listAuditEvents(limit = 50) {
   return http(`/api/audit-events?limit=${limit}`, undefined, z.array(AuditEventSchema));
 }
 
+export const CommandApprovalSchema = z.object({
+  id: z.string().uuid(),
+  scanRunId: z.string().uuid().nullable().optional(),
+  agentRunId: z.string().uuid().nullable().optional(),
+  tool: z.string().nullable().optional(),
+  command: z.string(),
+  reasoning: z.string().nullable().optional(),
+  impact: z.string(),
+  status: z.string(),
+  decidedBy: z.string().nullable().optional(),
+  args: z.any().optional(),
+  createdAt: z.any(),
+  decidedAt: z.any().nullable().optional()
+});
+export type CommandApproval = z.infer<typeof CommandApprovalSchema>;
+
+export async function listCommandApprovals(status = "pending") {
+  return http(`/api/command-approvals?status=${encodeURIComponent(status)}`, undefined, z.array(CommandApprovalSchema));
+}
+
+export async function approveCommand(id: string) {
+  return http(`/api/command-approvals/${id}/approve`, { method: "POST" }, z.object({ id: z.string(), status: z.string() }));
+}
+
+export async function rejectCommand(id: string) {
+  return http(`/api/command-approvals/${id}/reject`, { method: "POST" }, z.object({ id: z.string(), status: z.string() }));
+}
+
 export async function listReconAssets(targetId: string) {
   const qp = new URLSearchParams();
   qp.set("targetId", targetId);
@@ -392,6 +429,10 @@ export async function listAgentRuns(params?: { targetId?: string; limit?: number
   if (params?.limit) qp.set("limit", String(params.limit));
   const qs = qp.toString() ? `?${qp.toString()}` : "";
   return http(`/api/agent-runs${qs}`, undefined, z.array(AgentRunSchema));
+}
+
+export async function cancelAgentRun(id: string) {
+  return http(`/api/agent-runs/${id}/cancel`, { method: "POST", body: "{}" }, z.object({ ok: z.boolean() }));
 }
 
 export async function getAgentRun(id: string) {

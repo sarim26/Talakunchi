@@ -11,6 +11,13 @@ import { tlsCheckTool } from "./tlsCheck.js";
 import { sshEnumTool } from "./sshEnum.js";
 import { smbEnumTool } from "./smbEnum.js";
 import { cveEnricherTool } from "./cveEnricher.js";
+import { portRecheckTool } from "./portRecheck.js";
+import { infraEnumTools } from "./infraEnum.js";
+import { webScanTools } from "./webScan.js";
+import { osintTools } from "./osint.js";
+import { hydraTool } from "./hydra.js";
+import { postexTools } from "./postex.js";
+import { env } from "../env.js";
 
 /**
  * MCP recon tools. Flow: manager LLM → prompter → executionCommandWriter (when
@@ -29,6 +36,15 @@ export function buildReconMCPServer(): MCPServer {
   server.register(waybackUrlsTool);
   server.register(gobusterTool);
   server.register(ffufTool);
+  server.register(portRecheckTool);
+  for (const tool of infraEnumTools) server.register(tool);
+  for (const tool of webScanTools) server.register(tool);
+  for (const tool of osintTools) server.register(tool);
+  // Gated exploitation tools are only exposed in gated_exploit mode.
+  if (env.RECON_MODE === "gated_exploit") {
+    if (env.HYDRA_ENABLED) server.register(hydraTool);
+    for (const tool of postexTools) server.register(tool);
+  }
   server.register(toolInstallerTool);
   return server;
 }

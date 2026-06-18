@@ -121,6 +121,11 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
   const coverage = coverageFirstDecision(server, ctx);
   if (coverage) return coverage;
 
+  // Drain pending verifications before exploratory LLM steps so unconfirmed
+  // findings get corroborated (or marked unverified) deterministically.
+  const verification = verificationFirstDecision(server, ctx);
+  if (verification) return verification;
+
   const llmDecision = await tryLlmDecision(server, ctx, signal);
   if (llmDecision) {
     if (llmDecision.action === "stop") return llmDecision;
@@ -130,13 +135,75 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
   const fromRec = fallbackFromRecommendations(server, ctx);
   if (fromRec) return fromRec;
 
+  // Cold-start safety net: if the LLM failed and we have no host intel yet,
+  // start with nmap deterministically instead of stopping on step 1.
+  const initialNmap = fallbackInitialNmap(server, ctx);
+  if (initialNmap) return initialNmap;
+
   if (ctx.stepsRemaining <= 0) {
     return { action: "stop", reason: "Step budget exhausted" };
   }
   return {
     action: "stop",
-    reason:
-      "Manager LLM did not return usable JSON after retries, no runnable queued recommendation matched, and steps remain. Check Ollama; try a stronger JSON-capable model or OLLAMA_MANAGER_MODEL with more context."
+    reason: managerStopReasonAfterLlmFailure(lastManagerOllamaError)
+  };
+}
+
+/**
+ * Last error string returned by the manager Ollama call (cleared on each
+ * `tryLlmDecision`). Used to produce a specific stop reason and telemetry.
+ */
+let lastManagerOllamaError: string | undefined;
+
+/** Expose the last manager Ollama error so the orchestrator can record it in telemetry. */
+export function getLastManagerOllamaError(): string | undefined {
+  return lastManagerOllamaError;
+}
+
+/** Turn the raw Ollama failure into an actionable stop reason. */
+function managerStopReasonAfterLlmFailure(ollamaError?: string): string {
+  const e = ollamaError ?? "";
+  if (/system memory|more system memory|out of memory|cuda/i.test(e)) {
+    return `Ollama could not load ${env.OLLAMA_MANAGER_MODEL} (insufficient memory / GPU error). Use a smaller model in OLLAMA_MANAGER_MODEL (e.g. qwen3:8b), free RAM, or run 'ollama stop'. Detail: ${e.slice(0, 200)}`;
+  }
+  if (/not found|404|no such model/i.test(e)) {
+    return `Ollama model "${env.OLLAMA_MANAGER_MODEL}" is not available. Pull it first: 'ollama pull ${env.OLLAMA_MANAGER_MODEL}'.`;
+  }
+  if (e) {
+    return `Manager LLM call to Ollama failed and no deterministic fallback applied. Detail: ${e.slice(0, 200)}`;
+  }
+  return "Manager LLM did not return usable JSON after retries, no runnable queued recommendation matched, and steps remain. Check Ollama; try a stronger JSON-capable model or OLLAMA_MANAGER_MODEL with more context.";
+}
+
+/**
+ * Deterministic cold-start: no ports/services discovered yet and nmap has not
+ * been run — start recon with nmap even if the manager LLM is unavailable.
+ */
+function fallbackInitialNmap(server: MCPServer, ctx: ManagerContext): ManagerDecision | null {
+  if (!server.has("recon.nmap")) return null;
+  const history = ctx.invocationHistory ?? [];
+  if (history.some((h) => h.tool === "recon.nmap")) return null;
+  if ((ctx.knownPorts ?? []).length > 0 || (ctx.knownServices ?? []).length > 0) return null;
+
+  const hints = ctx.runHints;
+  const profile =
+    hints?.initialNmapProfile === "fast" ||
+    hints?.initialNmapProfile === "targeted" ||
+    hints?.initialNmapProfile === "deep" ||
+    hints?.initialNmapProfile === "full"
+      ? hints.initialNmapProfile
+      : "deep";
+  const args: Record<string, unknown> = { profile };
+  if (hints?.initialNmapPorts?.length) args.ports = hints.initialNmapPorts;
+  if (hints?.initialNmapExtraArgs?.trim()) args.extraArgs = hints.initialNmapExtraArgs.trim();
+
+  return {
+    action: "invoke",
+    tool: "recon.nmap",
+    intentGoal: `Discover open ports and services on ${ctx.targetHost} (${profile} scan)`,
+    args,
+    reasoning:
+      "Automatic fallback: manager LLM unavailable; starting with recon.nmap (no ports or services known yet)."
   };
 }
 
@@ -167,6 +234,25 @@ function coverageFirstDecision(server: MCPServer, ctx: ManagerContext): ManagerD
     };
   }
 
+  // Infra specialists: when a matching port is present and the specialist has
+  // not run yet, prioritize it (same coverage-first principle as SMB/SSH).
+  const nameOf = (s: { name?: string; product?: string }) => `${s.product ?? ""} ${s.name ?? ""}`;
+  const infraCoverage: Array<{ tool: string; match: (s: { port: number; protocol: string; name?: string; product?: string }) => boolean; goal: string }> = [
+    { tool: "recon.rdp_enum", match: (s) => s.protocol === "tcp" && (s.port === 3389 || /ms-wbt-server|rdp/i.test(nameOf(s))), goal: "Enumerate RDP encryption and NTLM info (coverage-first)" },
+    { tool: "recon.ftp_enum", match: (s) => s.protocol === "tcp" && (s.port === 21 || /\bftp\b/i.test(nameOf(s))), goal: "Check FTP for anonymous login and banner (coverage-first)" },
+    { tool: "recon.smtp_enum", match: (s) => s.protocol === "tcp" && ([25, 587, 465].includes(s.port) || /smtp/i.test(nameOf(s))), goal: "Enumerate SMTP commands and open-relay posture (coverage-first)" },
+    { tool: "recon.ldap_enum", match: (s) => s.protocol === "tcp" && ([389, 636, 3268, 3269].includes(s.port) || /ldap/i.test(nameOf(s))), goal: "Test LDAP anonymous bind and read naming contexts (coverage-first)" },
+    { tool: "recon.nfs_enum", match: (s) => s.protocol === "tcp" && (s.port === 2049 || /\bnfs\b/i.test(nameOf(s))), goal: "List exported NFS shares with showmount (coverage-first)" },
+    { tool: "recon.redis_enum", match: (s) => s.protocol === "tcp" && (s.port === 6379 || /redis/i.test(nameOf(s))), goal: "Check Redis for unauthenticated access (coverage-first)" },
+    { tool: "recon.snmp_enum", match: (s) => s.protocol === "udp" && (s.port === 161 || /snmp/i.test(nameOf(s))), goal: "Probe SNMP for readable community strings (coverage-first)" },
+    { tool: "recon.db_banner", match: (s) => s.protocol === "tcp" && [3306, 5432, 1433, 1521, 27017].includes(s.port), goal: "Grab database server banners/info (coverage-first)" }
+  ];
+  for (const c of infraCoverage) {
+    if (services.some(c.match) && server.has(c.tool) && !ran.has(c.tool)) {
+      return { action: "invoke", tool: c.tool, intentGoal: c.goal, args: { services }, reasoning: `Coverage-first: a matching service is present but ${c.tool} has not been run yet` };
+    }
+  }
+
   // If services exist but the enrich step hasn't run, do it once to attach
   // vulnerability context before spending more steps on web brute force.
   if (services.length > 0 && server.has("recon.cve_enricher") && !ran.has("recon.cve_enricher")) {
@@ -182,6 +268,21 @@ function coverageFirstDecision(server: MCPServer, ctx: ManagerContext): ManagerD
   return null;
 }
 
+/** Pick the next queued verification whose verifier tool is registered. */
+function verificationFirstDecision(server: MCPServer, ctx: ManagerContext): ManagerDecision | null {
+  for (const v of ctx.pendingVerifications ?? []) {
+    if (!v.verifierTool || !server.has(v.verifierTool)) continue;
+    return {
+      action: "invoke",
+      tool: v.verifierTool,
+      intentGoal: `Corroborate unconfirmed finding ${v.fingerprint} using ${v.verifierTool}`,
+      args: v.args ?? {},
+      reasoning: `Verification-first: ${v.fingerprint} is still unconfirmed; running ${v.verifierTool} to corroborate it.`
+    };
+  }
+  return null;
+}
+
 async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: AbortSignal): Promise<ManagerDecision | null> {
   const systemMsg = [
     "You are the MANAGER agent of a multi-agent penetration testing system.",
@@ -194,7 +295,11 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
     "",
     "Use the tools list as the authoritative registry. Pick the single best next step from context:",
     "  - No open ports yet → usually start with recon.nmap (or recon.dns_enum if you already have enough host intel).",
+    "  - Optional, low priority: for PUBLIC hostnames you may run recon.passive_dns / recon.osint before nmap to gather passive intel; these no-op without API keys, so skip them otherwise.",
     "  - After services exist → choose the most informative specialist (http_probe, ssh_enum, smb_enum, tls_check, cve_enricher, spider, waybackurls, gobuster, ffuf, etc.).",
+    "  - Infra services map to dedicated specialists: 3389→rdp_enum, 21→ftp_enum, 25/587/465→smtp_enum, 389/636→ldap_enum, 2049→nfs_enum, 6379→redis_enum, 161/udp→snmp_enum, 3306/5432/1433→db_banner. Run these when the matching port is open.",
+    "  - recon.nuclei (safe tags) and recon.waf_detect operate on web origins: run recon.http_probe first so HTTP seeds/discoveredEndpoints exist, then use them.",
+    "  - recon.hydra (only present in gated mode) is a credentialed check on auth services; it pauses for human approval before running. Choose it only when an auth service (ssh/ftp/rdp/smb/db) is open and credential testing is in scope.",
     "  - Follow tool `requires` hints; do not invoke a tool whose preconditions are clearly unmet.",
     "  - Prefer system.tool_installer only when a prior failure indicated a missing remote CLI (recentFailures.missingTool) — the orchestrator may force-install before you run again.",
     "",
@@ -219,6 +324,7 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
     { mode: "minimal", temp: 0.05, maxTokens: 1200 }
   ];
 
+  lastManagerOllamaError = undefined;
   for (let i = 0; i < attempts.length; i += 1) {
     const { mode, temp, maxTokens } = attempts[i]!;
     const userMsg = JSON.stringify(buildManagerUserPayload(server, ctx, mode), null, 2);
@@ -257,7 +363,8 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
       }
       return d;
     } catch (e) {
-      console.warn(`[manager] Ollama attempt ${i + 1} (${mode}): ${(e as Error).message}`);
+      lastManagerOllamaError = (e as Error).message;
+      console.warn(`[manager] Ollama attempt ${i + 1} (${mode}): ${lastManagerOllamaError}`);
     }
   }
   return null;

@@ -16,7 +16,10 @@ const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   requestRatePerMinute: 120,
   auditEnabled: true,
   // Prefer Kali-provided SecLists by default.
-  allowedWordlists: ["/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-10000.txt"]
+  allowedWordlists: ["/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-10000.txt"],
+  allowedCidrs: [],
+  enforceScope: false,
+  maxConcurrentAgentRuns: 1
 };
 
 async function ensureWorkflowTables() {
@@ -177,6 +180,66 @@ app.get("/api/audit-events", async (req) => {
     payload: r.payload ?? {},
     createdAt: r.created_at
   }));
+});
+
+// --- Command approval queue (Phase 9 gated exploitation) ---
+app.get("/api/command-approvals", async (req) => {
+  const q = req.query as any;
+  const status = typeof q.status === "string" ? q.status : "pending";
+  const rows = await withClient(async (c) => {
+    const res = await c.query(
+      `select id, scan_run_id, agent_run_id, tool, command, reasoning, impact, status, decided_by, args, created_at, decided_at
+       from command_approvals
+       where ($1 = 'all' or status = $1)
+       order by created_at desc
+       limit 100`,
+      [status]
+    );
+    return res.rows;
+  });
+  return rows.map((r) => ({
+    id: r.id,
+    scanRunId: r.scan_run_id,
+    agentRunId: r.agent_run_id,
+    tool: r.tool,
+    command: r.command,
+    reasoning: r.reasoning,
+    impact: r.impact,
+    status: r.status,
+    decidedBy: r.decided_by,
+    args: r.args ?? {},
+    createdAt: r.created_at,
+    decidedAt: r.decided_at
+  }));
+});
+
+async function decideApproval(id: string, status: "approved" | "rejected") {
+  return withClient(async (c) => {
+    const res = await c.query(
+      `update command_approvals
+       set status = $2, decided_by = 'operator', decided_at = now()
+       where id = $1 and status = 'pending'
+       returning id, status`,
+      [id, status]
+    );
+    return res.rows[0];
+  });
+}
+
+app.post("/api/command-approvals/:id/approve", async (req, reply) => {
+  const id = z.string().uuid().parse((req.params as any).id);
+  const row = await decideApproval(id, "approved");
+  if (!row) return reply.code(409).send({ error: "Approval not found or already decided." });
+  await writeAuditEvent("command.approved", { id }, undefined, "operator");
+  return { id: row.id, status: row.status };
+});
+
+app.post("/api/command-approvals/:id/reject", async (req, reply) => {
+  const id = z.string().uuid().parse((req.params as any).id);
+  const row = await decideApproval(id, "rejected");
+  if (!row) return reply.code(409).send({ error: "Approval not found or already decided." });
+  await writeAuditEvent("command.rejected", { id }, undefined, "operator");
+  return { id: row.id, status: row.status };
 });
 
 // --- Demo admin: reset database (two-step confirmation) ---
@@ -435,6 +498,22 @@ app.post("/api/scans/:id/cancel", async (req, reply) => {
   return reply.send({ ok: true });
 });
 
+app.post("/api/agent-runs/:id/cancel", async (req, reply) => {
+  const agentRunId = z.string().uuid().parse((req.params as any).id);
+  await withClient(async (c) => {
+    await c.query(`alter table agent_runs add column if not exists cancel_requested boolean not null default false`);
+    await c.query(`update agent_runs set cancel_requested = true where id = $1`, [agentRunId]);
+    // If the recon job hasn't started yet, also mark queued job as failed so worker never starts it.
+    await c.query(
+      `update jobs set status='failed', error='cancelled before start', updated_at=now()
+       where type='recon-mcp' and status='queued' and payload->>'agentRunId' = $1`,
+      [agentRunId]
+    );
+  });
+  await writeAuditEvent("agent_run.cancel_requested", { agentRunId }, undefined, "operator");
+  return reply.send({ ok: true });
+});
+
 app.get("/api/scans/:id/messages", async (req) => {
   const scanRunId = z.string().uuid().parse((req.params as any).id);
   const rows = await withClient(async (c) => {
@@ -545,7 +624,7 @@ app.get("/api/scans", async () => {
   const rows = await withClient(async (c) => {
     const res = await c.query(
       `select sr.id, sr.target_id, t.name as target_name, t.address as target_address,
-              sr.profile, sr.status, sr.requested_by, sr.started_at, sr.finished_at, sr.created_at
+              sr.profile, sr.status, sr.cancel_requested, sr.requested_by, sr.started_at, sr.finished_at, sr.created_at
        from scan_runs sr
        join targets t on t.id = sr.target_id
        order by sr.created_at desc
@@ -559,6 +638,7 @@ app.get("/api/scans", async () => {
     target: { name: r.target_name, address: r.target_address },
     profile: r.profile,
     status: r.status,
+    cancelRequested: Boolean(r.cancel_requested),
     requestedBy: r.requested_by,
     startedAt: r.started_at,
     finishedAt: r.finished_at,
@@ -572,7 +652,7 @@ app.get("/api/scans/:id", async (req) => {
   const result = await withClient(async (c) => {
     const runRes = await c.query(
       `select sr.id, sr.target_id, t.name as target_name, t.address as target_address,
-              sr.profile, sr.status, sr.requested_by, sr.started_at, sr.finished_at, sr.created_at
+              sr.profile, sr.status, sr.cancel_requested, sr.requested_by, sr.started_at, sr.finished_at, sr.created_at
        from scan_runs sr
        join targets t on t.id = sr.target_id
        where sr.id = $1`,
@@ -595,6 +675,7 @@ app.get("/api/scans/:id", async (req) => {
     target: { name: result.run.target_name, address: result.run.target_address },
     profile: result.run.profile,
     status: result.run.status,
+    cancelRequested: Boolean(result.run.cancel_requested),
     requestedBy: result.run.requested_by,
     startedAt: result.run.started_at,
     finishedAt: result.run.finished_at,
@@ -855,6 +936,43 @@ app.patch("/api/findings/:id", async (req) => {
   });
 
   return { id: updated.id, status: updated.status, severity: updated.severity };
+});
+
+app.post("/api/findings/:id/push-ticket", async (req, reply) => {
+  if (!env.TICKET_WEBHOOK_URL) {
+    return reply.code(400).send({ error: "TICKET_WEBHOOK_URL is not configured." });
+  }
+  const findingId = z.string().uuid().parse((req.params as any).id);
+  const finding = await withClient(async (c) => {
+    const res = await c.query(
+      `select f.id, f.title, f.severity, f.evidence_redacted, f.mitre_techniques, t.name as target_name, t.address as target_address
+       from findings f join targets t on t.id = f.target_id
+       where f.id = $1`,
+      [findingId]
+    );
+    return res.rows[0];
+  });
+  if (!finding) return reply.code(404).send({ error: "Finding not found." });
+
+  const payload = {
+    title: `[${String(finding.severity).toUpperCase()}] ${finding.title}`,
+    target: { name: finding.target_name, address: finding.target_address },
+    severity: finding.severity,
+    mitreTechniques: Array.isArray(finding.mitre_techniques) ? finding.mitre_techniques : [],
+    evidence: finding.evidence_redacted
+  };
+  try {
+    const res = await fetch(env.TICKET_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) return reply.code(502).send({ error: `Ticket webhook HTTP ${res.status}` });
+  } catch (err) {
+    return reply.code(502).send({ error: (err as Error).message });
+  }
+  await writeAuditEvent("finding.ticket.pushed", { findingId, severity: finding.severity }, String(finding.target_address), "operator");
+  return { ok: true, pushed: payload.title };
 });
 
 app.post("/api/findings/:id/explain", async (req, reply) => {
@@ -1364,7 +1482,7 @@ app.post("/api/agent-runs/:id/report", async (req, reply) => {
 
   const findings = await withClient(async (c) => {
     const r = await c.query(
-      `select title, severity, evidence_redacted
+      `select title, severity, evidence_redacted, mitre_techniques
          from findings where target_id = $1
          order by case severity
                     when 'critical' then 0 when 'high' then 1
@@ -1405,7 +1523,8 @@ app.post("/api/agent-runs/:id/report", async (req, reply) => {
     findings: findings.map((f: any) => ({
       title: String(f.title),
       severity: String(f.severity),
-      evidence: f.evidence_redacted ? String(f.evidence_redacted).slice(0, 700) : null
+      evidence: f.evidence_redacted ? String(f.evidence_redacted).slice(0, 700) : null,
+      mitreTechniques: Array.isArray(f.mitre_techniques) ? f.mitre_techniques.map(String) : []
     })),
     decisions: decisions.map((d: any, idx: number) => {
       const p = (d.payload ?? {}) as { step?: number; decision?: { tool?: string; intentGoal?: string; reasoning?: string; action?: string; reason?: string } };
@@ -1454,7 +1573,18 @@ app.post("/api/agent-runs/:id/report", async (req, reply) => {
 });
 
 app.get("/api/agent-tools", async () => {
-  // Stable list: keep in lock-step with worker/src/agents/registry.ts
+  // Single source of truth: the worker publishes its live MCP registry to
+  // agent_tool_manifest on boot. Serve that; fall back to the static list only
+  // if the worker has not published yet (fresh DB / worker not started).
+  const published = await withClient(async (c) => {
+    const r = await c.query(`select manifest from agent_tool_manifest where id = 1`);
+    return r.rows[0]?.manifest as Array<{ name: string; description: string; tags?: string[] }> | undefined;
+  }).catch(() => undefined);
+  if (Array.isArray(published) && published.length > 0) {
+    return published.map((t) => ({ name: t.name, description: t.description, tags: t.tags ?? [] }));
+  }
+
+  // Fallback list (only used before the worker publishes its manifest).
   return [
     { name: "recon.nmap", description: "Run an nmap scan to discover open ports and detect services on a target host.", tags: ["recon", "network"] },
     {

@@ -41,6 +41,8 @@ services:
       AI_MODE: "ollama"
       OLLAMA_URL: "${OLLAMA_URL:-http://host.docker.internal:11434}"
       OLLAMA_EXPLAIN_MODEL: "${OLLAMA_EXPLAIN_MODEL:-qwen3:14b}"
+      # Optional: push high/critical findings to an external tracker webhook.
+      TICKET_WEBHOOK_URL: "${TICKET_WEBHOOK_URL:-}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -69,6 +71,20 @@ services:
       OLLAMA_COMMAND_WRITER_MODEL: "${OLLAMA_COMMAND_WRITER_MODEL:-qwen2.5-coder:7b}"
       OLLAMA_PROMPTER_MODEL: "${OLLAMA_PROMPTER_MODEL:-qwen3:14b}"
       RECON_MAX_STEPS: "${RECON_MAX_STEPS:-20}"
+      # Engagement scope: comma/space separated IPv4 / CIDR / hostnames. Empty = unrestricted.
+      AGENT_SCOPE: "${AGENT_SCOPE:-}"
+      # Recon policy: readonly (default) or gated_exploit (exposes recon.hydra + exploit jobs behind approvals).
+      RECON_MODE: "${RECON_MODE:-readonly}"
+      APPROVAL_WAIT_MS: "${APPROVAL_WAIT_MS:-120000}"
+      EXPLOIT_COMMAND_ALLOWLIST: "${EXPLOIT_COMMAND_ALLOWLIST:-}"
+      EXPLOIT_LHOST_ALLOWLIST: "${EXPLOIT_LHOST_ALLOWLIST:-}"
+      # Optional online CVE enrichment + OSINT connector keys (all optional).
+      CVE_FEED_URL: "${CVE_FEED_URL:-}"
+      NVD_API_KEY: "${NVD_API_KEY:-}"
+      SHODAN_API_KEY: "${SHODAN_API_KEY:-}"
+      CENSYS_API_ID: "${CENSYS_API_ID:-}"
+      CENSYS_API_SECRET: "${CENSYS_API_SECRET:-}"
+      SECURITYTRAILS_API_KEY: "${SECURITYTRAILS_API_KEY:-}"
       # Optional deterministic credential checks during scan stage (legacy hydra path)
       HYDRA_ENABLED: "${HYDRA_ENABLED:-false}"
       # Hydra runs on the SSH host; these paths must exist there (container /wordlists mount is optional).

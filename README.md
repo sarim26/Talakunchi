@@ -52,6 +52,21 @@ Specialists preflight required binaries with `command -v <tool>`. If a tool is m
 - `worker/`: TypeScript worker that polls Postgres for scan jobs
 - `db/init.sql`: DB schema for prototype
 
+## Ollama model RAM tiers (16 GB host)
+The MCP recon system uses several Ollama models. On a 16 GB machine, keep **one heavy model loaded at a time** — the worker calls them serially, so memory pressure comes from leaving multiple large models resident.
+
+| Role | Env var | Suggested model (16 GB) | Notes |
+|------|---------|-------------------------|-------|
+| Manager (reasoning, tool choice) | `OLLAMA_MANAGER_MODEL` | `qwen3:8b` (or `deepseek-r1:14b` only with free RAM) | DeepSeek-R1 needs `stripModelReasoning` (already applied) and enough free host RAM after lowering Docker/WSL caps |
+| Prompter (intent → prose) | `OLLAMA_PROMPTER_MODEL` | `qwen3:8b`–`qwen3:14b` | |
+| Execution writer / specialist | `OLLAMA_SPECIALIST_MODEL`, `OLLAMA_COMMAND_WRITER_MODEL` | `qwen2.5-coder:7b` | structured arg filling |
+| AI summary / report (API) | `OLLAMA_EXPLAIN_MODEL` | `qwen3:14b` (run one at a time) | |
+
+Tips for 16 GB / WSL2:
+- Lower the WSL `memory=` cap (e.g. 6–8 GB) in `%UserProfile%\.wslconfig` so the host keeps RAM for native Ollama.
+- Use `ollama ps` to see loaded models and `ollama stop <model>` to free one before loading another.
+- If the manager stops on step 1 with a memory/CUDA error, switch `OLLAMA_MANAGER_MODEL` to a smaller model; the orchestrator still falls back to `recon.nmap` on a cold start.
+
 ## Notes
 - This is a prototype. Hardening (Okta, approvals, strict allowlists, Azure deployment) comes next.
 

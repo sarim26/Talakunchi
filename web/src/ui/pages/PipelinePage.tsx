@@ -22,17 +22,22 @@ import {
   AgentEvent,
   AgentInvocation,
   AgentRun,
+  approveCommand,
+  cancelAgentRun,
+  cancelScan,
   getAgentRun,
   getAgentRunEvents,
   getAgentRunInvocations,
   getPipelineConfig,
   listAgentRuns,
   listAuditEvents,
+  listCommandApprovals,
   listFindings,
   listReconAssets,
   listScans,
   listServices,
   listTargets,
+  rejectCommand,
   updatePipelineConfig
 } from "../../lib/api";
 
@@ -94,6 +99,7 @@ export function PipelinePage() {
   const [activePhase, setActivePhase] = React.useState(0);
   const [targetId, setTargetId] = React.useState("");
   const [draftWordlists, setDraftWordlists] = React.useState("");
+  const [draftCidrs, setDraftCidrs] = React.useState("");
   const targetsQ = useQuery({ queryKey: ["targets"], queryFn: listTargets, refetchInterval: 5000 });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: listScans, refetchInterval: 5000 });
   const findingsQ = useQuery({ queryKey: ["findings", targetId], queryFn: () => listFindings({ targetId: targetId || undefined }), refetchInterval: 5000 });
@@ -111,6 +117,22 @@ export function PipelinePage() {
   });
   const pipelineQ = useQuery({ queryKey: ["pipeline-config"], queryFn: getPipelineConfig, refetchInterval: 5000 });
   const auditQ = useQuery({ queryKey: ["audit-events"], queryFn: () => listAuditEvents(12), refetchInterval: 5000 });
+  const approvalsQ = useQuery({ queryKey: ["command-approvals"], queryFn: () => listCommandApprovals("pending"), refetchInterval: 4000 });
+  const approveM = useMutation({
+    mutationFn: approveCommand,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["command-approvals"] })
+  });
+  const rejectM = useMutation({
+    mutationFn: rejectCommand,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["command-approvals"] })
+  });
+  const cancelScanM = useMutation({
+    mutationFn: cancelScan,
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["runs"] });
+      await qc.invalidateQueries({ queryKey: ["audit-events"] });
+    }
+  });
 
   const saveM = useMutation({
     mutationFn: updatePipelineConfig,
@@ -126,6 +148,7 @@ export function PipelinePage() {
     if (!pipelineQ.data) return;
     setConfig(pipelineQ.data);
     setDraftWordlists(pipelineQ.data.allowedWordlists.join("\n"));
+    setDraftCidrs((pipelineQ.data.allowedCidrs ?? []).join("\n"));
   }, [pipelineQ.data]);
 
   const stage = WORKFLOW_STAGES[activePhase];
@@ -139,6 +162,10 @@ export function PipelinePage() {
     const next = {
       ...config,
       allowedWordlists: draftWordlists
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      allowedCidrs: draftCidrs
         .split("\n")
         .map((s) => s.trim())
         .filter(Boolean)
@@ -217,6 +244,13 @@ export function PipelinePage() {
                       onChange={(e) => setConfig({ ...config, requestRatePerMinute: Number(e.target.value) || 1 })}
                       fullWidth
                     />
+                    <TextField
+                      label="Max concurrent agent runs"
+                      type="number"
+                      value={config.maxConcurrentAgentRuns}
+                      onChange={(e) => setConfig({ ...config, maxConcurrentAgentRuns: Number(e.target.value) || 1 })}
+                      fullWidth
+                    />
                   </Stack>
                   <TextField
                     label="Allowed wordlists (one path per line)"
@@ -226,11 +260,20 @@ export function PipelinePage() {
                     onChange={(e) => setDraftWordlists(e.target.value)}
                     fullWidth
                   />
+                  <TextField
+                    label="Engagement scope — IPs / CIDRs / hostnames (one per line)"
+                    multiline
+                    minRows={3}
+                    value={draftCidrs}
+                    onChange={(e) => setDraftCidrs(e.target.value)}
+                    helperText="When enforcement is on, recon runs against targets outside this list are aborted."
+                    fullWidth
+                  />
 
                   <Stack direction={{ xs: "column", md: "row" }} spacing={2}>
                     <Stack direction="row" spacing={1} alignItems="center">
-                    </Stack>
-                    <Stack direction="row" spacing={1} alignItems="center">
+                      <Switch checked={config.enforceScope} onChange={(_e, checked) => setConfig({ ...config, enforceScope: checked })} />
+                      <Typography variant="body2">Enforce scope</Typography>
                     </Stack>
 
                     <Stack direction="row" spacing={1} alignItems="center">
@@ -247,6 +290,55 @@ export function PipelinePage() {
               ) : (
                 <Typography variant="body2" color="text.secondary">
                   Loading pipeline configuration...
+                </Typography>
+              )}
+            </Box>
+          ) : null}
+
+          {stage.id === 1 ? (
+            <Box sx={{ mb: 2 }}>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Active Scan Runs
+              </Typography>
+              {runs.filter((r) => r.status === "queued" || r.status === "running").length ? (
+                <Stack spacing={1}>
+                  {runs
+                    .filter((r) => r.status === "queued" || r.status === "running")
+                    .slice(0, 8)
+                    .map((r) => {
+                      const canCancel = !(r.cancelRequested ?? false);
+                      return (
+                        <Box key={r.id} sx={{ p: 1.25, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+                          <Stack direction={{ xs: "column", md: "row" }} spacing={1} alignItems={{ md: "center" }} justifyContent="space-between">
+                            <Stack spacing={0.25}>
+                              <Typography variant="body2">
+                                <strong>{r.target.name}</strong> ({r.target.address}) · {r.profile}
+                              </Typography>
+                              <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                                <Chip size="small" label={r.status} />
+                                {r.cancelRequested ? <Chip size="small" color="warning" label="cancel requested" /> : null}
+                                <Chip size="small" variant="outlined" label={r.id.slice(0, 8)} />
+                              </Stack>
+                            </Stack>
+                            <Stack direction="row" spacing={1} alignItems="center">
+                              <Button
+                                size="small"
+                                variant="outlined"
+                                color="error"
+                                disabled={!canCancel || cancelScanM.isPending}
+                                onClick={() => cancelScanM.mutate(r.id)}
+                              >
+                                Stop scan
+                              </Button>
+                            </Stack>
+                          </Stack>
+                        </Box>
+                      );
+                    })}
+                </Stack>
+              ) : (
+                <Typography variant="body2" color="text.secondary">
+                  No active scans right now.
                 </Typography>
               )}
             </Box>
@@ -280,6 +372,42 @@ export function PipelinePage() {
                     </Typography>
                   )}
                 </Stack>
+              )}
+            </Box>
+          ) : null}
+
+          {stage.id === 4 ? (
+            <Box sx={{ mb: 2 }}>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Command Approval Queue
+              </Typography>
+              {(approvalsQ.data ?? []).length ? (
+                <Stack spacing={1}>
+                  {(approvalsQ.data ?? []).map((a) => (
+                    <Box key={a.id} sx={{ p: 1.5, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+                      <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap sx={{ mb: 0.5 }}>
+                        <Chip size="small" color="warning" label={a.impact} />
+                        {a.tool ? <Chip size="small" variant="outlined" label={a.tool} /> : null}
+                      </Stack>
+                      <Typography variant="body2" sx={{ fontFamily: "monospace", mb: 0.5 }}>{a.command}</Typography>
+                      {a.reasoning ? (
+                        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>{a.reasoning}</Typography>
+                      ) : null}
+                      <Stack direction="row" spacing={1}>
+                        <Button size="small" variant="contained" color="success" disabled={approveM.isPending} onClick={() => approveM.mutate(a.id)}>
+                          Approve
+                        </Button>
+                        <Button size="small" variant="outlined" color="error" disabled={rejectM.isPending} onClick={() => rejectM.mutate(a.id)}>
+                          Reject
+                        </Button>
+                      </Stack>
+                    </Box>
+                  ))}
+                </Stack>
+              ) : (
+                <Typography variant="body2" color="text.secondary">
+                  No pending approvals. Gated exploit/hydra commands awaiting human sign-off appear here.
+                </Typography>
               )}
             </Box>
           ) : null}
@@ -368,6 +496,14 @@ function LatestAgentTelemetry(props: { targetId: string }) {
     refetchInterval: 4000
   });
   const latest: AgentRun | undefined = runsQ.data?.[0];
+  const qc = useQueryClient();
+  const cancelAgentM = useMutation({
+    mutationFn: cancelAgentRun,
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["agent-runs-latest"] });
+      await qc.invalidateQueries({ queryKey: ["audit-events"] });
+    }
+  });
 
   const runQ = useQuery({
     queryKey: ["pipeline-agent-run", latest?.id],
@@ -422,6 +558,11 @@ function LatestAgentTelemetry(props: { targetId: string }) {
             variant="outlined"
             color={run.findingCount ? "warning" : "default"}
           />
+          {(run.status === "queued" || run.status === "running") ? (
+            <Button size="small" color="error" variant="outlined" disabled={cancelAgentM.isPending} onClick={() => cancelAgentM.mutate(run.id)}>
+              Stop agent run
+            </Button>
+          ) : null}
           <Button size="small" component={Link} to="/agents">Open Agentic Recon</Button>
         </Stack>
       </Stack>

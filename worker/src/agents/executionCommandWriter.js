@@ -1,0 +1,255 @@
+/**
+ * Execution command writer.
+ *
+ * After the prompter has produced a specialist-facing instruction string,
+ * this module asks an LLM to translate that prose into the structured
+ * `args` payload that the already-selected MCP tool understands (per its
+ * `argSchema`). It does NOT pick the tool — the manager already did that.
+ *
+ * Pipeline position:
+ *   manager → prompter → executionCommandWriter → server.invoke(tool, args)
+ *
+ * Contracts:
+ *   - Input: chosen tool definition, prompter text, manager intent + args,
+ *            run context (target, ports, services, endpoints, wordlists).
+ *   - Output: a sanitized record of args plus metadata for telemetry. Manager
+ *            args take precedence on conflict; the writer fills missing keys.
+ *   - Failure: returns the manager args unchanged with `source: "manager"`
+ *              so the orchestrator can still invoke the tool.
+ */
+import { z } from "zod";
+import { env } from "../env.js";
+import { chatJSON } from "../llm/ollama.js";
+import { isWordlistAllowed } from "./wordlists.js";
+const DraftSchema = z.object({
+    args: z.record(z.string(), z.any()).default({}),
+    rationale: z.string().optional()
+});
+/**
+ * Merge writer-drafted args with manager-provided args. Manager wins on
+ * conflict so explicit decisions higher up the stack are never overridden.
+ */
+function mergeArgs(managerArgs, draftArgs) {
+    const base = { ...(managerArgs ?? {}) };
+    let touched = false;
+    for (const [k, v] of Object.entries(draftArgs)) {
+        if (v === undefined || v === null)
+            continue;
+        if (Object.prototype.hasOwnProperty.call(base, k))
+            continue;
+        base[k] = v;
+        touched = true;
+    }
+    return { merged: base, source: touched ? "merged" : "manager" };
+}
+/**
+ * Strip any obviously-bogus keys the LLM might invent (e.g. URLs that don't
+ * point at this run's target host, wordlists outside the SecLists catalog).
+ * Specialists already do their own validation, but trimming here keeps the
+ * telemetry honest and avoids burning a tool turn on garbage.
+ */
+function sanitizeDraft(tool, draft, ctx) {
+    const cleaned = {};
+    const dropped = [];
+    const allowedKeys = new Set(Object.keys(tool.argSchema ?? {}));
+    for (const [k, v] of Object.entries(draft)) {
+        if (allowedKeys.size > 0 && !allowedKeys.has(k)) {
+            dropped.push(`${k} (not in argSchema)`);
+            continue;
+        }
+        if (k === "http_targets" && Array.isArray(v)) {
+            const ok = [];
+            for (const item of v) {
+                if (typeof item !== "string")
+                    continue;
+                try {
+                    const u = new URL(item.trim());
+                    if (u.hostname !== ctx.target.host) {
+                        dropped.push(`http_targets item (host ${u.hostname} != target ${ctx.target.host})`);
+                        continue;
+                    }
+                    if (u.protocol !== "http:" && u.protocol !== "https:")
+                        continue;
+                    ok.push(u.href);
+                }
+                catch {
+                    dropped.push("http_targets item (invalid URL)");
+                }
+            }
+            if (ok.length)
+                cleaned[k] = ok;
+            continue;
+        }
+        if (k === "urls" && Array.isArray(v)) {
+            const ok = [];
+            for (const item of v) {
+                if (typeof item !== "string")
+                    continue;
+                const t = item.trim();
+                if (!t)
+                    continue;
+                if (/^https?:\/\//i.test(t)) {
+                    try {
+                        const u = new URL(t);
+                        if (u.hostname !== ctx.target.host) {
+                            dropped.push(`urls item (host ${u.hostname} != target ${ctx.target.host})`);
+                            continue;
+                        }
+                        if (u.protocol !== "http:" && u.protocol !== "https:")
+                            continue;
+                        ok.push(u.href);
+                    }
+                    catch {
+                        dropped.push("urls item (invalid URL)");
+                    }
+                    continue;
+                }
+                if (t.length > 800 || /\s/.test(t) || t.includes("..")) {
+                    dropped.push("urls item (unsafe or invalid path)");
+                    continue;
+                }
+                ok.push(t.startsWith("/") ? t : `/${t}`);
+            }
+            if (ok.length)
+                cleaned[k] = ok;
+            continue;
+        }
+        if (k === "services" && Array.isArray(v)) {
+            const out = [];
+            for (const item of v) {
+                if (!item || typeof item !== "object")
+                    continue;
+                const o = item;
+                const port = Number(o.port);
+                if (!Number.isFinite(port) || port < 1 || port > 65535)
+                    continue;
+                out.push({
+                    port,
+                    ...(typeof o.protocol === "string" ? { protocol: o.protocol } : {}),
+                    ...(typeof o.name === "string" ? { name: o.name } : {}),
+                    ...(typeof o.product === "string" ? { product: o.product } : {}),
+                    ...(typeof o.version === "string" ? { version: o.version } : {})
+                });
+            }
+            if (out.length)
+                cleaned[k] = out;
+            continue;
+        }
+        if ((k === "url" || k === "targetUrl") && typeof v === "string") {
+            try {
+                const u = new URL(v.replace(/FUZZ/g, "x"));
+                if (u.hostname !== ctx.target.host) {
+                    dropped.push(`${k} (host ${u.hostname} != target ${ctx.target.host})`);
+                    continue;
+                }
+            }
+            catch {
+                dropped.push(`${k} (invalid URL)`);
+                continue;
+            }
+        }
+        if (k === "wordlist" && typeof v === "string" && ctx.wordlistCatalog) {
+            if (!isWordlistAllowed(ctx.wordlistCatalog, v)) {
+                dropped.push(`wordlist (not in SecLists catalog)`);
+                continue;
+            }
+        }
+        cleaned[k] = v;
+    }
+    return { cleaned, dropped };
+}
+export async function draftExecutionPayload(input) {
+    const { tool, prompterText, intentGoal, managerArgs, context, signal } = input;
+    const model = env.executionWriterModel;
+    const wordlistHints = (() => {
+        const cat = context.wordlistCatalog;
+        if (!cat?.rootExists)
+            return null;
+        const top = (list, n = 5) => list.slice(0, n).map((e) => ({ path: e.path, label: e.label }));
+        return {
+            root: cat.root,
+            defaults: cat.defaults,
+            webContent: top(cat.byCategory["discovery-web-content"]),
+            dnsSubdomains: top(cat.byCategory["discovery-dns"])
+        };
+    })();
+    const schemaKeys = Object.keys(tool.argSchema ?? {});
+    const maxTokens = Math.min(2048, 450 + schemaKeys.length * 90);
+    const systemMsg = [
+        "You are EXECUTION_COMMAND_WRITER for an autonomous penetration-testing pipeline.",
+        "The MANAGER has already chosen the tool. The PROMPTER has produced an instruction.",
+        "Your only job is to translate that instruction into a JSON `args` object that the chosen tool can execute.",
+        "You do NOT output shell commands; each tool maps validated args to its CLI (e.g. katana flags from depth, http_targets, etc.).",
+        "",
+        "Hard rules:",
+        "- Return ONLY a JSON object, no markdown fences, no commentary.",
+        `- Tool: ${tool.name}.`,
+        `- Tool description: ${tool.description}`,
+        `- Tool argSchema (use ONLY these keys): ${JSON.stringify(tool.argSchema ?? {}, null, 0)}`,
+        `- Target host MUST equal: ${context.target.host}. Full URLs must use this host; \`urls\` may also use path-only strings (e.g. /uploads/) expanded per args.ports / context.`,
+        "- If a wordlist is needed, choose an absolute path from the provided SecLists catalog.",
+        "- Do not invent unknown keys. Omit fields you are unsure about (defaults will apply).",
+        "- Do not include a 'tool' or 'name' field; just args.",
+        "",
+        'Schema: { "args": { ... per argSchema ... }, "rationale": "<one-line why>" }'
+    ].join("\n");
+    const userMsg = JSON.stringify({
+        intentGoal,
+        prompterInstruction: prompterText.slice(0, 4000),
+        managerArgs: managerArgs ?? {},
+        target: { host: context.target.host, ip: context.target.ip ?? null },
+        knownPorts: context.knownPorts.slice(0, 40),
+        knownServices: context.knownServices.slice(0, 30),
+        discoveredEndpoints: context.discoveredEndpoints.slice(-15).map((e) => ({
+            url: e.url,
+            method: e.method ?? "GET",
+            status: e.status ?? null
+        })),
+        wordlists: wordlistHints
+    }, null, 2);
+    const fallback = (diag) => ({
+        finalArgs: { ...(managerArgs ?? {}) },
+        draftArgs: {},
+        source: "manager",
+        diag,
+        modelUsed: model
+    });
+    let raw = "";
+    try {
+        const r = await chatJSON({
+            model,
+            messages: [
+                { role: "system", content: systemMsg },
+                { role: "user", content: userMsg }
+            ],
+            temperature: 0.2,
+            maxTokens,
+            signal
+        });
+        raw = r.raw ?? "";
+        if (r.value === null) {
+            return fallback(`No JSON from execution writer (raw len ${raw.length})`);
+        }
+        const parsed = DraftSchema.safeParse(r.value);
+        if (!parsed.success) {
+            const msg = parsed.error.errors.slice(0, 4).map((e) => `${e.path.join(".")}: ${e.message}`).join("; ");
+            return fallback(`Schema mismatch: ${msg}`);
+        }
+        const { cleaned, dropped } = sanitizeDraft(tool, parsed.data.args, context);
+        const { merged, source } = mergeArgs(managerArgs, cleaned);
+        return {
+            finalArgs: merged,
+            draftArgs: parsed.data.args,
+            source: source === "manager" && Object.keys(cleaned).length > 0 ? "merged" : source,
+            diag: dropped.length > 0 ? `Dropped: ${dropped.join("; ")}` : undefined,
+            modelUsed: model
+        };
+    }
+    catch (e) {
+        return fallback(`Ollama error: ${e.message}`);
+    }
+}
+/** True when the tool declares structured `argSchema` keys (execution writer fills args from prompter text). */
+export function shouldUseExecutionWriter(tool) {
+    return Object.keys(tool.argSchema ?? {}).length > 0;
+}

@@ -10,6 +10,7 @@
  * an EventSink for a given run and pass it into MCPServer.invoke().
  */
 import { withClient } from "../db.js";
+import { mitreTechniquesFor } from "./mitre.js";
 import type { ToolEnvelope } from "../mcp/types.js";
 
 export type AgentRunSpec = {
@@ -34,6 +35,7 @@ export async function ensureAgentTables() {
         id uuid primary key default uuid_generate_v4(),
         target_id uuid not null references targets(id) on delete cascade,
         status text not null default 'queued',
+        cancel_requested boolean not null default false,
         manager_model text not null default '',
         specialist_model text not null default '',
         prompter_model text not null default '',
@@ -52,6 +54,7 @@ export async function ensureAgentTables() {
       )
     `);
     // Backfill/upgrade older installs (safe if columns already exist).
+    await c.query(`alter table agent_runs add column if not exists cancel_requested boolean not null default false`);
     await c.query(`alter table agent_runs add column if not exists initial_nmap_profile text`);
     await c.query(`alter table agent_runs add column if not exists initial_nmap_ports int[]`);
     await c.query(`alter table agent_runs add column if not exists initial_nmap_extra_args text`);
@@ -91,6 +94,7 @@ export async function ensureAgentTables() {
     await c.query(`alter table findings add column if not exists confidence text not null default 'medium'`);
     await c.query(`alter table findings add column if not exists requires_verification boolean not null default true`);
     await c.query(`alter table findings add column if not exists claim_type text`);
+    await c.query(`alter table findings add column if not exists mitre_techniques text[] not null default '{}'`);
 
     // Evidence chain: every tool observation, plus verifier outcomes
     // (verifier_failed / verifier_no_response) so unverified findings stay
@@ -307,15 +311,16 @@ export async function persistFindings(
         typeof f.requiresVerification === "boolean"
           ? f.requiresVerification
           : confidence !== "high";
+      const mitre = mitreTechniquesFor({ title: f.title, claimType: f.claimType });
 
       await c.query(
         `insert into findings (
            target_id, service_id, title, severity, status,
            fingerprint, evidence_redacted,
-           confidence, requires_verification, claim_type,
+           confidence, requires_verification, claim_type, mitre_techniques,
            first_seen_at, last_seen_at
          )
-         values ($1, $2, $3, $4, 'open', $5, $6, $7, $8, $9, now(), now())
+         values ($1, $2, $3, $4, 'open', $5, $6, $7, $8, $9, $10, now(), now())
          on conflict (fingerprint)
          do update set
            last_seen_at = now(),
@@ -328,8 +333,12 @@ export async function persistFindings(
              when findings.confidence = 'high' or excluded.confidence = 'high' then false
              else findings.requires_verification
            end,
-           claim_type = coalesce(findings.claim_type, excluded.claim_type)`,
-        [targetId, svcId, f.title, f.severity, fp, f.evidence, confidence, requiresVerification, f.claimType ?? null]
+           claim_type = coalesce(findings.claim_type, excluded.claim_type),
+           mitre_techniques = case
+             when array_length(excluded.mitre_techniques, 1) is null then findings.mitre_techniques
+             else excluded.mitre_techniques
+           end`,
+        [targetId, svcId, f.title, f.severity, fp, f.evidence, confidence, requiresVerification, f.claimType ?? null, mitre]
       );
 
       await c.query(

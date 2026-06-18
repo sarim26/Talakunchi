@@ -10,16 +10,19 @@ import { env } from "../env.js";
 import { withClient } from "../db.js";
 import { rebuildNeo4jForTarget, upsertNeo4jTarget } from "../neo4jSync.js";
 import { buildReconMCPServer } from "../agents/registry.js";
-import { decideNextAction, type ManagerContext } from "../agents/manager.js";
+import { decideNextAction, getLastManagerOllamaError, type ManagerContext } from "../agents/manager.js";
 import { generatePrompt } from "../agents/prompter.js";
 import { draftExecutionPayload, shouldUseExecutionWriter } from "../agents/executionCommandWriter.js";
 import { getWordlistCatalog } from "../agents/wordlists.js";
+import { pickVerifierFor } from "../agents/verification.js";
+import { parseScopeList, isHostInScope } from "../scope.js";
 import {
   createEventSink,
   createAgentRun,
   ensureAgentTables,
   persistDiscoveredServices,
   persistFindings,
+  recordVerifierAttempts,
   setAgentRunStatus
 } from "../persistence/agentEvents.js";
 import type { ToolEnvelope, ToolFinding } from "../mcp/types.js";
@@ -66,6 +69,26 @@ export async function startReconRun(input: StartReconRunInput): Promise<string> 
   return runId;
 }
 
+/**
+ * Resolve the effective engagement scope from `AGENT_SCOPE` (env) plus the
+ * pipeline config (`allowedCidrs` / `enforceScope`). A non-empty `AGENT_SCOPE`
+ * always enables enforcement; otherwise the pipeline `enforceScope` flag decides.
+ */
+async function resolveScope(): Promise<{ enforce: boolean; entries: string[] }> {
+  const envEntries = parseScopeList(env.AGENT_SCOPE);
+  const cfg = await withClient(async (c) => {
+    const r = await c.query(`select config from pipeline_configs where id = 1`);
+    return r.rows[0]?.config as { allowedCidrs?: unknown; enforceScope?: unknown } | undefined;
+  }).catch(() => undefined);
+
+  const cfgEntries = Array.isArray(cfg?.allowedCidrs)
+    ? (cfg!.allowedCidrs as unknown[]).filter((x): x is string => typeof x === "string")
+    : [];
+  const entries = [...new Set([...envEntries, ...cfgEntries])];
+  const enforce = (envEntries.length > 0 || cfg?.enforceScope === true) && entries.length > 0;
+  return { enforce, entries };
+}
+
 export async function runReconLoop(agentRunId: string): Promise<void> {
   await ensureAgentTables();
 
@@ -97,10 +120,37 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
   // async helpers (it gets lost across closure boundaries otherwise).
   const run = data;
 
+  const scope = await resolveScope();
+  if (scope.enforce && !isHostInScope(run.target_address, scope.entries)) {
+    const reason = `Target ${run.target_address} is outside the configured engagement scope (${scope.entries.join(", ") || "none"}).`;
+    await withClient(async (c) => {
+      await c.query(
+        `insert into audit_events (actor, action, target, payload) values ('worker', 'recon.scope.blocked', $1, $2::jsonb)`,
+        [run.target_address, JSON.stringify({ agentRunId, entries: scope.entries })]
+      );
+    });
+    await setAgentRunStatus(agentRunId, "failed", { notes: reason });
+    return;
+  }
+
   await setAgentRunStatus(agentRunId, "running");
 
   const server = buildReconMCPServer();
   const sink = createEventSink(agentRunId);
+
+  const ac = new AbortController();
+  let cancelSeen = false;
+  const cancelPoll = setInterval(async () => {
+    if (cancelSeen) return;
+    const cancelRequested = await withClient(async (c) => {
+      const res = await c.query(`select cancel_requested from agent_runs where id=$1`, [agentRunId]);
+      return Boolean(res.rows?.[0]?.cancel_requested);
+    }).catch(() => false);
+    if (cancelRequested) {
+      cancelSeen = true;
+      ac.abort();
+    }
+  }, 1000);
 
   const wordlistCatalog = await getWordlistCatalog().catch(() => undefined);
   await withClient(async (c) => {
@@ -233,6 +283,7 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
         target: { targetId: run.target_id, host: run.target_address },
         intent: invokeIntent,
         args: invokeArgs,
+        signal: ac.signal,
         context: {
           knownPorts: ctx.knownPorts,
           knownServices: ctx.knownServices,
@@ -375,50 +426,137 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       if (!ctx.pendingRecommendations.some((p) => p.agent === rec.agent)) ctx.pendingRecommendations.push(rec);
     }
 
-    ctx.knownFindings.push(...envelope.findings.slice(0, 3));
-  }
-
-  for (let step = 1; step <= run.max_steps; step += 1) {
-    ctx.stepsRemaining = run.max_steps - step + 1;
-
-    const decision = await decideNextAction(server, ctx);
-
-    await sink.emitDecision({
-      step,
-      decision,
-      snapshot: {
-        knownPorts: ctx.knownPorts,
-        services: ctx.knownServices.length,
-        findings: allFindings.length,
-        pendingVerifications: ctx.pendingVerifications.length,
-        discoveredEndpoints: ctx.discoveredEndpoints.length
-      }
-    });
-
-    if (decision.action === "stop") break;
-
-    const args = decision.args as Record<string, unknown> | undefined;
-    const got = await runSingleTool(step, decision.tool, decision.intentGoal, args);
-    if (got) {
-      await mergeEnvelope(step, got.toolName, got.args, got.invocationId, got.envelope);
+    // Session loop: once credentials are confirmed, queue gated read-only post-ex.
+    if (
+      server.has("postex.session_recon") &&
+      (envelope.findings ?? []).some((f) => f.claimType === "weak_credentials") &&
+      !ctx.pendingRecommendations.some((p) => p.agent === "postex.session_recon")
+    ) {
+      ctx.pendingRecommendations.unshift({
+        agent: "postex.session_recon",
+        reason: "Weak credentials confirmed; run gated read-only post-exploitation session recon.",
+        priority: 85
+      });
     }
 
-    await setAgentRunStatus(agentRunId, "running", {
-      stepsTaken: step,
-      invocationCount: ctx.invocationHistory.length,
-      findingCount: allFindings.length,
-      serviceCount: ctx.knownServices.length
-    });
+    ctx.knownFindings.push(...envelope.findings.slice(0, 3));
+
+    await reconcileVerifications(toolName, invocationId, envelope);
   }
 
-  await upsertNeo4jTarget({ id: run.target_id, name: run.target_name, address: run.target_address }).catch(() => {});
-  await rebuildNeo4jForTarget(run.target_id).catch(() => {});
+  /**
+   * Maintain the verification queue after each tool runs:
+   *  1. Any fingerprint corroborated by this envelope (via `verifiesFingerprint`)
+   *     is removed from the pending queue.
+   *  2. If this tool was a queued verifier and it did not corroborate its target
+   *     fingerprint, record a `verifier_no_response` so the original finding
+   *     moves Pending -> Unverified instead of lingering.
+   *  3. New open-port findings that still require verification are enqueued.
+   */
+  async function reconcileVerifications(
+    toolName: string,
+    invocationId: string,
+    envelope: ToolEnvelope
+  ) {
+    const corroborated = new Set(
+      (envelope.findings ?? [])
+        .map((f) => f.verifiesFingerprint)
+        .filter((fp): fp is string => typeof fp === "string" && fp.length > 0)
+    );
+    if (corroborated.size > 0) {
+      ctx.pendingVerifications = ctx.pendingVerifications.filter((p) => !corroborated.has(p.fingerprint));
+    }
 
-  await setAgentRunStatus(agentRunId, "succeeded", {
-    stepsTaken: ctx.invocationHistory.length,
-    invocationCount: ctx.invocationHistory.length,
-    findingCount: allFindings.length,
-    serviceCount: ctx.knownServices.length,
-    notes: `MCP recon complete: ${ctx.invocationHistory.length} agent invocations, ${allFindings.length} findings${hadFailure ? " (with some failed steps)" : ""}`
-  });
+    const attemptedByThisTool = ctx.pendingVerifications.filter((p) => p.verifierTool === toolName);
+    if (attemptedByThisTool.length > 0) {
+      const failures = attemptedByThisTool.filter((p) => !corroborated.has(p.fingerprint));
+      if (failures.length > 0) {
+        await recordVerifierAttempts(
+          run.target_id,
+          failures.map((p) => ({
+            fingerprint: p.fingerprint,
+            tool: toolName,
+            status: "verifier_no_response" as const,
+            evidence: `Verifier ${toolName} ran but did not corroborate ${p.fingerprint}`
+          })),
+          { invocationId, agentRunId }
+        );
+      }
+      // Each fingerprint is attempted once; drop them whether or not they held.
+      ctx.pendingVerifications = ctx.pendingVerifications.filter((p) => p.verifierTool !== toolName);
+    }
+
+    for (const f of envelope.findings ?? []) {
+      const v = pickVerifierFor(f, server);
+      if (!v) continue;
+      if (v.verifierTool === toolName) continue; // a tool cannot verify its own claim
+      if (ctx.pendingVerifications.some((p) => p.fingerprint === v.fingerprint)) continue;
+      ctx.pendingVerifications.push(v);
+    }
+  }
+
+  let stoppedForCancel = false;
+  try {
+    for (let step = 1; step <= run.max_steps; step += 1) {
+      if (ac.signal.aborted) {
+        stoppedForCancel = true;
+        break;
+      }
+      ctx.stepsRemaining = run.max_steps - step + 1;
+
+      const decision = await decideNextAction(server, ctx);
+
+      await sink.emitDecision({
+        step,
+        decision,
+        ollamaError: getLastManagerOllamaError() ?? null,
+        snapshot: {
+          knownPorts: ctx.knownPorts,
+          services: ctx.knownServices.length,
+          findings: allFindings.length,
+          pendingVerifications: ctx.pendingVerifications.length,
+          discoveredEndpoints: ctx.discoveredEndpoints.length
+        }
+      });
+
+      if (decision.action === "stop") break;
+
+      const args = decision.args as Record<string, unknown> | undefined;
+      const got = await runSingleTool(step, decision.tool, decision.intentGoal, args);
+      if (got) {
+        await mergeEnvelope(step, got.toolName, got.args, got.invocationId, got.envelope);
+      }
+
+      await setAgentRunStatus(agentRunId, "running", {
+        stepsTaken: step,
+        invocationCount: ctx.invocationHistory.length,
+        findingCount: allFindings.length,
+        serviceCount: ctx.knownServices.length
+      });
+    }
+
+    if (stoppedForCancel) {
+      await withClient(async (c) => {
+        await c.query(`insert into agent_events (agent_run_id, kind, payload) values ($1, 'run.cancelled', $2::jsonb)`, [
+          agentRunId,
+          JSON.stringify({ agentRunId })
+        ]);
+      }).catch(() => undefined);
+      await setAgentRunStatus(agentRunId, "failed", { notes: "Cancelled by operator" });
+      return;
+    }
+
+    await upsertNeo4jTarget({ id: run.target_id, name: run.target_name, address: run.target_address }).catch(() => {});
+    await rebuildNeo4jForTarget(run.target_id).catch(() => {});
+
+    await setAgentRunStatus(agentRunId, "succeeded", {
+      stepsTaken: ctx.invocationHistory.length,
+      invocationCount: ctx.invocationHistory.length,
+      findingCount: allFindings.length,
+      serviceCount: ctx.knownServices.length,
+      notes: `MCP recon complete: ${ctx.invocationHistory.length} agent invocations, ${allFindings.length} findings${hadFailure ? " (with some failed steps)" : ""}`
+    });
+  } finally {
+    clearInterval(cancelPoll);
+  }
 }

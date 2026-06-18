@@ -7,19 +7,30 @@ import { rebuildNeo4jForTarget, upsertNeo4jTarget } from "./neo4jSync.js";
 import { nmapScan } from "./nmapScan.js";
 import { HydraCredSource, hydraFromNmapServices } from "./hydraScan.js";
 import { runReconLoop } from "./orchestrator/reconRun.js";
+import { runExploitJob, type ExploitJobPayload } from "./orchestrator/exploitRun.js";
 import { ensureAgentTables } from "./persistence/agentEvents.js";
+import { buildReconMCPServer } from "./agents/registry.js";
 
 type PipelineConfig = {
   maxConcurrentScans: number;
   requestRatePerMinute: number;
   auditEnabled: boolean;
   allowedWordlists: string[];
+  /** Engagement scope (IPv4/CIDR/hostnames) checked in addition to AGENT_SCOPE. */
+  allowedCidrs: string[];
+  /** When true, recon runs against out-of-scope targets are aborted. */
+  enforceScope: boolean;
+  /** Cap on simultaneously running agentic recon runs (serial guardrail, not fleet parallelism). */
+  maxConcurrentAgentRuns: number;
 };
 
 const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   maxConcurrentScans: 2,
   requestRatePerMinute: 120,
   auditEnabled: true,
+  allowedCidrs: [],
+  enforceScope: false,
+  maxConcurrentAgentRuns: 1,
   // Prefer Kali-provided SecLists by default (used by agent + exploit stages).
   allowedWordlists: ["/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-10000.txt"]
 };
@@ -43,17 +54,29 @@ async function claimNextJob(config: PipelineConfig) {
       const runningScans = Number(runningScansRes.rows[0]?.n ?? 0);
       const canStartScan = runningScans < limit;
 
+      // Serial guardrail for agentic recon (not fleet parallelism): keep the
+      // number of concurrently running agent_runs at or below the configured cap.
+      const agentRunLimit = Math.max(1, Number(config.maxConcurrentAgentRuns) || 1);
+      const runningAgentRunsRes = await c.query(
+        `select count(*)::int as n
+         from agent_runs
+         where status = 'running'`
+      );
+      const runningAgentRuns = Number(runningAgentRunsRes.rows[0]?.n ?? 0);
+      const canStartAgentRun = runningAgentRuns < agentRunLimit;
+
       const res = await c.query(
         `
         select id, type, payload
         from jobs
         where status = 'queued'
           and ($1::boolean or type <> 'scan')
+          and ($2::boolean or type <> 'recon-mcp')
         order by created_at asc
         for update skip locked
         limit 1
         `,
-        [canStartScan]
+        [canStartScan, canStartAgentRun]
       );
       const job = res.rows[0];
       if (!job) {
@@ -130,7 +153,37 @@ async function ensureWorkflowTables() {
     `);
     await c.query(`create index if not exists idx_command_approvals_scan_run_id on command_approvals(scan_run_id)`);
     await c.query(`create index if not exists idx_command_approvals_status on command_approvals(status)`);
+    // Generalise approvals to agentic recon/exploit runs (Phase 9 gating).
+    await c.query(`alter table command_approvals alter column scan_run_id drop not null`);
+    await c.query(`alter table command_approvals add column if not exists agent_run_id uuid`);
+    await c.query(`alter table command_approvals add column if not exists tool text`);
+    await c.query(`alter table command_approvals add column if not exists args jsonb not null default '{}'::jsonb`);
+
+    await c.query(`
+      create table if not exists agent_tool_manifest (
+        id int primary key,
+        manifest jsonb not null,
+        updated_at timestamptz not null default now()
+      )
+    `);
   });
+}
+
+/**
+ * Publish the live MCP tool registry to the DB so the API can serve a single,
+ * always-in-sync manifest at GET /api/agent-tools (no hand-maintained copy).
+ */
+async function publishToolManifest() {
+  const manifest = buildReconMCPServer().manifest();
+  await withClient(async (c) => {
+    await c.query(
+      `insert into agent_tool_manifest (id, manifest, updated_at)
+       values (1, $1::jsonb, now())
+       on conflict (id) do update set manifest = excluded.manifest, updated_at = now()`,
+      [JSON.stringify(manifest)]
+    );
+  });
+  console.log(`[worker] published ${manifest.length} MCP tools to agent_tool_manifest`);
 }
 
 async function upsertReconAsset(input: {
@@ -319,218 +372,199 @@ async function runScan(scanRunId: string) {
     return res.rows[0].id as string;
   });
 
-  const nmapCmd = `nmap ${env.NMAP_ARGS} -oX - ${ctx.target_address}`;
-  await appendStepLog(discoveryStepId, `Running: ${nmapCmd}\n`);
-
   const ac = new AbortController();
+  let activeStepId: string = discoveryStepId;
+  let cancelSeen = false;
   const cancelPoll = setInterval(async () => {
+    if (cancelSeen) return;
     const cancelRequested = await withClient(async (c) => {
       const res = await c.query(`select cancel_requested from scan_runs where id=$1`, [scanRunId]);
       return Boolean(res.rows?.[0]?.cancel_requested);
     });
     if (cancelRequested) {
-      await appendStepLog(discoveryStepId, "\nCancel requested. Stopping scan...\n");
+      cancelSeen = true;
+      await appendStepLog(activeStepId, "\nCancel requested. Stopping scan...\n");
       ac.abort();
     }
   }, 1000);
 
-  let buffer = "";
-  let lastFlush = Date.now();
-  const flushIfNeeded = async (force = false) => {
-    const now = Date.now();
-    if (!force && now - lastFlush < 1500) return;
-    if (!buffer) return;
-    const out = buffer;
-    buffer = "";
-    lastFlush = now;
-    await appendStepLog(discoveryStepId, out);
-  };
-
-  let scanOut: Awaited<ReturnType<typeof nmapScan>> | null = null;
   try {
-    scanOut = await nmapScan(ctx.target_address, env.NMAP_ARGS, {
+    const nmapCmd = `nmap ${env.NMAP_ARGS} -oX - ${ctx.target_address}`;
+    await appendStepLog(discoveryStepId, `Running: ${nmapCmd}\n`);
+
+    let buffer = "";
+    let lastFlush = Date.now();
+    const flushIfNeeded = async (force = false) => {
+      const now = Date.now();
+      if (!force && now - lastFlush < 1500) return;
+      if (!buffer) return;
+      const out = buffer;
+      buffer = "";
+      lastFlush = now;
+      await appendStepLog(discoveryStepId, out);
+    };
+
+    const scanOut = await nmapScan(ctx.target_address, env.NMAP_ARGS, {
       onOutput: (chunk) => {
         buffer += chunk;
       },
       signal: ac.signal
+    }).finally(async () => {
+      await flushIfNeeded(true);
     });
-  } catch (e: any) {
-    await flushIfNeeded(true);
-    clearInterval(cancelPoll);
 
-    const isCancelled = String(e?.message ?? "").toLowerCase().includes("aborted");
+    if (ac.signal.aborted) throw new Error("aborted");
+
+    const services = scanOut.services
+      .filter((s: any) => s.state === "open")
+      .map((s: any) => ({
+        port: s.port,
+        protocol: s.protocol,
+        serviceName: s.serviceName,
+        product: s.product,
+        version: s.version,
+        banner: s.banner
+      }));
+
+    if (scanOut.status === "down") {
+      await appendStepLog(discoveryStepId, `Host appears down from Nmap output: ${scanOut.host}\n`);
+    }
+
+    let findings = deriveFindingsFromObserved(ctx.target_address, services);
+
+    // Step 1 finish
     await withClient(async (c) => {
-      await c.query(`update scan_steps set status='failed', finished_at=now(), log=log || $2 where id=$1`, [
-        discoveryStepId,
-        isCancelled ? "\nScan cancelled.\n" : `\nScan failed: ${e?.message ?? String(e)}\n`
-      ]);
-      await c.query(`update scan_runs set status='failed', finished_at=now() where id=$1`, [scanRunId]);
+      await c.query(`update scan_steps set status='succeeded', finished_at=now() where id=$1`, [discoveryStepId]);
+      const step2 = await c.query(
+        `select id from scan_steps where scan_run_id=$1 and name='Service Identification' order by created_at asc limit 1`,
+        [scanRunId]
+      );
+      await c.query(`update scan_steps set status='running', started_at=now() where id=$1`, [step2.rows[0].id]);
     });
+
+    await sleep(500);
+    if (ac.signal.aborted) throw new Error("aborted");
+
+    // Upsert services
+    const serviceIdByPort = new Map<number, string>();
+    await withClient(async (c) => {
+      for (const s of services) {
+        const res = await c.query(
+          `
+          insert into services (target_id, port, protocol, service_name, product, version, banner, first_seen_at, last_seen_at)
+          values ($1, $2, $3, $4, $5, $6, $7, now(), now())
+          on conflict (target_id, port, protocol)
+          do update set service_name=excluded.service_name, product=excluded.product, version=excluded.version, banner=excluded.banner, last_seen_at=now()
+          returning id
+          `,
+          [ctx.target_id, s.port, s.protocol, s.serviceName ?? null, s.product ?? null, s.version ?? null, s.banner ?? null]
+        );
+        serviceIdByPort.set(s.port, res.rows[0].id);
+      }
+    });
+
+    // Step 2 finish, Step 3 start
+    const checksStepId = await withClient(async (c) => {
+      const step2 = await c.query(
+        `select id from scan_steps where scan_run_id=$1 and name='Service Identification' order by created_at asc limit 1`,
+        [scanRunId]
+      );
+      await c.query(
+        `update scan_steps set status='succeeded', finished_at=now(), log=log || $2 where id=$1`,
+        [step2.rows[0].id, `Identified ${services.length} services\n`]
+      );
+
+      const step3 = await c.query(
+        `select id from scan_steps where scan_run_id=$1 and name='Checks & Findings' order by created_at asc limit 1`,
+        [scanRunId]
+      );
+      await c.query(`update scan_steps set status='running', started_at=now() where id=$1`, [step3.rows[0].id]);
+      return step3.rows[0].id as string;
+    });
+    activeStepId = checksStepId;
+
+    await sleep(500);
+    if (ac.signal.aborted) throw new Error("aborted");
+
+    if (env.HYDRA_ENABLED) {
+      const hydraCredSource = buildHydraCredSource();
+      if (!hydraCredSource) {
+        await appendStepLog(
+          checksStepId,
+          "Hydra enabled but credential source is incomplete. Set HYDRA_USERNAME/HYDRA_USERLIST and HYDRA_PASSWORD/HYDRA_PASSLIST.\n"
+        );
+      } else {
+        const hydraOutput: string[] = [];
+        try {
+          const hydraResults = await hydraFromNmapServices(ctx.target_address, services, hydraCredSource, {
+            threads: env.HYDRA_THREADS,
+            stopOnFirstFind: env.HYDRA_STOP_ON_FIRST_FIND,
+            signal: ac.signal,
+            onOutput: (line) => {
+              hydraOutput.push(line);
+            }
+          });
+          if (hydraOutput.length) {
+            await appendStepLog(checksStepId, hydraOutput.join(""));
+          }
+          const hydraCreds = hydraResults.flatMap((r) => r.credentials);
+          findings = findings.concat(deriveFindingsFromHydra(hydraCreds));
+        } catch (e: any) {
+          await appendStepLog(checksStepId, `Hydra phase skipped due to error: ${e?.message ?? String(e)}\n`);
+        }
+      }
+    }
+
+    await sleep(500);
+    if (ac.signal.aborted) throw new Error("aborted");
+
+    // Upsert findings
+    await withClient(async (c) => {
+      for (const f of findings) {
+        const svcId = f.servicePort ? serviceIdByPort.get(f.servicePort) : undefined;
+        await c.query(
+          `
+          insert into findings (target_id, service_id, title, severity, status, fingerprint, evidence_redacted, first_seen_at, last_seen_at, last_scan_run_id)
+          values ($1, $2, $3, $4, 'open', $5, $6, now(), now(), $7)
+          on conflict (fingerprint)
+          do update set last_seen_at=now(), evidence_redacted=excluded.evidence_redacted, last_scan_run_id=excluded.last_scan_run_id
+          `,
+          [ctx.target_id, svcId ?? null, f.title, f.severity, f.fingerprint, f.evidenceRedacted, scanRunId]
+        );
+      }
+    });
+
+    await withClient(async (c) => {
+      await c.query(
+        `update scan_steps set status='succeeded', finished_at=now(), log=log || $2 where id=$1`,
+        [checksStepId, `Created/updated ${findings.length} findings\n`]
+      );
+      await c.query(`update scan_runs set status='succeeded', finished_at=now() where id=$1`, [scanRunId]);
+    });
+    await writeAuditEvent("scan.completed", { scanRunId, findings: findings.length, services: services.length }, ctx.target_address);
+
+    // Neo4j graph (demo wow)
+    await upsertNeo4jTarget({ id: ctx.target_id, name: ctx.target_name, address: ctx.target_address });
+    await rebuildNeo4jForTarget(ctx.target_id);
+  } catch (e: any) {
+    const isCancelled = cancelSeen || String(e?.message ?? "").toLowerCase().includes("aborted");
+    if (isCancelled) {
+      await withClient(async (c) => {
+        await c.query(
+          `update scan_steps
+           set status='cancelled', finished_at=now(), log=log || $2
+           where scan_run_id=$1 and status in ('queued','running')`,
+          [scanRunId, "\nScan cancelled.\n"]
+        );
+        await c.query(`update scan_runs set status='cancelled', finished_at=now() where id=$1`, [scanRunId]);
+      });
+      await writeAuditEvent("scan.cancelled", { scanRunId }, ctx.target_address);
+      return;
+    }
     throw e;
   } finally {
     clearInterval(cancelPoll);
-    await flushIfNeeded(true);
   }
-
-  if (!scanOut) throw new Error("Scan produced no output");
-
-  const services = scanOut.services
-    .filter((s: any) => s.state === "open")
-    .map((s: any) => ({
-    port: s.port,
-    protocol: s.protocol,
-    serviceName: s.serviceName,
-    product: s.product,
-    version: s.version,
-    banner: s.banner
-    }));
-
-  if (scanOut.status === "down") {
-    await appendStepLog(discoveryStepId, `Host appears down from Nmap output: ${scanOut.host}\n`);
-  }
-
-  let findings = deriveFindingsFromObserved(ctx.target_address, services);
-
-  // Step 1 finish
-  await withClient(async (c) => {
-    await c.query(`update scan_steps set status='succeeded', finished_at=now() where id=$1`, [discoveryStepId]);
-    const step2 = await c.query(
-      `select id from scan_steps where scan_run_id=$1 and name='Service Identification' order by created_at asc limit 1`,
-      [scanRunId]
-    );
-    await c.query(`update scan_steps set status='running', started_at=now() where id=$1`, [step2.rows[0].id]);
-  });
-
-  await sleep(500);
-
-  // Upsert services
-  const serviceIdByPort = new Map<number, string>();
-  await withClient(async (c) => {
-    for (const s of services) {
-      const res = await c.query(
-        `
-        insert into services (target_id, port, protocol, service_name, product, version, banner, first_seen_at, last_seen_at)
-        values ($1, $2, $3, $4, $5, $6, $7, now(), now())
-        on conflict (target_id, port, protocol)
-        do update set service_name=excluded.service_name, product=excluded.product, version=excluded.version, banner=excluded.banner, last_seen_at=now()
-        returning id
-        `,
-        [ctx.target_id, s.port, s.protocol, s.serviceName ?? null, s.product ?? null, s.version ?? null, s.banner ?? null]
-      );
-      serviceIdByPort.set(s.port, res.rows[0].id);
-    }
-  });
-
-  // Step 2 finish, Step 3 start
-  await withClient(async (c) => {
-    const step2 = await c.query(
-      `select id from scan_steps where scan_run_id=$1 and name='Service Identification' order by created_at asc limit 1`,
-      [scanRunId]
-    );
-    await c.query(
-      `update scan_steps set status='succeeded', finished_at=now(), log=log || $2 where id=$1`,
-      [step2.rows[0].id, `Identified ${services.length} services\n`]
-    );
-
-    const step3 = await c.query(
-      `select id from scan_steps where scan_run_id=$1 and name='Checks & Findings' order by created_at asc limit 1`,
-      [scanRunId]
-    );
-    await c.query(`update scan_steps set status='running', started_at=now() where id=$1`, [step3.rows[0].id]);
-  });
-
-  await sleep(500);
-
-  if (env.HYDRA_ENABLED) {
-    const hydraCredSource = buildHydraCredSource();
-    if (!hydraCredSource) {
-      const step3 = await withClient(async (c) => {
-        const res = await c.query(
-          `select id from scan_steps where scan_run_id=$1 and name='Checks & Findings' order by created_at asc limit 1`,
-          [scanRunId]
-        );
-        return res.rows[0]?.id as string;
-      });
-      if (step3) {
-        await appendStepLog(
-          step3,
-          "Hydra enabled but credential source is incomplete. Set HYDRA_USERNAME/HYDRA_USERLIST and HYDRA_PASSWORD/HYDRA_PASSLIST.\n"
-        );
-      }
-    } else {
-      const hydraOutput: string[] = [];
-      try {
-        const hydraResults = await hydraFromNmapServices(ctx.target_address, services, hydraCredSource, {
-          threads: env.HYDRA_THREADS,
-          stopOnFirstFind: env.HYDRA_STOP_ON_FIRST_FIND,
-          signal: ac.signal,
-          onOutput: (line) => {
-            hydraOutput.push(line);
-          }
-        });
-
-        const step3 = await withClient(async (c) => {
-          const res = await c.query(
-            `select id from scan_steps where scan_run_id=$1 and name='Checks & Findings' order by created_at asc limit 1`,
-            [scanRunId]
-          );
-          return res.rows[0]?.id as string;
-        });
-        if (step3 && hydraOutput.length) {
-          await appendStepLog(step3, hydraOutput.join(""));
-        }
-
-        const hydraCreds = hydraResults.flatMap((r) => r.credentials);
-        findings = findings.concat(deriveFindingsFromHydra(hydraCreds));
-      } catch (e: any) {
-        const step3 = await withClient(async (c) => {
-          const res = await c.query(
-            `select id from scan_steps where scan_run_id=$1 and name='Checks & Findings' order by created_at asc limit 1`,
-            [scanRunId]
-          );
-          return res.rows[0]?.id as string;
-        });
-        if (step3) {
-          await appendStepLog(step3, `Hydra phase skipped due to error: ${e?.message ?? String(e)}\n`);
-        }
-      }
-    }
-  }
-
-  await sleep(500);
-
-  // Upsert findings
-  await withClient(async (c) => {
-    for (const f of findings) {
-      const svcId = f.servicePort ? serviceIdByPort.get(f.servicePort) : undefined;
-      await c.query(
-        `
-        insert into findings (target_id, service_id, title, severity, status, fingerprint, evidence_redacted, first_seen_at, last_seen_at, last_scan_run_id)
-        values ($1, $2, $3, $4, 'open', $5, $6, now(), now(), $7)
-        on conflict (fingerprint)
-        do update set last_seen_at=now(), evidence_redacted=excluded.evidence_redacted, last_scan_run_id=excluded.last_scan_run_id
-        `,
-        [ctx.target_id, svcId ?? null, f.title, f.severity, f.fingerprint, f.evidenceRedacted, scanRunId]
-      );
-    }
-  });
-
-  await withClient(async (c) => {
-    const step3 = await c.query(
-      `select id from scan_steps where scan_run_id=$1 and name='Checks & Findings' order by created_at asc limit 1`,
-      [scanRunId]
-    );
-    await c.query(
-      `update scan_steps set status='succeeded', finished_at=now(), log=log || $2 where id=$1`,
-      [step3.rows[0].id, `Created/updated ${findings.length} findings\n`]
-    );
-    await c.query(`update scan_runs set status='succeeded', finished_at=now() where id=$1`, [scanRunId]);
-  });
-  await writeAuditEvent("scan.completed", { scanRunId, findings: findings.length, services: services.length }, ctx.target_address);
-
-  // Neo4j graph (demo wow)
-  await upsertNeo4jTarget({ id: ctx.target_id, name: ctx.target_name, address: ctx.target_address });
-  await rebuildNeo4jForTarget(ctx.target_id);
 }
 
 async function appendStepLog(stepId: string, text: string) {
@@ -661,6 +695,7 @@ async function main() {
   await ensureWorkflowTables();
   await ensureAgentTables();
   await getPipelineConfig();
+  await publishToolManifest().catch((e) => console.warn(`[worker] manifest publish failed: ${(e as Error).message}`));
   console.log(
     `[worker] starting (tools_ssh=${env.REMOTE_SSH_USER}@${env.REMOTE_SSH_HOST}:${env.REMOTE_SSH_PORT}, ollama=${env.OLLAMA_URL})`
   );
@@ -685,10 +720,7 @@ async function main() {
         const agentRunId = job.payload.agentRunId as string;
         await runReconLoop(agentRunId);
       } else if (job.type === "exploit") {
-        // Legacy path — left here so older queued jobs drain gracefully.
-        await withClient(async (c) => {
-          await c.query(`insert into audit_events (actor, action, payload) values ('worker','exploit.legacy.skipped', $1::jsonb)`, [JSON.stringify({ jobId: job.id, payload: job.payload })]);
-        });
+        await runExploitJob(job.payload as ExploitJobPayload);
       } else {
         throw new Error(`Unknown job type: ${job.type}`);
       }

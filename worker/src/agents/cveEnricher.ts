@@ -1,5 +1,58 @@
-import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
+import { ToolDefinition, ToolEnvelope, type Severity } from "../mcp/types.js";
 import { loadCveHeuristics, type CompiledHeuristic } from "../cveDb/heuristics.js";
+import { env } from "../env.js";
+
+type OnlineCve = { id: string; summary?: string; severity?: Severity };
+
+/**
+ * Optional online CVE lookup. Disabled unless `CVE_FEED_URL` or `NVD_API_KEY`
+ * is configured. Failures are swallowed (returns []) so offline enrichment is
+ * never blocked by network issues.
+ */
+async function queryOnlineCves(banner: string, signal?: AbortSignal): Promise<OnlineCve[]> {
+  const keyword = banner.trim();
+  if (!keyword) return [];
+  try {
+    if (env.CVE_FEED_URL) {
+      const url = `${env.CVE_FEED_URL}${env.CVE_FEED_URL.includes("?") ? "&" : "?"}keyword=${encodeURIComponent(keyword)}`;
+      const res = await fetch(url, { signal });
+      if (!res.ok) return [];
+      const data = (await res.json()) as Array<Record<string, unknown>>;
+      return (Array.isArray(data) ? data : [])
+        .map((d) => ({
+          id: String(d.id ?? d.cve ?? "").trim(),
+          summary: typeof d.summary === "string" ? d.summary : undefined,
+          severity: normalizeSeverity(d.severity)
+        }))
+        .filter((d) => d.id.length > 0)
+        .slice(0, 10);
+    }
+    if (env.NVD_API_KEY) {
+      const url = `https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${encodeURIComponent(keyword)}&resultsPerPage=5`;
+      const res = await fetch(url, { headers: { apiKey: env.NVD_API_KEY }, signal });
+      if (!res.ok) return [];
+      const data = (await res.json()) as { vulnerabilities?: Array<{ cve?: Record<string, unknown> }> };
+      return (data.vulnerabilities ?? [])
+        .map((v) => {
+          const cve = (v.cve ?? {}) as Record<string, unknown>;
+          const descs = (cve.descriptions ?? []) as Array<{ lang?: string; value?: string }>;
+          const summary = descs.find((d) => d.lang === "en")?.value;
+          return { id: String(cve.id ?? "").trim(), summary };
+        })
+        .filter((d) => d.id.length > 0)
+        .slice(0, 5);
+    }
+  } catch {
+    return [];
+  }
+  return [];
+}
+
+function normalizeSeverity(v: unknown): Severity | undefined {
+  const s = String(v ?? "").toLowerCase();
+  if (s === "critical" || s === "high" || s === "medium" || s === "low" || s === "info") return s;
+  return undefined;
+}
 
 /**
  * recon.cve_enricher — pure enrichment, no scanning. Maps observed
@@ -27,10 +80,11 @@ export const cveEnricherTool: ToolDefinition = {
   description: "Enrich detected services with a local CVE heuristics feed (offline at runtime; no remote scanning).",
   tags: ["recon", "enrichment"],
   requires: ["services"],
-  defaultTimeoutMs: 30_000,
+  defaultTimeoutMs: 60_000,
   handler: async (input): Promise<ToolEnvelope> => {
     const services = input.context?.knownServices ?? [];
     const cfg = await getHeuristics();
+    const onlineEnabled = Boolean(env.CVE_FEED_URL || env.NVD_API_KEY);
     const findings: ToolEnvelope["findings"] = [];
     const facts: ToolEnvelope["facts"] = [];
 
@@ -61,6 +115,24 @@ export const cveEnricherTool: ToolDefinition = {
           });
         }
       }
+
+      if (onlineEnabled) {
+        const online = await queryOnlineCves(banner, input.signal);
+        for (const cve of online) {
+          facts.push({ type: "cve_online", value: { port: svc.port, banner, id: cve.id }, source: env.CVE_FEED_URL ? "cve_feed" : "nvd" });
+          findings.push({
+            title: `${cve.id}: ${banner} on port ${svc.port}`,
+            severity: cve.severity ?? "medium",
+            port: svc.port,
+            protocol: svc.protocol,
+            evidence: cve.summary ? cve.summary.slice(0, 600) : `Online CVE feed matched ${cve.id} for banner "${banner}"`,
+            fingerprint: `cve-online|${svc.port}|${cve.id}`,
+            confidence: "medium",
+            requiresVerification: true,
+            claimType: "cve_online"
+          });
+        }
+      }
     }
 
     return {
@@ -70,7 +142,7 @@ export const cveEnricherTool: ToolDefinition = {
       recommendations: [],
       artifacts: { commands: [] },
       meta: {
-        cveFeed: { source: cfg?.source ?? "unknown", path: cfg?.path ?? null, error: cfg?.error ?? null },
+        cveFeed: { source: cfg?.source ?? "unknown", path: cfg?.path ?? null, error: cfg?.error ?? null, online: onlineEnabled },
         servicesScanned: services.length,
         matches: findings.length,
         commandSummary: `Enrich discovered services with a local CVE heuristics feed (offline at runtime; no remote scanning).`

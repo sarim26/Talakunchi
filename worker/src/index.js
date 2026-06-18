@@ -1,0 +1,591 @@
+import { setTimeout as sleep } from "node:timers/promises";
+import dns from "node:dns/promises";
+import net from "node:net";
+import { env } from "./env.js";
+import { withClient } from "./db.js";
+import { rebuildNeo4jForTarget, upsertNeo4jTarget } from "./neo4jSync.js";
+import { nmapScan } from "./nmapScan.js";
+import { hydraFromNmapServices } from "./hydraScan.js";
+import { runReconLoop } from "./orchestrator/reconRun.js";
+import { runExploitJob } from "./orchestrator/exploitRun.js";
+import { ensureAgentTables } from "./persistence/agentEvents.js";
+import { buildReconMCPServer } from "./agents/registry.js";
+const DEFAULT_PIPELINE_CONFIG = {
+    maxConcurrentScans: 2,
+    requestRatePerMinute: 120,
+    auditEnabled: true,
+    allowedCidrs: [],
+    enforceScope: false,
+    maxConcurrentAgentRuns: 1,
+    // Prefer Kali-provided SecLists by default (used by agent + exploit stages).
+    allowedWordlists: ["/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-10000.txt"]
+};
+async function ensureCancelColumn() {
+    await withClient(async (c) => {
+        await c.query(`alter table scan_runs add column if not exists cancel_requested boolean not null default false`);
+    });
+}
+async function claimNextJob(config) {
+    return await withClient(async (c) => {
+        await c.query("begin");
+        try {
+            const limit = Math.max(1, Number(config.maxConcurrentScans) || 1);
+            const runningScansRes = await c.query(`select count(*)::int as n
+         from scan_runs
+         where status = 'running'`);
+            const runningScans = Number(runningScansRes.rows[0]?.n ?? 0);
+            const canStartScan = runningScans < limit;
+            // Serial guardrail for agentic recon (not fleet parallelism): keep the
+            // number of concurrently running agent_runs at or below the configured cap.
+            const agentRunLimit = Math.max(1, Number(config.maxConcurrentAgentRuns) || 1);
+            const runningAgentRunsRes = await c.query(`select count(*)::int as n
+         from agent_runs
+         where status = 'running'`);
+            const runningAgentRuns = Number(runningAgentRunsRes.rows[0]?.n ?? 0);
+            const canStartAgentRun = runningAgentRuns < agentRunLimit;
+            const res = await c.query(`
+        select id, type, payload
+        from jobs
+        where status = 'queued'
+          and ($1::boolean or type <> 'scan')
+          and ($2::boolean or type <> 'recon-mcp')
+        order by created_at asc
+        for update skip locked
+        limit 1
+        `, [canStartScan, canStartAgentRun]);
+            const job = res.rows[0];
+            if (!job) {
+                await c.query("commit");
+                return null;
+            }
+            await c.query(`update jobs set status = 'running', updated_at = now() where id = $1`, [job.id]);
+            await c.query("commit");
+            return job;
+        }
+        catch (e) {
+            await c.query("rollback");
+            throw e;
+        }
+    });
+}
+async function setJobDone(jobId, ok, error) {
+    await withClient(async (c) => {
+        await c.query(`update jobs set status = $2, error = $3, updated_at = now() where id = $1`, [jobId, ok ? "succeeded" : "failed", error ?? null]);
+    });
+}
+async function ensureWorkflowTables() {
+    await withClient(async (c) => {
+        await c.query(`
+      create table if not exists pipeline_configs (
+        id int primary key,
+        config jsonb not null,
+        updated_at timestamptz not null default now()
+      )
+    `);
+        await c.query(`
+      create table if not exists audit_events (
+        id uuid primary key default uuid_generate_v4(),
+        actor text not null default 'system',
+        action text not null,
+        target text,
+        payload jsonb not null default '{}'::jsonb,
+        created_at timestamptz not null default now()
+      )
+    `);
+        await c.query(`create index if not exists idx_audit_events_created_at on audit_events(created_at desc)`);
+        await c.query(`
+      create table if not exists recon_assets (
+        id uuid primary key default uuid_generate_v4(),
+        target_id uuid not null references targets(id) on delete cascade,
+        asset_type text not null,
+        value text not null,
+        source text not null,
+        confidence int not null default 50,
+        metadata jsonb not null default '{}'::jsonb,
+        first_seen_at timestamptz not null default now(),
+        last_seen_at timestamptz not null default now(),
+        unique (target_id, asset_type, value, source)
+      )
+    `);
+        await c.query(`create index if not exists idx_recon_assets_target on recon_assets(target_id)`);
+        await c.query(`
+      create table if not exists command_approvals (
+        id uuid primary key default uuid_generate_v4(),
+        scan_run_id uuid not null references scan_runs(id) on delete cascade,
+        command text not null,
+        reasoning text,
+        impact text not null default 'low',
+        status text not null default 'pending', -- pending | approved | rejected
+        decided_by text,
+        created_at timestamptz not null default now(),
+        decided_at timestamptz
+      )
+    `);
+        await c.query(`create index if not exists idx_command_approvals_scan_run_id on command_approvals(scan_run_id)`);
+        await c.query(`create index if not exists idx_command_approvals_status on command_approvals(status)`);
+        // Generalise approvals to agentic recon/exploit runs (Phase 9 gating).
+        await c.query(`alter table command_approvals alter column scan_run_id drop not null`);
+        await c.query(`alter table command_approvals add column if not exists agent_run_id uuid`);
+        await c.query(`alter table command_approvals add column if not exists tool text`);
+        await c.query(`alter table command_approvals add column if not exists args jsonb not null default '{}'::jsonb`);
+        await c.query(`
+      create table if not exists agent_tool_manifest (
+        id int primary key,
+        manifest jsonb not null,
+        updated_at timestamptz not null default now()
+      )
+    `);
+    });
+}
+/**
+ * Publish the live MCP tool registry to the DB so the API can serve a single,
+ * always-in-sync manifest at GET /api/agent-tools (no hand-maintained copy).
+ */
+async function publishToolManifest() {
+    const manifest = buildReconMCPServer().manifest();
+    await withClient(async (c) => {
+        await c.query(`insert into agent_tool_manifest (id, manifest, updated_at)
+       values (1, $1::jsonb, now())
+       on conflict (id) do update set manifest = excluded.manifest, updated_at = now()`, [JSON.stringify(manifest)]);
+    });
+    console.log(`[worker] published ${manifest.length} MCP tools to agent_tool_manifest`);
+}
+async function upsertReconAsset(input) {
+    await withClient(async (c) => {
+        await c.query(`insert into recon_assets (target_id, asset_type, value, source, confidence, metadata, first_seen_at, last_seen_at)
+       values ($1, $2, $3, $4, $5, $6::jsonb, now(), now())
+       on conflict (target_id, asset_type, value, source)
+       do update set confidence = excluded.confidence, metadata = excluded.metadata, last_seen_at = now()`, [
+            input.targetId,
+            input.assetType,
+            input.value,
+            input.source,
+            input.confidence,
+            JSON.stringify(input.metadata ?? {})
+        ]);
+    });
+}
+async function runReconnaissance(targetId, targetAddress, stepId) {
+    let found = 0;
+    const isIpTarget = net.isIP(targetAddress) !== 0;
+    await appendStepLog(stepId, `Recon start: ${targetAddress}\n`);
+    if (isIpTarget) {
+        await upsertReconAsset({
+            targetId,
+            assetType: "host",
+            value: targetAddress,
+            source: "host_discovery",
+            confidence: 95,
+            metadata: { reachable: true, method: "seed_target" }
+        });
+        found += 1;
+        try {
+            const ptr = await dns.reverse(targetAddress);
+            for (const hostname of ptr.slice(0, 5)) {
+                await upsertReconAsset({
+                    targetId,
+                    assetType: "hostname",
+                    value: hostname,
+                    source: "reverse_dns",
+                    confidence: 70,
+                    metadata: { ip: targetAddress }
+                });
+                found += 1;
+            }
+        }
+        catch {
+            await appendStepLog(stepId, "Reverse DNS: no PTR records\n");
+        }
+    }
+    else {
+        try {
+            const lookup = await dns.lookup(targetAddress, { all: true });
+            for (const rec of lookup.slice(0, 10)) {
+                await upsertReconAsset({
+                    targetId,
+                    assetType: "ip",
+                    value: rec.address,
+                    source: "dns_lookup",
+                    confidence: 80,
+                    metadata: { family: rec.family, hostname: targetAddress }
+                });
+                found += 1;
+            }
+        }
+        catch {
+            await appendStepLog(stepId, "DNS lookup failed or no records\n");
+        }
+    }
+    // Phase 2 MVP: placeholder passive OSINT signal for pipeline wiring.
+    await upsertReconAsset({
+        targetId,
+        assetType: "osint_signal",
+        value: targetAddress,
+        source: "osint_stub",
+        confidence: 40,
+        metadata: { provider: "stub", note: "integrate Shodan/Censys connectors in next iteration" }
+    });
+    found += 1;
+    await appendStepLog(stepId, `Recon complete. Assets discovered/updated: ${found}\n`);
+    return found;
+}
+async function getPipelineConfig() {
+    return withClient(async (c) => {
+        const res = await c.query(`select config from pipeline_configs where id = 1`);
+        const cfg = res.rows[0]?.config;
+        if (cfg) {
+            const merged = { ...DEFAULT_PIPELINE_CONFIG, ...cfg };
+            if (!Array.isArray(cfg.allowedWordlists) || cfg.allowedWordlists.length === 0) {
+                merged.allowedWordlists = DEFAULT_PIPELINE_CONFIG.allowedWordlists;
+            }
+            return merged;
+        }
+        await c.query(`insert into pipeline_configs (id, config, updated_at)
+       values (1, $1::jsonb, now())
+       on conflict (id) do update set config = excluded.config, updated_at = now()`, [JSON.stringify(DEFAULT_PIPELINE_CONFIG)]);
+        return DEFAULT_PIPELINE_CONFIG;
+    });
+}
+async function writeAuditEvent(action, payload, target) {
+    const cfg = await getPipelineConfig();
+    if (!cfg.auditEnabled)
+        return;
+    await withClient(async (c) => {
+        await c.query(`insert into audit_events (actor, action, target, payload) values ($1, $2, $3, $4::jsonb)`, ["worker", action, target ?? null, JSON.stringify(payload)]);
+    });
+}
+async function runScan(scanRunId) {
+    await ensureCancelColumn();
+    const ctx = await withClient(async (c) => {
+        const runRes = await c.query(`select sr.id, sr.target_id, sr.profile, t.name as target_name, t.address as target_address
+       from scan_runs sr
+       join targets t on t.id = sr.target_id
+       where sr.id = $1`, [scanRunId]);
+        return runRes.rows[0];
+    });
+    const pipelineConfig = await getPipelineConfig();
+    await writeAuditEvent("scan.started", { scanRunId, targetId: ctx.target_id, profile: ctx.profile }, ctx.target_address);
+    await withClient(async (c) => {
+        await c.query(`update scan_runs set status='running', started_at=now() where id=$1`, [scanRunId]);
+        await c.query(`insert into scan_steps (scan_run_id, name, status, started_at)
+       values ($1, 'Reconnaissance', 'running', now()),
+              ($1, 'Discovery', 'queued', null),
+              ($1, 'Service Identification', 'queued', null),
+              ($1, 'Checks & Findings', 'queued', null)`, [scanRunId]);
+    });
+    const reconStepId = await withClient(async (c) => {
+        const res = await c.query(`select id from scan_steps where scan_run_id=$1 and name='Reconnaissance' order by created_at asc limit 1`, [scanRunId]);
+        return res.rows[0].id;
+    });
+    const reconCount = await runReconnaissance(ctx.target_id, ctx.target_address, reconStepId);
+    await withClient(async (c) => {
+        await c.query(`update scan_steps set status='succeeded', finished_at=now(), log=log || $2 where id=$1`, [
+            reconStepId,
+            `Recon assets: ${reconCount}\n`
+        ]);
+        const d = await c.query(`select id from scan_steps where scan_run_id=$1 and name='Discovery' order by created_at asc limit 1`, [scanRunId]);
+        await c.query(`update scan_steps set status='running', started_at=now() where id=$1`, [d.rows[0].id]);
+    });
+    const discoveryStepId = await withClient(async (c) => {
+        const res = await c.query(`select id from scan_steps where scan_run_id=$1 and name='Discovery' order by created_at asc limit 1`, [scanRunId]);
+        return res.rows[0].id;
+    });
+    const ac = new AbortController();
+    let activeStepId = discoveryStepId;
+    let cancelSeen = false;
+    const cancelPoll = setInterval(async () => {
+        if (cancelSeen)
+            return;
+        const cancelRequested = await withClient(async (c) => {
+            const res = await c.query(`select cancel_requested from scan_runs where id=$1`, [scanRunId]);
+            return Boolean(res.rows?.[0]?.cancel_requested);
+        });
+        if (cancelRequested) {
+            cancelSeen = true;
+            await appendStepLog(activeStepId, "\nCancel requested. Stopping scan...\n");
+            ac.abort();
+        }
+    }, 1000);
+    try {
+        const nmapCmd = `nmap ${env.NMAP_ARGS} -oX - ${ctx.target_address}`;
+        await appendStepLog(discoveryStepId, `Running: ${nmapCmd}\n`);
+        let buffer = "";
+        let lastFlush = Date.now();
+        const flushIfNeeded = async (force = false) => {
+            const now = Date.now();
+            if (!force && now - lastFlush < 1500)
+                return;
+            if (!buffer)
+                return;
+            const out = buffer;
+            buffer = "";
+            lastFlush = now;
+            await appendStepLog(discoveryStepId, out);
+        };
+        const scanOut = await nmapScan(ctx.target_address, env.NMAP_ARGS, {
+            onOutput: (chunk) => {
+                buffer += chunk;
+            },
+            signal: ac.signal
+        }).finally(async () => {
+            await flushIfNeeded(true);
+        });
+        if (ac.signal.aborted)
+            throw new Error("aborted");
+        const services = scanOut.services
+            .filter((s) => s.state === "open")
+            .map((s) => ({
+            port: s.port,
+            protocol: s.protocol,
+            serviceName: s.serviceName,
+            product: s.product,
+            version: s.version,
+            banner: s.banner
+        }));
+        if (scanOut.status === "down") {
+            await appendStepLog(discoveryStepId, `Host appears down from Nmap output: ${scanOut.host}\n`);
+        }
+        let findings = deriveFindingsFromObserved(ctx.target_address, services);
+        // Step 1 finish
+        await withClient(async (c) => {
+            await c.query(`update scan_steps set status='succeeded', finished_at=now() where id=$1`, [discoveryStepId]);
+            const step2 = await c.query(`select id from scan_steps where scan_run_id=$1 and name='Service Identification' order by created_at asc limit 1`, [scanRunId]);
+            await c.query(`update scan_steps set status='running', started_at=now() where id=$1`, [step2.rows[0].id]);
+        });
+        await sleep(500);
+        if (ac.signal.aborted)
+            throw new Error("aborted");
+        // Upsert services
+        const serviceIdByPort = new Map();
+        await withClient(async (c) => {
+            for (const s of services) {
+                const res = await c.query(`
+          insert into services (target_id, port, protocol, service_name, product, version, banner, first_seen_at, last_seen_at)
+          values ($1, $2, $3, $4, $5, $6, $7, now(), now())
+          on conflict (target_id, port, protocol)
+          do update set service_name=excluded.service_name, product=excluded.product, version=excluded.version, banner=excluded.banner, last_seen_at=now()
+          returning id
+          `, [ctx.target_id, s.port, s.protocol, s.serviceName ?? null, s.product ?? null, s.version ?? null, s.banner ?? null]);
+                serviceIdByPort.set(s.port, res.rows[0].id);
+            }
+        });
+        // Step 2 finish, Step 3 start
+        const checksStepId = await withClient(async (c) => {
+            const step2 = await c.query(`select id from scan_steps where scan_run_id=$1 and name='Service Identification' order by created_at asc limit 1`, [scanRunId]);
+            await c.query(`update scan_steps set status='succeeded', finished_at=now(), log=log || $2 where id=$1`, [step2.rows[0].id, `Identified ${services.length} services\n`]);
+            const step3 = await c.query(`select id from scan_steps where scan_run_id=$1 and name='Checks & Findings' order by created_at asc limit 1`, [scanRunId]);
+            await c.query(`update scan_steps set status='running', started_at=now() where id=$1`, [step3.rows[0].id]);
+            return step3.rows[0].id;
+        });
+        activeStepId = checksStepId;
+        await sleep(500);
+        if (ac.signal.aborted)
+            throw new Error("aborted");
+        if (env.HYDRA_ENABLED) {
+            const hydraCredSource = buildHydraCredSource();
+            if (!hydraCredSource) {
+                await appendStepLog(checksStepId, "Hydra enabled but credential source is incomplete. Set HYDRA_USERNAME/HYDRA_USERLIST and HYDRA_PASSWORD/HYDRA_PASSLIST.\n");
+            }
+            else {
+                const hydraOutput = [];
+                try {
+                    const hydraResults = await hydraFromNmapServices(ctx.target_address, services, hydraCredSource, {
+                        threads: env.HYDRA_THREADS,
+                        stopOnFirstFind: env.HYDRA_STOP_ON_FIRST_FIND,
+                        signal: ac.signal,
+                        onOutput: (line) => {
+                            hydraOutput.push(line);
+                        }
+                    });
+                    if (hydraOutput.length) {
+                        await appendStepLog(checksStepId, hydraOutput.join(""));
+                    }
+                    const hydraCreds = hydraResults.flatMap((r) => r.credentials);
+                    findings = findings.concat(deriveFindingsFromHydra(hydraCreds));
+                }
+                catch (e) {
+                    await appendStepLog(checksStepId, `Hydra phase skipped due to error: ${e?.message ?? String(e)}\n`);
+                }
+            }
+        }
+        await sleep(500);
+        if (ac.signal.aborted)
+            throw new Error("aborted");
+        // Upsert findings
+        await withClient(async (c) => {
+            for (const f of findings) {
+                const svcId = f.servicePort ? serviceIdByPort.get(f.servicePort) : undefined;
+                await c.query(`
+          insert into findings (target_id, service_id, title, severity, status, fingerprint, evidence_redacted, first_seen_at, last_seen_at, last_scan_run_id)
+          values ($1, $2, $3, $4, 'open', $5, $6, now(), now(), $7)
+          on conflict (fingerprint)
+          do update set last_seen_at=now(), evidence_redacted=excluded.evidence_redacted, last_scan_run_id=excluded.last_scan_run_id
+          `, [ctx.target_id, svcId ?? null, f.title, f.severity, f.fingerprint, f.evidenceRedacted, scanRunId]);
+            }
+        });
+        await withClient(async (c) => {
+            await c.query(`update scan_steps set status='succeeded', finished_at=now(), log=log || $2 where id=$1`, [checksStepId, `Created/updated ${findings.length} findings\n`]);
+            await c.query(`update scan_runs set status='succeeded', finished_at=now() where id=$1`, [scanRunId]);
+        });
+        await writeAuditEvent("scan.completed", { scanRunId, findings: findings.length, services: services.length }, ctx.target_address);
+        // Neo4j graph (demo wow)
+        await upsertNeo4jTarget({ id: ctx.target_id, name: ctx.target_name, address: ctx.target_address });
+        await rebuildNeo4jForTarget(ctx.target_id);
+    }
+    catch (e) {
+        const isCancelled = cancelSeen || String(e?.message ?? "").toLowerCase().includes("aborted");
+        if (isCancelled) {
+            await withClient(async (c) => {
+                await c.query(`update scan_steps
+           set status='cancelled', finished_at=now(), log=log || $2
+           where scan_run_id=$1 and status in ('queued','running')`, [scanRunId, "\nScan cancelled.\n"]);
+                await c.query(`update scan_runs set status='cancelled', finished_at=now() where id=$1`, [scanRunId]);
+            });
+            await writeAuditEvent("scan.cancelled", { scanRunId }, ctx.target_address);
+            return;
+        }
+        throw e;
+    }
+    finally {
+        clearInterval(cancelPoll);
+    }
+}
+async function appendStepLog(stepId, text) {
+    await withClient(async (c) => {
+        await c.query(`update scan_steps set log = log || $2 where id = $1`, [stepId, text]);
+    });
+}
+function deriveFindingsFromObserved(targetAddress, services) {
+    // Deterministic "service exposure" findings for every open port, plus special policy findings.
+    const mk = (key) => `fp:${key}`;
+    const severityForPort = (port) => {
+        // Demo-friendly baseline (tune later / replace with AI suggestions).
+        if ([3389, 445].includes(port))
+            return "medium";
+        if ([5985, 5986, 22].includes(port))
+            return "low";
+        if ([80].includes(port))
+            return "low";
+        if ([443].includes(port))
+            return "info";
+        if ([21, 23, 25, 110, 139].includes(port))
+            return "medium";
+        return "info";
+    };
+    const out = [];
+    for (const s of services) {
+        const label = [s.serviceName, s.product, s.version].filter(Boolean).join(" ").trim();
+        out.push({
+            title: `Open service exposure: ${s.port}/${s.protocol}${label ? ` (${label})` : ""}`,
+            severity: severityForPort(s.port),
+            servicePort: s.port,
+            evidenceRedacted: `Observed open port ${s.port}/${s.protocol} on ${targetAddress}. Service: ${label || "unknown"}.`,
+            fingerprint: mk(`${targetAddress}|${s.protocol}|${s.port}|exposure|${s.serviceName ?? ""}|${s.product ?? ""}|${s.version ?? ""}`)
+        });
+    }
+    // Keep explicit policy findings (these are the ones you'd pitch as "violations")
+    if (services.some((s) => s.protocol === "tcp" && s.port === 445)) {
+        out.push({
+            title: "Policy: SMB exposed on host",
+            severity: "medium",
+            servicePort: 445,
+            evidenceRedacted: `Observed open port 445/tcp on ${targetAddress}. Restrict SMB to required subnets only.`,
+            fingerprint: mk(`${targetAddress}|tcp|445|policy:smb-exposed`)
+        });
+    }
+    if (services.some((s) => s.protocol === "tcp" && s.port === 3389)) {
+        out.push({
+            title: "Policy: RDP exposed on host",
+            severity: "medium",
+            servicePort: 3389,
+            evidenceRedacted: `Observed open port 3389/tcp on ${targetAddress}. Restrict RDP to admin subnet/jumpbox and enforce MFA.`,
+            fingerprint: mk(`${targetAddress}|tcp|3389|policy:rdp-exposed`)
+        });
+    }
+    if (services.some((s) => s.protocol === "tcp" && (s.port === 5985 || s.port === 5986))) {
+        out.push({
+            title: "Policy: WinRM reachable (review access controls)",
+            severity: "low",
+            servicePort: services.some((s) => s.port === 5986) ? 5986 : 5985,
+            evidenceRedacted: `Observed WinRM port open on ${targetAddress}. Ensure it is restricted and logged.`,
+            fingerprint: mk(`${targetAddress}|tcp|5985-5986|policy:winrm-reachable`)
+        });
+    }
+    return out;
+}
+function maskSecret(value) {
+    if (!value)
+        return "";
+    if (value.length <= 2)
+        return "*".repeat(value.length);
+    return `${value[0]}${"*".repeat(Math.max(1, value.length - 2))}${value[value.length - 1]}`;
+}
+function deriveFindingsFromHydra(credentials) {
+    const mk = (key) => `fp:${key}`;
+    return credentials.map((cred) => ({
+        title: `Weak/default credentials accepted on ${cred.service} (${cred.port})`,
+        severity: "high",
+        servicePort: cred.port,
+        evidenceRedacted: `Hydra reported valid login on ${cred.host}:${cred.port}/${cred.service} with username "${cred.username}" and password "${maskSecret(cred.password)}".`,
+        fingerprint: mk(`${cred.host}|${cred.port}|${cred.service}|hydra|${cred.username}`)
+    }));
+}
+function buildHydraCredSource() {
+    const username = env.HYDRA_USERNAME?.trim();
+    const password = env.HYDRA_PASSWORD?.trim();
+    const userList = env.HYDRA_USERLIST?.trim();
+    const passList = env.HYDRA_PASSLIST?.trim();
+    const usernameSource = username ? { username } : userList ? { userList } : null;
+    const passwordSource = password ? { password } : passList ? { passwordList: passList } : null;
+    if (!usernameSource || !passwordSource)
+        return null;
+    return { ...usernameSource, ...passwordSource };
+}
+let lastScanStartAtMs = 0;
+async function enforceScanRate(config) {
+    const rpm = Math.max(1, Number(config.requestRatePerMinute) || 1);
+    const minGapMs = Math.ceil(60_000 / rpm);
+    const waitMs = minGapMs - (Date.now() - lastScanStartAtMs);
+    if (waitMs > 0)
+        await sleep(waitMs);
+    lastScanStartAtMs = Date.now();
+}
+async function main() {
+    await ensureWorkflowTables();
+    await ensureAgentTables();
+    await getPipelineConfig();
+    await publishToolManifest().catch((e) => console.warn(`[worker] manifest publish failed: ${e.message}`));
+    console.log(`[worker] starting (tools_ssh=${env.REMOTE_SSH_USER}@${env.REMOTE_SSH_HOST}:${env.REMOTE_SSH_PORT}, ollama=${env.OLLAMA_URL})`);
+    console.log(`[worker] mcp models: manager=${env.OLLAMA_MANAGER_MODEL} specialistDefault=${env.OLLAMA_SPECIALIST_MODEL} prompter=${env.OLLAMA_PROMPTER_MODEL} executionWriter=${env.executionWriterModel}`);
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+        const pipelineConfig = await getPipelineConfig();
+        const job = await claimNextJob(pipelineConfig);
+        if (!job) {
+            await sleep(env.POLL_INTERVAL_MS);
+            continue;
+        }
+        try {
+            if (job.type === "scan") {
+                const scanRunId = job.payload.scanRunId;
+                await enforceScanRate(pipelineConfig);
+                await runScan(scanRunId);
+            }
+            else if (job.type === "recon-mcp") {
+                const agentRunId = job.payload.agentRunId;
+                await runReconLoop(agentRunId);
+            }
+            else if (job.type === "exploit") {
+                await runExploitJob(job.payload);
+            }
+            else {
+                throw new Error(`Unknown job type: ${job.type}`);
+            }
+            await setJobDone(job.id, true);
+        }
+        catch (e) {
+            await setJobDone(job.id, false, e?.message ?? String(e));
+        }
+    }
+}
+await main();

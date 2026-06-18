@@ -15,7 +15,9 @@ const EnvSchema = z.object({
     .transform((v) => (v === "gemini" ? "ollama" : v)),
   OLLAMA_URL: z.string().min(1).default("http://localhost:11434"),
   /** Finding explain, agent-run AI summary, and detailed AI report. */
-  OLLAMA_EXPLAIN_MODEL: z.string().min(1).default("qwen3:14b")
+  OLLAMA_EXPLAIN_MODEL: z.string().min(1).default("qwen3:14b"),
+  /** Optional webhook for pushing high/critical findings to an external tracker. */
+  TICKET_WEBHOOK_URL: z.string().optional()
 });
 
 export type Env = z.infer<typeof EnvSchema>;

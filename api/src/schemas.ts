@@ -33,6 +33,9 @@ export const PipelineConfigSchema = z.object({
   maxConcurrentScans: z.coerce.number().int().positive().max(100).default(2),
   requestRatePerMinute: z.coerce.number().int().positive().max(5000).default(120),
   auditEnabled: z.coerce.boolean().default(true),
-  allowedWordlists: z.array(z.string()).default([])
+  allowedWordlists: z.array(z.string()).default([]),
+  allowedCidrs: z.array(z.string()).default([]),
+  enforceScope: z.coerce.boolean().default(false),
+  maxConcurrentAgentRuns: z.coerce.number().int().positive().max(20).default(1)
 });
 
