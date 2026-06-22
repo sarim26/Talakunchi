@@ -3,10 +3,10 @@ import { remoteScript, snippet } from "./shared.js";
 import { getWordlistCatalog, isWordlistAllowed } from "./wordlists.js";
 import { findingsFromWebFactsLlm } from "./webPathFindingsLlm.js";
 import {
-  gobusterBaseUrl,
-  gobusterConnectFlag,
+  cdnHostHeaderFlag,
+  connectIpUrl,
   hostAllowed,
-  normHost,
+  normalizeHttpUrl,
   resolveWebScanFromInput
 } from "./webTarget.js";
 
@@ -56,7 +56,7 @@ export const gobusterTool: ToolDefinition = {
     const args = (input.args ?? {}) as GobusterArgs;
     const webScan = resolveWebScanFromInput(input.target.host, input.target.vhost, input.context?.webScan);
     const bases = collectGobusterBaseUrls(args, input.target.host, webScan.vhost).map((u) =>
-      applyBasePath(gobusterBaseUrl(u, webScan), args.basePath)
+      applyBasePath(connectIpUrl(normalizeHttpUrl(u), webScan), args.basePath)
     );
 
     if (bases.length === 0 && webScan.connectIp && !webScan.vhost) {
@@ -123,7 +123,7 @@ export const gobusterTool: ToolDefinition = {
     let anyHardFailure = false;
     let anyRunOk = false;
 
-    const ipFlag = gobusterConnectFlag(webScan);
+    const hostFlag = cdnHostHeaderFlag(webScan);
 
     for (const url of bases) {
       const script = [
@@ -134,7 +134,7 @@ export const gobusterTool: ToolDefinition = {
         `  echo "WORDLIST_MISSING: $WORDLIST"`,
         `  exit 0`,
         `fi`,
-        `gobuster dir -u "$URL" -w "$WORDLIST" -k --no-error --quiet -t ${threads} -b 404,403${ipFlag ? ` ${ipFlag}` : ""}`
+        `gobuster dir -u "$URL" -w "$WORDLIST" -k --no-error --quiet -t ${threads} -b 404,403${hostFlag ? ` ${hostFlag}` : ""}`
       ].join("\n");
 
       emit.log(

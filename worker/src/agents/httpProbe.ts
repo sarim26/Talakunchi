@@ -209,14 +209,38 @@ type HttpxParseResult = {
   hasLive: boolean;
 };
 
-async function discoverCertHostnames(connectIp: string, signal?: AbortSignal): Promise<string[]> {
-  const script = [
+async function discoverCertHostnames(
+  connectIp: string,
+  signal?: AbortSignal,
+  extraServernames: string[] = []
+): Promise<string[]> {
+  const names = new Set<string>();
+  const snis = new Set<string>([connectIp]);
+  for (const s of extraServernames) {
+    const t = s.trim();
+    if (t && !isIpAddress(t)) snis.add(t);
+  }
+
+  for (const sni of [...snis].slice(0, 12)) {
+    const script = [
+      `set +e`,
+      `IP=${shellQuote(connectIp)}`,
+      `SNI=${shellQuote(sni)}`,
+      `openssl s_client -connect "$IP:443" -servername "$SNI" </dev/null 2>/dev/null | openssl x509 -noout -text 2>/dev/null || true`
+    ].join("\n");
+    const r = await remoteScript(script, signal);
+    for (const n of parseCertHostnames(r.stdout)) names.add(n);
+  }
+
+  const noSniScript = [
     `set +e`,
     `IP=${shellQuote(connectIp)}`,
-    `openssl s_client -connect "$IP:443" -servername "$IP" </dev/null 2>/dev/null | openssl x509 -noout -text 2>/dev/null || true`
+    `openssl s_client -connect "$IP:443" </dev/null 2>/dev/null | openssl x509 -noout -text 2>/dev/null || true`
   ].join("\n");
-  const r = await remoteScript(script, signal);
-  return parseCertHostnames(r.stdout);
+  const bare = await remoteScript(noSniScript, signal);
+  for (const n of parseCertHostnames(bare.stdout)) names.add(n);
+
+  return [...names];
 }
 
 async function runHttpxWithVhostFallback(
@@ -243,7 +267,7 @@ async function runHttpxWithVhostFallback(
     for (const d of input.context?.knownDomains ?? []) {
       if (typeof d === "string" && d.trim()) candidates.add(d.trim());
     }
-    for (const n of await discoverCertHostnames(host, input.signal)) candidates.add(n);
+    for (const n of await discoverCertHostnames(host, input.signal, input.context?.knownDomains ?? [])) candidates.add(n);
 
     for (const name of [...candidates].slice(0, 10)) {
       if (isIpAddress(name)) continue;

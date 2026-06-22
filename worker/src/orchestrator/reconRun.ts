@@ -258,12 +258,13 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
         intentGoal,
         managerArgs: args,
         context: {
-          target: { targetId: run.target_id, host: run.target_address },
+          target: { targetId: run.target_id, host: run.target_address, vhost: targetVhost ?? undefined },
           knownPorts: ctx.knownPorts,
           knownServices: ctx.knownServices,
           discoveredEndpoints: ctx.discoveredEndpoints,
           priorFindings: allFindings,
-          wordlistCatalog
+          wordlistCatalog,
+          webScan: ctx.webScan
         }
       });
       invokeArgs = writer.finalArgs;

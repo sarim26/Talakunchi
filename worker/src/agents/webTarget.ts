@@ -108,20 +108,55 @@ export function httpxExtraFlags(hints: WebScanHints): string {
   return "";
 }
 
-export function gobusterConnectFlag(hints: WebScanHints): string {
-  if (hints.connectIp && hints.vhost) return `-ip ${hints.connectIp}`;
+/** Strip default ports (:80 / :443) so CLIs don't choke on explicit defaults. */
+export function normalizeHttpUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    const port = Number(u.port || (u.protocol === "https:" ? 443 : 80));
+    const def = u.protocol === "https:" ? 443 : 80;
+    if (port === def) u.port = "";
+    return u.href;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * For CDN/IP targets: keep path/scheme/port but connect to `connectIp`.
+ * Pair with `cdnHostHeaderFlag()` — gobuster/katana do not support httpx's `-ip`.
+ */
+export function connectIpUrl(url: string, hints: WebScanHints): string {
+  if (!hints.connectIp || !hints.vhost) return normalizeHttpUrl(url);
+  try {
+    const u = new URL(url);
+    const port = Number(u.port || (u.protocol === "https:" ? 443 : 80));
+    const def = u.protocol === "https:" ? 443 : 80;
+    u.hostname = hints.connectIp;
+    u.port = port === def ? "" : String(port);
+    return u.href;
+  } catch {
+    return normalizeHttpUrl(url);
+  }
+}
+
+/** `-H 'Host: …'` for tools that connect to an IP but must present a vhost (gobuster, ffuf, katana). */
+export function cdnHostHeaderFlag(hints: WebScanHints): string {
+  if (hints.connectIp && hints.vhost) return `-H ${shellQuote(`Host: ${hostTrim(hints.vhost)}`)}`;
   return "";
 }
 
+/** @deprecated Use {@link cdnHostHeaderFlag} — gobuster has no `-ip` flag. */
+export function gobusterConnectFlag(hints: WebScanHints): string {
+  return cdnHostHeaderFlag(hints);
+}
+
+/** @deprecated Use {@link connectIpUrl} + {@link cdnHostHeaderFlag}. */
 export function gobusterBaseUrl(url: string, hints: WebScanHints): string {
-  if (!hints.connectIp || !hints.vhost) return url;
-  const rewritten = rewriteUrlsForVhost([url], hints.vhost);
-  return rewritten[0] ?? url;
+  return connectIpUrl(url, hints);
 }
 
 export function ffufHostHeaderArgs(hints: WebScanHints): string {
-  if (hints.connectIp && hints.vhost) return `-H ${shellQuote(`Host: ${hostTrim(hints.vhost)}`)}`;
-  return "";
+  return cdnHostHeaderFlag(hints);
 }
 
 /** Parse CN + SAN DNS names from `openssl x509 -noout -text` output. */

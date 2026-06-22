@@ -1,6 +1,6 @@
 import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
 import { remoteScript, requireRemoteTool, snippet } from "./shared.js";
-import { hostAllowed, resolveWebScanFromInput } from "./webTarget.js";
+import { cdnHostHeaderFlag, connectIpUrl, hostAllowed, isIpAddress, normalizeHttpUrl, resolveWebScanFromInput } from "./webTarget.js";
 
 const KATANA_BIN = "katana";
 
@@ -71,11 +71,26 @@ export const spiderTool: ToolDefinition = {
     const presence = await requireRemoteTool(KATANA_BIN, input.signal, { installCommand: KATANA_INSTALL_COMMAND });
     if (presence.missing) return presence.envelope;
 
+    if (isIpAddress(input.target.host) && !webScan.vhost) {
+      return {
+        status: "skipped",
+        error:
+          "CDN/IP target: run recon.http_probe first (or set target vhost) before spidering a bare IP — Akamai/CDN edges return 400 without a Host header.",
+        artifacts: { commands: [] },
+        facts: [],
+        findings: [],
+        recommendations: [{ agent: "recon.http_probe", reason: "Resolve vhost from TLS cert before crawling", priority: 90 }],
+        meta: { webScan }
+      };
+    }
+
     const depth = clampInt(args.depth ?? 3, 1, 6);
     const concurrency = clampInt(args.concurrency ?? 10, 1, 30);
     const timeoutSec = clampInt(args.timeoutSec ?? 10, 3, 30);
     const jsCrawl = args.jsCrawl !== false;
-    const fieldScope = args.includeSubdomains ? "rdn" : "fqdn";
+    const hostFlag = cdnHostHeaderFlag(webScan);
+    const fieldScope =
+      webScan.vhost && webScan.connectIp ? "rdn" : args.includeSubdomains ? "rdn" : "fqdn";
 
     const allFacts: ToolEnvelope["facts"] = [];
     const allFindings: ToolEnvelope["findings"] = [];
@@ -87,9 +102,14 @@ export const spiderTool: ToolDefinition = {
     let stdoutAggregate = "";
 
     for (const seedUrl of seeds) {
-      const flags = buildKatanaArgv(seedUrl, depth, concurrency, timeoutSec, fieldScope, jsCrawl);
+      const crawlUrl = connectIpUrl(normalizeHttpUrl(seedUrl), webScan);
+      const flags = buildKatanaArgv(crawlUrl, depth, concurrency, timeoutSec, fieldScope, jsCrawl, hostFlag);
       const script = [`set +e`, `${KATANA_BIN} ${flags.join(" ")}`].join("\n");
-      emit.log(`Running katana against ${seedUrl} (depth=${depth}, concurrency=${concurrency}, jsCrawl=${jsCrawl})`);
+      emit.log(
+        webScan.vhost && webScan.connectIp
+          ? `Running katana against ${crawlUrl} Host:${webScan.vhost} (depth=${depth})`
+          : `Running katana against ${crawlUrl} (depth=${depth}, concurrency=${concurrency}, jsCrawl=${jsCrawl})`
+      );
       const r = await remoteScript(script, input.signal, (s) => emit.log(s));
       totalDuration += r.durationMs;
       stdoutAggregate += r.stdout;
@@ -207,7 +227,8 @@ function buildKatanaArgv(
   concurrency: number,
   timeoutSec: number,
   fieldScope: string,
-  jsCrawl: boolean
+  jsCrawl: boolean,
+  hostHeaderFlag = ""
 ): string[] {
   const flags: string[] = [
     `-u ${quote(url)}`,
@@ -221,6 +242,7 @@ function buildKatanaArgv(
     `-silent`,
     `-no-color`
   ];
+  if (hostHeaderFlag) flags.push(hostHeaderFlag);
   if (jsCrawl) flags.push("-jc");
   return flags;
 }

@@ -22,6 +22,7 @@ import { env } from "../env.js";
 import { chatJSON } from "../llm/ollama.js";
 import type { TargetCtx, ToolDefinition, ToolFinding } from "../mcp/types.js";
 import { isWordlistAllowed, type WordlistCatalog } from "./wordlists.js";
+import { normHost, type WebScanHints } from "./webTarget.js";
 
 export type ExecutionWriterContext = {
   target: TargetCtx;
@@ -30,7 +31,17 @@ export type ExecutionWriterContext = {
   discoveredEndpoints: Array<{ url: string; method?: string; status?: number | null; sourceTool?: string }>;
   priorFindings: ToolFinding[];
   wordlistCatalog?: WordlistCatalog;
+  /** CDN/vhost routing from http_probe — allows vhost hostnames in http_targets. */
+  webScan?: WebScanHints | null;
 };
+
+function urlHostAllowed(hostname: string, ctx: ExecutionWriterContext): boolean {
+  const h = normHost(hostname);
+  if (h === normHost(ctx.target.host)) return true;
+  const vhost = ctx.webScan?.vhost?.trim();
+  if (vhost && h === normHost(vhost)) return true;
+  return false;
+}
 
 export type ExecutionWriterInput = {
   tool: ToolDefinition;
@@ -102,7 +113,7 @@ function sanitizeDraft(
         if (typeof item !== "string") continue;
         try {
           const u = new URL(item.trim());
-          if (u.hostname !== ctx.target.host) {
+          if (!urlHostAllowed(u.hostname, ctx)) {
             dropped.push(`http_targets item (host ${u.hostname} != target ${ctx.target.host})`);
             continue;
           }
@@ -124,7 +135,7 @@ function sanitizeDraft(
         if (/^https?:\/\//i.test(t)) {
           try {
             const u = new URL(t);
-            if (u.hostname !== ctx.target.host) {
+            if (!urlHostAllowed(u.hostname, ctx)) {
               dropped.push(`urls item (host ${u.hostname} != target ${ctx.target.host})`);
               continue;
             }
@@ -165,7 +176,7 @@ function sanitizeDraft(
     if ((k === "url" || k === "targetUrl") && typeof v === "string") {
       try {
         const u = new URL(v.replace(/FUZZ/g, "x"));
-        if (u.hostname !== ctx.target.host) {
+        if (!urlHostAllowed(u.hostname, ctx)) {
           dropped.push(`${k} (host ${u.hostname} != target ${ctx.target.host})`);
           continue;
         }
@@ -217,6 +228,9 @@ export async function draftExecutionPayload(input: ExecutionWriterInput): Promis
     `- Tool description: ${tool.description}`,
     `- Tool argSchema (use ONLY these keys): ${JSON.stringify(tool.argSchema ?? {}, null, 0)}`,
     `- Target host MUST equal: ${context.target.host}. Full URLs must use this host; \`urls\` may also use path-only strings (e.g. /uploads/) expanded per args.ports / context.`,
+    context.webScan?.vhost
+      ? `- CDN/vhost mode: URLs may also use the resolved vhost hostname (${context.webScan.vhost}). Tools connect to ${context.webScan.connectIp ?? context.target.host} with Host: ${context.webScan.vhost}.`
+      : "",
     "- If a wordlist is needed, choose an absolute path from the provided SecLists catalog.",
     "- Do not invent unknown keys. Omit fields you are unsure about (defaults will apply).",
     "- Do not include a 'tool' or 'name' field; just args.",
@@ -237,6 +251,13 @@ export async function draftExecutionPayload(input: ExecutionWriterInput): Promis
         method: e.method ?? "GET",
         status: e.status ?? null
       })),
+      webScan: context.webScan
+        ? {
+            connectIp: context.webScan.connectIp,
+            vhost: context.webScan.vhost,
+            cdnDetected: context.webScan.cdnDetected
+          }
+        : null,
       wordlists: wordlistHints
     },
     null,
