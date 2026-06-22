@@ -4,6 +4,8 @@ export const CreateTargetSchema = z.object({
     address: z.string().min(1),
     /** Canonical HTTP hostname when `address` is an IP behind CDN/WAF (optional). */
     vhost: z.string().min(1).optional(),
+    /** IPs, CIDRs, and/or hostnames in scope for this target (per-engagement). */
+    scope: z.array(z.string()).optional().default([]),
     tags: z.array(z.string()).optional().default([]),
     owner: z.string().optional()
 });

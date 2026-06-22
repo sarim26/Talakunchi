@@ -41,6 +41,7 @@ export type ManagerRunHints = {
 
 export type ManagerContext = {
   targetHost: string;
+  targetName?: string | null;
   stepsRemaining: number;
   knownPorts: number[];
   knownServices: Array<{ port: number; protocol: string; name?: string; product?: string; version?: string }>;
@@ -126,6 +127,10 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
   const coverage = coverageFirstDecision(server, ctx);
   if (coverage) return coverage;
 
+  // Cold-start: always port-scan before CDN/http work when we have zero intel.
+  const initialNmap = fallbackInitialNmap(server, ctx);
+  if (initialNmap) return initialNmap;
+
   const cdnGuard = cdnVhostGuardDecision(server, ctx);
   if (cdnGuard) return cdnGuard;
 
@@ -137,16 +142,14 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
   const llmDecision = await tryLlmDecision(server, ctx, signal);
   if (llmDecision) {
     if (llmDecision.action === "stop") return llmDecision;
-    if (llmDecision.action === "invoke" && server.has(llmDecision.tool)) return llmDecision;
+    if (llmDecision.action === "invoke" && server.has(llmDecision.tool)) {
+      const guarded = suppressRepeatToolInvocation(llmDecision, ctx);
+      if (guarded) return guarded;
+    }
   }
 
   const fromRec = fallbackFromRecommendations(server, ctx);
   if (fromRec) return fromRec;
-
-  // Cold-start safety net: if the LLM failed and we have no host intel yet,
-  // start with nmap deterministically instead of stopping on step 1.
-  const initialNmap = fallbackInitialNmap(server, ctx);
-  if (initialNmap) return initialNmap;
 
   if (ctx.stepsRemaining <= 0) {
     return { action: "stop", reason: "Step budget exhausted" };
@@ -215,6 +218,19 @@ function fallbackInitialNmap(server: MCPServer, ctx: ManagerContext): ManagerDec
   };
 }
 
+/** Prevent burning steps re-running slow specialists with no new intel. */
+function suppressRepeatToolInvocation(decision: ManagerDecision, ctx: ManagerContext): ManagerDecision | null {
+  if (decision.action !== "invoke") return decision;
+  const history = ctx.invocationHistory ?? [];
+  const priorRuns = history.filter((h) => h.tool === decision.tool).length;
+  if (priorRuns === 0) return decision;
+
+  const noRepeat = new Set(["recon.tls_check", "recon.waf_detect"]);
+  if (noRepeat.has(decision.tool) && priorRuns >= 1) return null;
+
+  return decision;
+}
+
 /** When the target is an IP behind CDN, resolve vhost via http_probe before fuzzing. */
 function cdnVhostGuardDecision(server: MCPServer, ctx: ManagerContext): ManagerDecision | null {
   if (!isIpAddress(ctx.targetHost)) return null;
@@ -222,6 +238,10 @@ function cdnVhostGuardDecision(server: MCPServer, ctx: ManagerContext): ManagerD
   const history = ctx.invocationHistory ?? [];
   const ran = new Set(history.map((h) => h.tool));
   const probeRuns = history.filter((h) => h.tool === "recon.http_probe").length;
+
+  const hasPortIntel =
+    (ctx.knownPorts ?? []).length > 0 || (ctx.knownServices ?? []).length > 0 || ran.has("recon.nmap");
+  if (!hasPortIntel) return null;
 
   const needsVhost = !ws.vhost;
   const cdnLikely = ws.cdnDetected || isIpAddress(ctx.targetHost);
@@ -356,8 +376,9 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
     "  - After services exist → choose the most informative specialist (http_probe, ssh_enum, smb_enum, tls_check, cve_enricher, spider, waybackurls, gobuster, ffuf, etc.).",
     "  - Infra services map to dedicated specialists: 3389→rdp_enum, 21→ftp_enum, 25/587/465→smtp_enum, 389/636→ldap_enum, 2049→nfs_enum, 6379→redis_enum, 161/udp→snmp_enum, 3306/5432/1433→db_banner. Run these when the matching port is open.",
     "  - recon.nuclei (safe tags) and recon.waf_detect operate on web origins: run recon.http_probe first so HTTP seeds/discoveredEndpoints exist, then use them.",
-    "  - IP targets behind CDN/WAF (Akamai, Cloudflare): NEVER fuzz http://<ip>/ directly. Run recon.http_probe first — it discovers the vhost from TLS cert and retries with Host/SNI routing. Use discoveredEndpoints hostnames in gobuster/ffuf args.",
-    "  - If webScan.vhost is set in context, pass http_targets using that hostname (worker connects to connectIp automatically).",
+    "  - IP targets behind CDN/WAF (Akamai, Cloudflare): run recon.nmap then recon.http_probe. TLS cert SANs on a scoped IP identify the vhost — use those hostnames in http_targets (worker connects to connectIp with Host header). Respect target scope entries only.",
+    "  - If webScan.vhost is set, web tools connect to connectIp with Host/SNI for that hostname.",
+    "  - Do NOT repeat recon.tls_check or recon.waf_detect if they already appear in history unless new ports appeared.",
     "  - recon.hydra (only present in gated mode) is a credentialed check on auth services; it pauses for human approval before running. Choose it only when an auth service (ssh/ftp/rdp/smb/db) is open and credential testing is in scope.",
     "  - Follow tool `requires` hints; do not invoke a tool whose preconditions are clearly unmet.",
     "  - Prefer system.tool_installer only when a prior failure indicated a missing remote CLI (recentFailures.missingTool) — the orchestrator may force-install before you run again.",
@@ -468,7 +489,7 @@ function fallbackFromRecommendations(server: MCPServer, ctx: ManagerContext): Ma
   for (const p of list) {
     if (!server.has(p.agent)) continue;
     if (!recommendationHasRunnableArgs(p)) continue;
-    return {
+    const decision: ManagerDecision = {
       action: "invoke",
       tool: p.agent,
       intentGoal: p.reason.slice(0, 400),
@@ -476,6 +497,8 @@ function fallbackFromRecommendations(server: MCPServer, ctx: ManagerContext): Ma
       reasoning:
         "Automatic fallback: manager model produced no usable JSON after retries; running highest-priority recommendation queued by a prior tool."
     };
+    const guarded = suppressRepeatToolInvocation(decision, ctx);
+    if (guarded) return guarded;
   }
   return null;
 }
@@ -505,6 +528,7 @@ function buildManagerUserPayload(server: MCPServer, ctx: ManagerContext, mode: M
     return {
       tools: server.list().map((t) => ({ name: t.name, requires: t.requires })),
       target: ctx.targetHost,
+      targetName: ctx.targetName ?? null,
       stepsRemaining: ctx.stepsRemaining,
       knownPorts: ctx.knownPorts,
       knownServices: ctx.knownServices.slice(0, 20),
@@ -525,6 +549,7 @@ function buildManagerUserPayload(server: MCPServer, ctx: ManagerContext, mode: M
   return {
     tools: server.manifestCompact(),
     target: ctx.targetHost,
+    targetName: ctx.targetName ?? null,
     stepsRemaining: ctx.stepsRemaining,
     knownPorts: ctx.knownPorts,
     knownServices: ctx.knownServices.slice(0, 40),

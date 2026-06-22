@@ -7,6 +7,7 @@ create table if not exists targets (
   name text not null,
   address text not null, -- ip or hostname
   vhost text, -- canonical HTTP hostname when address is an IP behind CDN
+  scope text[] not null default '{}', -- per-target engagement scope (IPs/CIDRs/hostnames)
   tags text[] not null default '{}',
   owner text,
   created_at timestamptz not null default now()

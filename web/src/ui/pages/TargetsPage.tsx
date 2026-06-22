@@ -20,6 +20,7 @@ export function TargetsPage() {
   const [name, setName] = useState("WIN-LAB-01");
   const [address, setAddress] = useState("10.0.0.10");
   const [vhost, setVhost] = useState("");
+  const [scope, setScope] = useState("");
   const [tags, setTags] = useState("lab,staging");
 
   const createM = useMutation({
@@ -36,6 +37,15 @@ export function TargetsPage() {
         .map((t) => t.trim())
         .filter(Boolean),
     [tags]
+  );
+
+  const scopeList = useMemo(
+    () =>
+      scope
+        .split(/[\s,]+/)
+        .map((t) => t.trim())
+        .filter(Boolean),
+    [scope]
   );
 
   return (
@@ -65,6 +75,13 @@ export function TargetsPage() {
               fullWidth
             />
             <TextField
+              label="Scope (optional)"
+              placeholder="IPs, CIDRs, hostnames — e.g. 23.55.58.147, example.com"
+              value={scope}
+              onChange={(e) => setScope(e.target.value)}
+              fullWidth
+            />
+            <TextField
               label="Tags (comma separated)"
               value={tags}
               onChange={(e) => setTags(e.target.value)}
@@ -72,7 +89,15 @@ export function TargetsPage() {
             />
             <Button
               variant="contained"
-              onClick={() => createM.mutate({ name, address, vhost: vhost.trim() || undefined, tags: tagList })}
+              onClick={() =>
+                createM.mutate({
+                  name,
+                  address,
+                  vhost: vhost.trim() || undefined,
+                  scope: scopeList.length ? scopeList : undefined,
+                  tags: tagList
+                })
+              }
               disabled={createM.isPending}
               sx={{ minWidth: 150 }}
             >
@@ -98,6 +123,7 @@ export function TargetsPage() {
                     <Typography variant="body2" color="text.secondary">
                       {t.address}
                       {t.vhost ? ` · vhost ${t.vhost}` : ""}
+                      {t.scope?.length ? ` · scope ${t.scope.join(", ")}` : ""}
                     </Typography>
                   </Box>
                   <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>

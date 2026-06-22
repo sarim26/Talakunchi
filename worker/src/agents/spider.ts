@@ -1,6 +1,6 @@
 import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
 import { remoteScript, requireRemoteTool, snippet } from "./shared.js";
-import { cdnHostHeaderFlag, connectIpUrl, hostAllowed, isIpAddress, normalizeHttpUrl, resolveWebScanFromInput } from "./webTarget.js";
+import { cdnHostHeaderFlag, connectIpUrl, hostAllowed, isIpAddress, normalizeHttpUrl, resolveWebScanFromInput, vhostAcceptPolicyFromInput } from "./webTarget.js";
 
 const KATANA_BIN = "katana";
 
@@ -54,7 +54,8 @@ export const spiderTool: ToolDefinition = {
   handler: async (input, emit): Promise<ToolEnvelope> => {
     const args = (input.args ?? {}) as SpiderArgs;
     const webScan = resolveWebScanFromInput(input.target.host, input.target.vhost, input.context?.webScan);
-    const seeds = collectSeeds(args, input.target.host, webScan.vhost);
+    const vhostPolicy = vhostAcceptPolicyFromInput(input.target.host, input, webScan.cdnDetected);
+    const seeds = collectSeeds(args, input.target.host, webScan.vhost, vhostPolicy);
     if (seeds.length === 0) {
       return {
         status: "skipped",
@@ -194,7 +195,12 @@ export const spiderTool: ToolDefinition = {
   }
 };
 
-function collectSeeds(args: SpiderArgs, targetHost: string, vhost: string | null): string[] {
+function collectSeeds(
+  args: SpiderArgs,
+  targetHost: string,
+  vhost: string | null,
+  policy: ReturnType<typeof vhostAcceptPolicyFromInput>
+): string[] {
   const ordered: string[] = [];
   const seen = new Set<string>();
   const push = (raw: string) => {
@@ -202,7 +208,7 @@ function collectSeeds(args: SpiderArgs, targetHost: string, vhost: string | null
     if (!s) return;
     try {
       const u = new URL(s);
-      if (!hostAllowed(u.hostname, targetHost, vhost)) return;
+      if (!hostAllowed(u.hostname, targetHost, vhost, policy)) return;
       if (u.protocol !== "http:" && u.protocol !== "https:") return;
       const href = u.href;
       if (seen.has(href)) return;

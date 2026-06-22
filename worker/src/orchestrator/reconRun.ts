@@ -15,7 +15,7 @@ import { generatePrompt } from "../agents/prompter.js";
 import { draftExecutionPayload, shouldUseExecutionWriter } from "../agents/executionCommandWriter.js";
 import { getWordlistCatalog } from "../agents/wordlists.js";
 import { pickVerifierFor } from "../agents/verification.js";
-import { parseScopeList, isHostInScope } from "../scope.js";
+import { isHostInScope, resolveEngagementScope } from "../scope.js";
 import { emptyWebScanHints, mergeWebScanHints, webScanFromEnvelopeMeta, type WebScanHints } from "../agents/webTarget.js";
 import {
   createEventSink,
@@ -70,37 +70,30 @@ export async function startReconRun(input: StartReconRunInput): Promise<string> 
   return runId;
 }
 
-/**
- * Resolve the effective engagement scope from `AGENT_SCOPE` (env) plus the
- * pipeline config (`allowedCidrs` / `enforceScope`). A non-empty `AGENT_SCOPE`
- * always enables enforcement; otherwise the pipeline `enforceScope` flag decides.
- */
-async function resolveScope(): Promise<{ enforce: boolean; entries: string[] }> {
-  const envEntries = parseScopeList(env.AGENT_SCOPE);
+async function loadPipelineScopeConfig(): Promise<{ allowedCidrs: string[]; enforceScope: boolean }> {
   const cfg = await withClient(async (c) => {
     const r = await c.query(`select config from pipeline_configs where id = 1`);
     return r.rows[0]?.config as { allowedCidrs?: unknown; enforceScope?: unknown } | undefined;
   }).catch(() => undefined);
-
-  const cfgEntries = Array.isArray(cfg?.allowedCidrs)
+  const allowedCidrs = Array.isArray(cfg?.allowedCidrs)
     ? (cfg!.allowedCidrs as unknown[]).filter((x): x is string => typeof x === "string")
     : [];
-  const entries = [...new Set([...envEntries, ...cfgEntries])];
-  const enforce = (envEntries.length > 0 || cfg?.enforceScope === true) && entries.length > 0;
-  return { enforce, entries };
+  return { allowedCidrs, enforceScope: cfg?.enforceScope === true };
 }
 
 export async function runReconLoop(agentRunId: string): Promise<void> {
   await ensureAgentTables();
   await withClient(async (c) => {
     await c.query(`alter table targets add column if not exists vhost text`);
+    await c.query(`alter table targets add column if not exists scope text[] not null default '{}'::text[]`);
   });
 
   const data = await withClient(async (c) => {
     const r = await c.query(
       `select ar.id, ar.target_id, ar.max_steps,
               ar.initial_nmap_profile, ar.initial_nmap_ports, ar.initial_nmap_extra_args,
-              t.name as target_name, t.address as target_address, t.vhost as target_vhost
+              t.name as target_name, t.address as target_address, t.vhost as target_vhost,
+              t.scope as target_scope
        from agent_runs ar
        join targets t on t.id = ar.target_id
        where ar.id = $1`,
@@ -117,6 +110,7 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
           target_name: string;
           target_address: string;
           target_vhost: string | null;
+          target_scope: string[] | null;
         }
       | undefined;
   });
@@ -125,7 +119,15 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
   // async helpers (it gets lost across closure boundaries otherwise).
   const run = data;
 
-  const scope = await resolveScope();
+  const pipelineScope = await loadPipelineScopeConfig();
+  const scope = resolveEngagementScope({
+    targetAddress: run.target_address,
+    targetVhost: run.target_vhost,
+    targetScope: run.target_scope,
+    envScope: env.AGENT_SCOPE,
+    pipelineAllowedCidrs: pipelineScope.allowedCidrs,
+    pipelineEnforceScope: pipelineScope.enforceScope
+  });
   if (scope.enforce && !isHostInScope(run.target_address, scope.entries)) {
     const reason = `Target ${run.target_address} is outside the configured engagement scope (${scope.entries.join(", ") || "none"}).`;
     await withClient(async (c) => {
@@ -178,6 +180,7 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
 
   const ctx: ManagerContext = {
     targetHost: run.target_address,
+    targetName: run.target_name,
     stepsRemaining: run.max_steps,
     knownPorts: [],
     knownServices: [],
@@ -258,13 +261,20 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
         intentGoal,
         managerArgs: args,
         context: {
-          target: { targetId: run.target_id, host: run.target_address, vhost: targetVhost ?? undefined },
+          target: {
+            targetId: run.target_id,
+            host: run.target_address,
+            vhost: targetVhost ?? undefined,
+            name: run.target_name
+          },
           knownPorts: ctx.knownPorts,
           knownServices: ctx.knownServices,
           discoveredEndpoints: ctx.discoveredEndpoints,
           priorFindings: allFindings,
           wordlistCatalog,
-          webScan: ctx.webScan
+          webScan: ctx.webScan,
+          scopeEntries: scope.entries,
+          scopeEnforce: scope.enforce
         }
       });
       invokeArgs = writer.finalArgs;
@@ -291,7 +301,12 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
     const { invocationId, envelope } = await server.invoke(
       toolDef.name,
       {
-        target: { targetId: run.target_id, host: run.target_address, vhost: targetVhost ?? undefined },
+        target: {
+          targetId: run.target_id,
+          host: run.target_address,
+          vhost: targetVhost ?? undefined,
+          name: run.target_name
+        },
         intent: invokeIntent,
         args: invokeArgs,
         signal: ac.signal,
@@ -307,6 +322,8 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
             sourceTool: e.sourceTool
           })),
           webScan: ctx.webScan,
+          scopeEntries: scope.entries,
+          scopeEnforce: scope.enforce,
           runId: agentRunId,
           invocationId: ""
         }
@@ -464,6 +481,9 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
     for (const rec of envelope.recommendations ?? []) {
       if (!ctx.pendingRecommendations.some((p) => p.agent === rec.agent)) ctx.pendingRecommendations.push(rec);
     }
+
+    // Drop queued recommendation once we have run that specialist.
+    ctx.pendingRecommendations = ctx.pendingRecommendations.filter((p) => p.agent !== toolName);
 
     // Session loop: once credentials are confirmed, queue gated read-only post-ex.
     if (

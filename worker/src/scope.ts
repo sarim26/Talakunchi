@@ -43,6 +43,10 @@ export function isHostInScope(host: string, entries: string[]): boolean {
     const entry = raw.trim();
     if (!entry) continue;
     if (entry.toLowerCase() === h) return true;
+    if (!hostIsIpv4 && !entry.includes("/") && net.isIP(entry) === 0) {
+      const e = entry.toLowerCase();
+      if (h === e || h.endsWith(`.${e}`)) return true;
+    }
     if (hostIsIpv4) {
       if (entry.includes("/")) {
         if (inCidr(host, entry)) return true;
@@ -52,4 +56,34 @@ export function isHostInScope(host: string, entries: string[]): boolean {
     }
   }
   return false;
+}
+
+export type EngagementScopeInput = {
+  targetAddress: string;
+  targetVhost?: string | null;
+  /** Per-target scope: IPs, CIDRs, hostnames allowed for this engagement. */
+  targetScope?: string[] | null;
+  envScope?: string | null;
+  pipelineAllowedCidrs?: string[];
+  pipelineEnforceScope?: boolean;
+};
+
+/**
+ * Merge scope from target (primary), optional global env, and pipeline config.
+ * Each target/run can define its own scope — nothing is hardcoded per customer.
+ */
+export function resolveEngagementScope(input: EngagementScopeInput): { enforce: boolean; entries: string[] } {
+  const envEntries = parseScopeList(input.envScope);
+  const targetScopeEntries = (input.targetScope ?? []).map((s) => s.trim()).filter(Boolean);
+  const targetEntries = [
+    input.targetAddress.trim(),
+    ...(input.targetVhost?.trim() ? [input.targetVhost.trim()] : []),
+    ...targetScopeEntries
+  ].filter(Boolean);
+  const pipelineEntries = (input.pipelineAllowedCidrs ?? []).map((s) => s.trim()).filter(Boolean);
+  const entries = [...new Set([...targetEntries, ...envEntries, ...pipelineEntries])];
+  const enforce =
+    (targetScopeEntries.length > 0 || envEntries.length > 0 || input.pipelineEnforceScope === true) &&
+    entries.length > 0;
+  return { enforce, entries };
 }

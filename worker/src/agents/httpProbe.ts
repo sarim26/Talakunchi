@@ -13,7 +13,10 @@ import {
   rewriteUrlsForVhost,
   serializeWebScan,
   shellQuote,
-  type WebScanHints
+  acceptVhostCandidate,
+  isScopedIpEngagement,
+  type WebScanHints,
+  vhostAcceptPolicyFromInput
 } from "./webTarget.js";
 
 const HTTPX_BIN = "httpx-toolkit";
@@ -254,6 +257,7 @@ async function runHttpxWithVhostFallback(
   knownPorts?: ProbeRow[]
 ): Promise<ToolEnvelope> {
   let first = await runHttpxOnce(urls, host, input, emit, mode, webScan);
+  const policy = vhostAcceptPolicyFromInput(host, input, first.cdnDetected);
 
   const needsVhost =
     isIpAddress(host) &&
@@ -267,10 +271,16 @@ async function runHttpxWithVhostFallback(
     for (const d of input.context?.knownDomains ?? []) {
       if (typeof d === "string" && d.trim()) candidates.add(d.trim());
     }
-    for (const n of await discoverCertHostnames(host, input.signal, input.context?.knownDomains ?? [])) candidates.add(n);
+    for (const n of await discoverCertHostnames(host, input.signal, input.context?.knownDomains ?? [])) {
+      candidates.add(n);
+    }
 
     for (const name of [...candidates].slice(0, 10)) {
       if (isIpAddress(name)) continue;
+      if (!acceptVhostCandidate(name, policy)) {
+        emit.log(`Skipping vhost candidate ${name} (outside engagement scope)`);
+        continue;
+      }
       const vhostUrls = rewriteUrlsForVhost(urls, name);
       const hints = mergeWebScanHints(webScan, {
         connectIp: host,
@@ -312,7 +322,7 @@ async function runHttpxWithVhostFallback(
       mode === "context"
         ? (knownPorts ?? []).some((kp) => kp.scheme === "https")
         : urls.some((u) => u.startsWith("https://"));
-    if (https) {
+    if (https && webScan.vhost) {
       recs.push({ agent: "recon.tls_check", reason: "Verify TLS configuration", priority: 70 });
     }
     if (webScan.cdnDetected) {
@@ -325,6 +335,16 @@ async function runHttpxWithVhostFallback(
     extraFacts.push({
       type: "virtual_host",
       value: { vhost: webScan.vhost, connectIp: host, cdnVendor: webScan.cdnVendor },
+      source: "http_probe"
+    });
+  } else if (first.cdnDetected && isIpAddress(host) && !webScan.vhost && !isScopedIpEngagement(policy)) {
+    extraFacts.push({
+      type: "cdn_shared_edge",
+      value: {
+        connectIp: host,
+        cdnVendor: webScan.cdnVendor ?? first.cdnVendor,
+        hint: "CDN edge with no vhost resolved — set target vhost or add hostname to AGENT_SCOPE."
+      },
       source: "http_probe"
     });
   }

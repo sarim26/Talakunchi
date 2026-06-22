@@ -8,7 +8,8 @@ import {
   hostAllowed,
   isIpAddress,
   normHost,
-  resolveWebScanFromInput
+  resolveWebScanFromInput,
+  vhostAcceptPolicyFromInput
 } from "./webTarget.js";
 
 const FFUF_BIN = "ffuf";
@@ -64,7 +65,8 @@ export const ffufTool: ToolDefinition = {
     };
 
     const webScan = resolveWebScanFromInput(input.target.host, input.target.vhost, input.context?.webScan);
-    const targets = collectTargetUrls(args, input.target.host, webScan.vhost);
+    const vhostPolicy = vhostAcceptPolicyFromInput(input.target.host, input, webScan.cdnDetected);
+    const targets = collectTargetUrls(args, input.target.host, webScan.vhost, vhostPolicy);
     if (targets.length === 0) {
       if (isIpAddress(input.target.host) && !webScan.vhost) {
         return {
@@ -246,7 +248,8 @@ function ensureFuzz(u: string): string {
 function collectTargetUrls(
   args: { http_targets?: unknown; targetUrl?: string; basePath?: string },
   targetHost: string,
-  vhost: string | null
+  vhost: string | null,
+  policy: ReturnType<typeof vhostAcceptPolicyFromInput>
 ): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -256,7 +259,7 @@ function collectTargetUrls(
     if (!/FUZZ/.test(t)) return;
     try {
       const u = new URL(t.replace(/FUZZ/g, "x"));
-      if (!hostAllowed(u.hostname, targetHost, vhost)) return;
+      if (!hostAllowed(u.hostname, targetHost, vhost, policy)) return;
       const href = t;
       if (seen.has(href)) return;
       seen.add(href);
@@ -273,7 +276,7 @@ function collectTargetUrls(
       if (typeof item !== "string") continue;
       try {
         const base = new URL(item.trim());
-        if (!hostAllowed(base.hostname, targetHost, vhost)) continue;
+        if (!hostAllowed(base.hostname, targetHost, vhost, policy)) continue;
         if (base.protocol !== "http:" && base.protocol !== "https:") continue;
         const withPath = joinPath(base.toString(), args.basePath);
         const final = ensureFuzz(withPath);
@@ -291,7 +294,7 @@ function collectTargetUrls(
     if (base) {
       try {
         const u = new URL(base);
-        if (hostAllowed(u.hostname, targetHost, vhost)) out.push(ensureFuzz(joinPath(base, args.basePath)));
+        if (hostAllowed(u.hostname, targetHost, vhost, policy)) out.push(ensureFuzz(joinPath(base, args.basePath)));
       } catch {
         // ignore
       }

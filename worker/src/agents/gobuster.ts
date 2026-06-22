@@ -3,11 +3,14 @@ import { remoteScript, snippet } from "./shared.js";
 import { getWordlistCatalog, isWordlistAllowed } from "./wordlists.js";
 import { findingsFromWebFactsLlm } from "./webPathFindingsLlm.js";
 import {
+  acceptVhostCandidate,
   cdnHostHeaderFlag,
   connectIpUrl,
   hostAllowed,
+  isIpAddress,
   normalizeHttpUrl,
-  resolveWebScanFromInput
+  resolveWebScanFromInput,
+  vhostAcceptPolicyFromInput
 } from "./webTarget.js";
 
 type GobusterArgs = {
@@ -55,7 +58,8 @@ export const gobusterTool: ToolDefinition = {
   handler: async (input, emit): Promise<ToolEnvelope> => {
     const args = (input.args ?? {}) as GobusterArgs;
     const webScan = resolveWebScanFromInput(input.target.host, input.target.vhost, input.context?.webScan);
-    const bases = collectGobusterBaseUrls(args, input.target.host, webScan.vhost).map((u) =>
+    const vhostPolicy = vhostAcceptPolicyFromInput(input.target.host, input, webScan.cdnDetected);
+    const bases = collectGobusterBaseUrls(args, input.target.host, webScan.vhost, vhostPolicy).map((u) =>
       applyBasePath(connectIpUrl(normalizeHttpUrl(u), webScan), args.basePath)
     );
 
@@ -249,13 +253,20 @@ function fuzzToBaseUrl(raw: string): string {
   return s.trim();
 }
 
-function tryAddBaseUrl(raw: string | undefined, targetHost: string, vhost: string | null, seen: Set<string>, out: string[]): void {
+function tryAddBaseUrl(
+  raw: string | undefined,
+  targetHost: string,
+  vhost: string | null,
+  policy: ReturnType<typeof vhostAcceptPolicyFromInput>,
+  seen: Set<string>,
+  out: string[]
+): void {
   if (!raw || typeof raw !== "string") return;
   const candidate = fuzzToBaseUrl(raw);
   if (!candidate) return;
   try {
     const u = new URL(candidate);
-    if (!hostAllowed(u.hostname, targetHost, vhost)) return;
+    if (!hostAllowed(u.hostname, targetHost, vhost, policy)) return;
     if (u.protocol !== "http:" && u.protocol !== "https:") return;
     const key = u.toString();
     if (seen.has(key)) return;
@@ -266,14 +277,19 @@ function tryAddBaseUrl(raw: string | undefined, targetHost: string, vhost: strin
   }
 }
 
-function collectGobusterBaseUrls(args: GobusterArgs, targetHost: string, vhost: string | null): string[] {
+function collectGobusterBaseUrls(
+  args: GobusterArgs,
+  targetHost: string,
+  vhost: string | null,
+  policy: ReturnType<typeof vhostAcceptPolicyFromInput>
+): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
-  tryAddBaseUrl(args.url, targetHost, vhost, seen, out);
-  tryAddBaseUrl(args.targetUrl, targetHost, vhost, seen, out);
+  tryAddBaseUrl(args.url, targetHost, vhost, policy, seen, out);
+  tryAddBaseUrl(args.targetUrl, targetHost, vhost, policy, seen, out);
   if (Array.isArray(args.http_targets)) {
     for (const item of args.http_targets) {
-      if (typeof item === "string") tryAddBaseUrl(item, targetHost, vhost, seen, out);
+      if (typeof item === "string") tryAddBaseUrl(item, targetHost, vhost, policy, seen, out);
     }
   }
   return out;

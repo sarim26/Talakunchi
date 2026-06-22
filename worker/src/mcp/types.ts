@@ -16,7 +16,9 @@ export const TargetCtxSchema = z.object({
   host: z.string().min(1),
   ip: z.string().optional(),
   /** Optional canonical HTTP hostname when `host` is an IP behind CDN/vhost routing. */
-  vhost: z.string().optional()
+  vhost: z.string().optional(),
+  /** Human label from targets.name — used to reject unrelated CDN cert hostnames. */
+  name: z.string().optional()
 });
 export type TargetCtx = z.infer<typeof TargetCtxSchema>;
 
@@ -115,6 +117,9 @@ export type ToolInput = {
     discoveredEndpoints?: Array<{ url: string; method?: string; status?: number | null; sourceTool?: string }>;
     /** CDN/vhost routing state (IP connect + Host header) for web specialists. */
     webScan?: WebScanHintsCtx;
+    /** Engagement scope entries (when enforceScope is on). */
+    scopeEntries?: string[];
+    scopeEnforce?: boolean;
     /** Optional last remote shell outcome (reserved for future tools). */
     lastKaliShell?: {
       exitCode: number | null;

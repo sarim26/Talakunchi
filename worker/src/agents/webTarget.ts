@@ -1,4 +1,5 @@
 import net from "node:net";
+import { isHostInScope } from "../scope.js";
 
 /**
  * CDN / virtual-host aware web scanning.
@@ -15,6 +16,109 @@ export type WebScanHints = {
   cdnDetected: boolean;
   cdnVendor: string | null;
 };
+
+/** Rules for accepting a discovered/configured HTTP hostname on this run. */
+export type VhostAcceptPolicy = {
+  targetHost: string;
+  targetName?: string | null;
+  configuredVhost?: string | null;
+  knownDomains?: string[];
+  scopeEntries?: string[];
+  scopeEnforce?: boolean;
+  cdnDetected: boolean;
+};
+
+function tokensFromTargetName(name: string | null | undefined): string[] {
+  if (!name?.trim()) return [];
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length >= 3);
+}
+
+function hostnameRelatesToTargetName(hostname: string, targetName: string | null | undefined): boolean {
+  const tokens = tokensFromTargetName(targetName);
+  if (!tokens.length) return false;
+  const h = normHost(hostname);
+  return tokens.some((t) => h.includes(t));
+}
+
+/** True when the engagement target is an IP that is allowed by scope (or scope is open). */
+export function isScopedIpEngagement(policy: VhostAcceptPolicy): boolean {
+  if (!isIpAddress(policy.targetHost)) return false;
+  if (!policy.scopeEnforce || !policy.scopeEntries?.length) return true;
+  return isHostInScope(policy.targetHost, policy.scopeEntries);
+}
+
+/** Hostname matches a scope entry exactly or as a subdomain of a scoped domain. */
+export function hostnameMatchesScopeEntry(hostname: string, entries: string[]): boolean {
+  const h = normHost(hostname);
+  for (const raw of entries) {
+    const entry = normHost(raw);
+    if (!entry || net.isIP(entry) !== 0) continue;
+    if (h === entry) return true;
+    if (h.endsWith(`.${entry}`)) return true;
+  }
+  return isHostInScope(hostname, entries);
+}
+
+/**
+ * Whether a hostname may be used as vhost / http_targets for this engagement.
+ *
+ * For IP targets in scope behind CDN, TLS cert SANs on that IP identify the
+ * customer's web hostname when that IP is in the engagement scope.
+ */
+export function acceptVhostCandidate(hostname: string, policy: VhostAcceptPolicy): boolean {
+  const h = normHost(hostname);
+  if (!h || isIpAddress(h)) return false;
+
+  if (policy.configuredVhost && normHost(policy.configuredVhost) === h) return true;
+
+  if (policy.knownDomains?.some((d) => normHost(d) === h)) return true;
+
+  if (policy.scopeEnforce && policy.scopeEntries?.length) {
+    if (hostnameMatchesScopeEntry(h, policy.scopeEntries)) return true;
+    if (isHostInScope(h, policy.scopeEntries)) return true;
+    // Scoped IP pentest: cert/vhost hostnames for that IP are in-scope web identities.
+    if (policy.cdnDetected && isScopedIpEngagement(policy)) return true;
+    return false;
+  }
+
+  if (normHost(policy.targetHost) === h) return true;
+
+  if (hostnameRelatesToTargetName(h, policy.targetName)) return true;
+
+  if (policy.cdnDetected && isScopedIpEngagement(policy)) return true;
+
+  if (policy.cdnDetected) return false;
+
+  return true;
+}
+
+export function vhostAcceptPolicyFromInput(
+  targetHost: string,
+  input: {
+    target?: { vhost?: string; name?: string };
+    context?: {
+      knownDomains?: string[];
+      scopeEntries?: string[];
+      scopeEnforce?: boolean;
+      webScan?: WebScanHints | null;
+    };
+  },
+  cdnDetected: boolean
+): VhostAcceptPolicy {
+  return {
+    targetHost,
+    targetName: input.target?.name ?? null,
+    configuredVhost: input.target?.vhost ?? null,
+    knownDomains: input.context?.knownDomains ?? [],
+    scopeEntries: input.context?.scopeEntries ?? [],
+    scopeEnforce: input.context?.scopeEnforce ?? false,
+    cdnDetected
+  };
+}
 
 export function emptyWebScanHints(targetHost: string, configuredVhost?: string | null): WebScanHints {
   const connectIp = isIpAddress(targetHost) ? targetHost.trim() : null;
@@ -67,11 +171,20 @@ export function looksLikeCdnBlock(status: number | null, server: string | null |
   return status === 400 || status === 403 || status === 503;
 }
 
-/** Hostname allowed for URLs on this run (target address or resolved vhost). */
-export function hostAllowed(urlHostname: string, targetHost: string, vhost: string | null): boolean {
+/** Hostname allowed for URLs on this run (target address or validated vhost). */
+export function hostAllowed(
+  urlHostname: string,
+  targetHost: string,
+  vhost: string | null,
+  policy?: VhostAcceptPolicy | null
+): boolean {
   const h = normHost(urlHostname);
   if (h === normHost(targetHost)) return true;
-  if (vhost && h === normHost(vhost)) return true;
+  if (vhost && h === normHost(vhost)) {
+    if (policy && isIpAddress(targetHost) && isScopedIpEngagement(policy)) return true;
+    if (policy) return acceptVhostCandidate(vhost, policy);
+    return true;
+  }
   return false;
 }
 

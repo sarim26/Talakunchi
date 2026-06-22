@@ -22,7 +22,7 @@ import { env } from "../env.js";
 import { chatJSON } from "../llm/ollama.js";
 import type { TargetCtx, ToolDefinition, ToolFinding } from "../mcp/types.js";
 import { isWordlistAllowed, type WordlistCatalog } from "./wordlists.js";
-import { normHost, type WebScanHints } from "./webTarget.js";
+import { acceptVhostCandidate, hostnameMatchesScopeEntry, isIpAddress, isScopedIpEngagement, normHost, type WebScanHints, vhostAcceptPolicyFromInput } from "./webTarget.js";
 
 export type ExecutionWriterContext = {
   target: TargetCtx;
@@ -31,16 +31,27 @@ export type ExecutionWriterContext = {
   discoveredEndpoints: Array<{ url: string; method?: string; status?: number | null; sourceTool?: string }>;
   priorFindings: ToolFinding[];
   wordlistCatalog?: WordlistCatalog;
-  /** CDN/vhost routing from http_probe — allows vhost hostnames in http_targets. */
   webScan?: WebScanHints | null;
+  scopeEntries?: string[];
+  scopeEnforce?: boolean;
 };
 
 function urlHostAllowed(hostname: string, ctx: ExecutionWriterContext): boolean {
   const h = normHost(hostname);
   if (h === normHost(ctx.target.host)) return true;
-  const vhost = ctx.webScan?.vhost?.trim();
-  if (vhost && h === normHost(vhost)) return true;
-  return false;
+  const policy = vhostAcceptPolicyFromInput(ctx.target.host, {
+    target: { vhost: ctx.target.vhost, name: ctx.target.name },
+    context: {
+      knownDomains: [],
+      scopeEntries: ctx.scopeEntries,
+      scopeEnforce: ctx.scopeEnforce,
+      webScan: ctx.webScan
+    }
+  }, ctx.webScan?.cdnDetected ?? false);
+  if (isIpAddress(ctx.target.host) && isScopedIpEngagement(policy) && ctx.webScan?.vhost && h === normHost(ctx.webScan.vhost))
+    return true;
+  if (ctx.scopeEnforce && ctx.scopeEntries?.length && hostnameMatchesScopeEntry(h, ctx.scopeEntries)) return true;
+  return acceptVhostCandidate(hostname, policy);
 }
 
 export type ExecutionWriterInput = {
