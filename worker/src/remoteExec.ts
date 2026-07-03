@@ -45,6 +45,14 @@ export type RemoteSpawnCallbacks = {
   signal?: AbortSignal;
 };
 
+export type RemoteSpawnResult = {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  /** True when the caller aborted (e.g. tool timeout) but partial output was retained. */
+  aborted?: boolean;
+};
+
 /**
  * Remote bash script runner (robust): runs `bash -s` on the SSH host and streams the script over stdin.
  * This avoids quoting/base64 pitfalls with ssh remote command parsing.
@@ -52,7 +60,7 @@ export type RemoteSpawnCallbacks = {
 export function spawnBashScriptOverSsh(
   bashScript: string,
   opts?: RemoteSpawnCallbacks
-): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+): Promise<RemoteSpawnResult> {
   const { exe, argv } = buildSshArgv("/bin/bash", ["-o", "xtrace", "-o", "verbose", "-s"]);
 
   return new Promise((resolve, reject) => {
@@ -66,9 +74,11 @@ export function spawnBashScriptOverSsh(
       fn();
     };
 
+    let aborted = false;
     const onAbort = () => {
+      aborted = true;
       try { child.kill("SIGKILL"); } catch { /* noop */ }
-      settle(() => reject(new Error("aborted")));
+      settle(() => resolve({ stdout, stderr, exitCode: null, aborted: true }));
     };
 
     const sig = opts?.signal;
@@ -90,6 +100,7 @@ export function spawnBashScriptOverSsh(
     child.on("error", (err) => settle(() => reject(err)));
     child.on("close", (code) => {
       sig?.removeEventListener("abort", onAbort);
+      if (aborted) return;
       settle(() => resolve({ stdout, stderr, exitCode: code }));
     });
 
@@ -106,7 +117,7 @@ export function spawnWithRemotePolicy(
   program: string,
   programArgs: string[],
   opts?: RemoteSpawnCallbacks
-): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+): Promise<RemoteSpawnResult> {
   const { exe, argv } = resolveSpawnArgv(program, programArgs);
 
   return new Promise((resolve, reject) => {
@@ -120,9 +131,11 @@ export function spawnWithRemotePolicy(
       fn();
     };
 
+    let aborted = false;
     const onAbort = () => {
+      aborted = true;
       try { child.kill("SIGKILL"); } catch { /* noop */ }
-      settle(() => reject(new Error("aborted")));
+      settle(() => resolve({ stdout, stderr, exitCode: null, aborted: true }));
     };
 
     const sig = opts?.signal;
@@ -144,6 +157,7 @@ export function spawnWithRemotePolicy(
     child.on("error", (err) => settle(() => reject(err)));
     child.on("close", (code) => {
       sig?.removeEventListener("abort", onAbort);
+      if (aborted) return;
       settle(() => resolve({ stdout, stderr, exitCode: code }));
     });
   });

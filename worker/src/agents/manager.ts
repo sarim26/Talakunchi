@@ -16,6 +16,7 @@ import type { ToolFinding } from "../mcp/types.js";
 import type { WordlistCatalog } from "./wordlists.js";
 import { isIpAddress } from "./webTarget.js";
 import type { WebScanHints } from "./webTarget.js";
+import { isGatedExploitTool } from "./exploitGated.js";
 
 export const ManagerDecisionSchema = z.union([
   z.object({
@@ -84,6 +85,8 @@ export type ManagerContext = {
     args: Record<string, unknown>;
     missingTool: string;
   } | null;
+  /** `recon` (default) or `exploit` after operator starts gated exploit phase. */
+  runPhase?: "recon" | "exploit";
   /** From `agent_runs` — not a policy; the LLM may ignore or apply when choosing `recon.nmap`. */
   runHints?: ManagerRunHints;
 };
@@ -101,6 +104,49 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
       intentGoal: `Retry ${blocked.tool} after installing '${blocked.missingTool}'`,
       args: blocked.args,
       reasoning: "Dependency installed; re-invoking previously blocked specialist"
+    };
+  }
+
+  if (ctx.runPhase === "exploit") {
+    const lastFail = (ctx.recentFailures ?? []).slice(-1)[0];
+    const missingTool = lastFail?.missingTool;
+    if (
+      missingTool &&
+      server.has("system.tool_installer") &&
+      !(ctx.installedToolsAttempted ?? []).includes(missingTool)
+    ) {
+      const installArgs: Record<string, unknown> = { tool: missingTool };
+      if (lastFail.missingToolInstallCommand) installArgs.installCommand = lastFail.missingToolInstallCommand;
+      return {
+        action: "invoke",
+        tool: "system.tool_installer",
+        intentGoal: `Install missing tool '${missingTool}' so ${lastFail!.tool} can run`,
+        args: installArgs,
+        reasoning: "Auto-install missing tool before retrying the failed exploit specialist"
+      };
+    }
+
+    const llmDecision = await tryLlmDecision(server, ctx, signal);
+    if (llmDecision) {
+      if (llmDecision.action === "stop") return llmDecision;
+      if (llmDecision.action === "invoke" && server.has(llmDecision.tool)) {
+        const phased = enforcePhaseToolPolicy(llmDecision, ctx);
+        if (phased) {
+          const guarded = suppressRepeatToolInvocation(phased, ctx);
+          if (guarded) return guarded;
+        }
+      }
+    }
+
+    const fromRec = fallbackFromRecommendations(server, ctx, { exploitOnly: true });
+    if (fromRec) return fromRec;
+
+    if (ctx.stepsRemaining <= 0) {
+      return { action: "stop", reason: "Exploit step budget exhausted" };
+    }
+    return {
+      action: "stop",
+      reason: managerStopReasonAfterLlmFailure(lastManagerOllamaError) || "Exploit phase: manager found no further gated actions"
     };
   }
 
@@ -143,8 +189,11 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
   if (llmDecision) {
     if (llmDecision.action === "stop") return llmDecision;
     if (llmDecision.action === "invoke" && server.has(llmDecision.tool)) {
-      const guarded = suppressRepeatToolInvocation(llmDecision, ctx);
-      if (guarded) return guarded;
+      const phased = enforcePhaseToolPolicy(llmDecision, ctx);
+      if (phased) {
+        const guarded = suppressRepeatToolInvocation(phased, ctx);
+        if (guarded) return guarded;
+      }
     }
   }
 
@@ -221,13 +270,37 @@ function fallbackInitialNmap(server: MCPServer, ctx: ManagerContext): ManagerDec
 /** Prevent burning steps re-running slow specialists with no new intel. */
 function suppressRepeatToolInvocation(decision: ManagerDecision, ctx: ManagerContext): ManagerDecision | null {
   if (decision.action !== "invoke") return decision;
+
   const history = ctx.invocationHistory ?? [];
   const priorRuns = history.filter((h) => h.tool === decision.tool).length;
   if (priorRuns === 0) return decision;
 
-  const noRepeat = new Set(["recon.tls_check", "recon.waf_detect"]);
+  const noRepeat = new Set([
+    "recon.tls_check",
+    "recon.waf_detect",
+    "exploit.sqlmap",
+    "exploit.commix",
+    "exploit.crackmapexec",
+    "recon.hydra",
+    "postex.session_recon"
+  ]);
   if (noRepeat.has(decision.tool) && priorRuns >= 1) return null;
 
+  return decision;
+}
+
+/** Recon phase blocks gated tools; exploit phase blocks recon specialists (except tool_installer). */
+function enforcePhaseToolPolicy(decision: ManagerDecision, ctx: ManagerContext): ManagerDecision | null {
+  if (decision.action !== "invoke") return decision;
+  const tool = decision.tool;
+  if (tool === "system.tool_installer") return decision;
+
+  if (ctx.runPhase === "exploit") {
+    if (!isGatedExploitTool(tool)) return null;
+    return decision;
+  }
+
+  if (isGatedExploitTool(tool)) return null;
   return decision;
 }
 
@@ -244,7 +317,7 @@ function cdnVhostGuardDecision(server: MCPServer, ctx: ManagerContext): ManagerD
   if (!hasPortIntel) return null;
 
   const needsVhost = !ws.vhost;
-  const cdnLikely = ws.cdnDetected || isIpAddress(ctx.targetHost);
+  const cdnLikely = ws.cdnDetected;
 
   if (needsVhost && cdnLikely && server.has("recon.http_probe") && probeRuns === 0) {
     return {
@@ -284,6 +357,50 @@ function cdnVhostGuardDecision(server: MCPServer, ctx: ManagerContext): ManagerD
   return null;
 }
 
+function exploitToolsForPlanner(server: MCPServer): ToolDefinition[] {
+  return server.list().filter((t) => isGatedExploitTool(t.name) || t.name === "system.tool_installer");
+}
+
+type ToolDefinition = ReturnType<MCPServer["list"]>[number];
+
+function buildExploitSystemPrompt(): string {
+  return [
+    "You are the EXPLOIT MANAGER of a multi-agent penetration testing system.",
+    "Reconnaissance is complete. You decide which ONE gated exploitation tool to invoke next, or whether to stop.",
+    "Every tool you pick still requires human approval in the Pipeline before it runs.",
+    "",
+    'Return ONLY a JSON object matching ONE of:',
+    '  { "action": "invoke", "tool": "<exact gated tool name>", "intentGoal": "<short english goal>", "args": { ... }, "reasoning": "<why>" }',
+    '  { "action": "stop", "reason": "<short why exploitation is complete or blocked>" }',
+    "",
+    "Gated exploit tools (pick based on recon findings — services, endpoints, findings, CVE hints):",
+    "  - recon.hydra: credential brute on auth services (ssh, ftp, smb, mysql, rdp, telnet, vnc, smtp…). Use when auth ports are open and creds not yet found.",
+    "  - exploit.sqlmap: SQL injection on HTTP(S) URLs with parameters (phpMyAdmin, DVWA, ?id=, login forms). Pass urls or http_targets.",
+    "  - exploit.commix: command injection on parameterized web URLs.",
+    "  - exploit.msf_module: Metasploit module check/run when service banner/version matches a known exploit (vsFTPd 2.3.4, ProFTPd, Samba, Tomcat, PHP-CGI…). Pass module, rport, action=check then run.",
+    "  - exploit.crackmapexec: SMB share enum, auth test, or spray when port 445 is open or weak creds exist.",
+    "  - postex.session_recon: read-only SSH session enum AFTER valid credentials found (hydra/nxc).",
+  "  - system.tool_installer: only when recentFailures shows a missing remote CLI.",
+    "",
+    "Decision guidance:",
+    "  - Web apps with query params / admin panels → exploit.sqlmap before commix.",
+    "  - vsFTPd 2.3.4 / ProFTPd / Samba / distcc banners → exploit.msf_module with matching module.",
+    "  - Open SSH/FTP/MySQL without web attack surface → recon.hydra.",
+    "  - SMB 445 + creds or anonymous access → exploit.crackmapexec.",
+    "  - After weak_credentials finding on SSH → postex.session_recon.",
+    "  - Do NOT repeat a tool already in history unless new evidence justifies it.",
+    "  - Stop when all relevant exploit paths are exhausted or step budget is low.",
+    "",
+    "Args discipline:",
+    "- exploit.sqlmap / exploit.commix: pass urls[] or http_targets[] from discoveredEndpoints.",
+    "- exploit.msf_module: module, rport, action (check|run), optional lhost for reverse shells.",
+    "- recon.hydra: services[], stopOnFirstFind.",
+    "- exploit.crackmapexec: action shares|auth|spray, username/password when known.",
+    "",
+    "Use knownServices (product/version), discoveredEndpoints, knownFindings (titles + claimType), and history."
+  ].join("\n");
+}
+
 function coverageFirstDecision(server: MCPServer, ctx: ManagerContext): ManagerDecision | null {
   const services = ctx.knownServices ?? [];
   const history = ctx.invocationHistory ?? [];
@@ -311,8 +428,6 @@ function coverageFirstDecision(server: MCPServer, ctx: ManagerContext): ManagerD
     };
   }
 
-  // Infra specialists: when a matching port is present and the specialist has
-  // not run yet, prioritize it (same coverage-first principle as SMB/SSH).
   const nameOf = (s: { name?: string; product?: string }) => `${s.product ?? ""} ${s.name ?? ""}`;
   const infraCoverage: Array<{ tool: string; match: (s: { port: number; protocol: string; name?: string; product?: string }) => boolean; goal: string }> = [
     { tool: "recon.rdp_enum", match: (s) => s.protocol === "tcp" && (s.port === 3389 || /ms-wbt-server|rdp/i.test(nameOf(s))), goal: "Enumerate RDP encryption and NTLM info (coverage-first)" },
@@ -330,8 +445,6 @@ function coverageFirstDecision(server: MCPServer, ctx: ManagerContext): ManagerD
     }
   }
 
-  // If services exist but the enrich step hasn't run, do it once to attach
-  // vulnerability context before spending more steps on web brute force.
   if (services.length > 0 && server.has("recon.cve_enricher") && !ran.has("recon.cve_enricher")) {
     return {
       action: "invoke",
@@ -361,42 +474,45 @@ function verificationFirstDecision(server: MCPServer, ctx: ManagerContext): Mana
 }
 
 async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: AbortSignal): Promise<ManagerDecision | null> {
-  const systemMsg = [
-    "You are the MANAGER agent of a multi-agent penetration testing system.",
-    "You alone decide which ONE specialist tool to invoke next, or whether to stop the run.",
-    "Operate in read-only reconnaissance mode (no exploitation, no destructive operations).",
-    "",
-    'Return ONLY a JSON object matching ONE of:',
-    '  { "action": "invoke", "tool": "<exact tool name from tools[].name>", "intentGoal": "<short english goal>", "args": { ... }, "reasoning": "<why>" }',
-    '  { "action": "stop", "reason": "<short why we are stopping>" }',
-    "",
-    "Use the tools list as the authoritative registry. Pick the single best next step from context:",
-    "  - No open ports yet → usually start with recon.nmap (or recon.dns_enum if you already have enough host intel).",
-    "  - Optional, low priority: for PUBLIC hostnames you may run recon.passive_dns / recon.osint before nmap to gather passive intel; these no-op without API keys, so skip them otherwise.",
-    "  - After services exist → choose the most informative specialist (http_probe, ssh_enum, smb_enum, tls_check, cve_enricher, spider, waybackurls, gobuster, ffuf, etc.).",
-    "  - Infra services map to dedicated specialists: 3389→rdp_enum, 21→ftp_enum, 25/587/465→smtp_enum, 389/636→ldap_enum, 2049→nfs_enum, 6379→redis_enum, 161/udp→snmp_enum, 3306/5432/1433→db_banner. Run these when the matching port is open.",
-    "  - recon.nuclei (safe tags) and recon.waf_detect operate on web origins: run recon.http_probe first so HTTP seeds/discoveredEndpoints exist, then use them.",
-    "  - IP targets behind CDN/WAF (Akamai, Cloudflare): run recon.nmap then recon.http_probe. TLS cert SANs on a scoped IP identify the vhost — use those hostnames in http_targets (worker connects to connectIp with Host header). Respect target scope entries only.",
-    "  - If webScan.vhost is set, web tools connect to connectIp with Host/SNI for that hostname.",
-    "  - Do NOT repeat recon.tls_check or recon.waf_detect if they already appear in history unless new ports appeared.",
-    "  - recon.hydra (only present in gated mode) is a credentialed check on auth services; it pauses for human approval before running. Choose it only when an auth service (ssh/ftp/rdp/smb/db) is open and credential testing is in scope.",
-    "  - Follow tool `requires` hints; do not invoke a tool whose preconditions are clearly unmet.",
-    "  - Prefer system.tool_installer only when a prior failure indicated a missing remote CLI (recentFailures.missingTool) — the orchestrator may force-install before you run again.",
-    "",
-    "Downstream: a prompter turns your intentGoal into prose; an execution-writer LLM fills JSON `args` per the tool's argSchema (not raw shell — the worker maps args → CLI safely).",
-    "You never see raw tool stdout. Use `knownFindings`, `discoveredEndpoints` (truncated sample), `discoveredEndpointCount`, and `history` as summaries.",
-    "",
-    "Args discipline:",
-    "- recon.http_probe: prefer `services` (from nmap) and/or explicit `urls`; optional `ports` when using context fallback.",
-    "- recon.spider: pass `http_targets` (array of seed URLs on the target host) and/or `url`.",
-    "- recon.gobuster: pass `url` and/or `http_targets` (base URLs on the target host, e.g. http://TARGET:80/). Optional `targetUrl` without FUZZ is treated like `url`; do not use placeholder/example IPs.",
-    "- recon.ffuf: pass `targetUrl` with a FUZZ marker on the target host (e.g. http://TARGET:80/FUZZ).",
-    "",
-    "Rules:",
-    "- Choose exactly one tool per step (no batching).",
-    "- Stop when diminishing returns, budget is low, or nothing safe remains.",
-    "- Use history to avoid useless repeats unless a retry is justified (e.g. after install or new evidence)."
-  ].join("\n");
+  const isExploit = ctx.runPhase === "exploit";
+  const systemMsg = isExploit
+    ? buildExploitSystemPrompt()
+    : [
+        "You are the MANAGER agent of a multi-agent penetration testing system.",
+        "You alone decide which ONE specialist tool to invoke next, or whether to stop the run.",
+        "Operate in read-only reconnaissance mode (no exploitation, no destructive operations).",
+        "",
+        'Return ONLY a JSON object matching ONE of:',
+        '  { "action": "invoke", "tool": "<exact tool name from tools[].name>", "intentGoal": "<short english goal>", "args": { ... }, "reasoning": "<why>" }',
+        '  { "action": "stop", "reason": "<short why we are stopping>" }',
+        "",
+        "Use the tools list as the authoritative registry. Pick the single best next step from context:",
+        "  - No open ports yet → usually start with recon.nmap (or recon.dns_enum if you already have enough host intel).",
+        "  - Optional, low priority: for PUBLIC hostnames you may run recon.passive_dns / recon.osint before nmap to gather passive intel; these no-op without API keys, so skip them otherwise.",
+        "  - After services exist → choose the most informative specialist (http_probe, ssh_enum, smb_enum, tls_check, cve_enricher, spider, waybackurls, gobuster, ffuf, etc.).",
+        "  - Infra services map to dedicated specialists: 3389→rdp_enum, 21→ftp_enum, 25/587/465→smtp_enum, 389/636→ldap_enum, 2049→nfs_enum, 6379→redis_enum, 161/udp→snmp_enum, 3306/5432/1433→db_banner. Run these when the matching port is open.",
+        "  - recon.nuclei (safe tags) and recon.waf_detect operate on web origins: run recon.http_probe first so HTTP seeds/discoveredEndpoints exist, then use them.",
+        "  - IP targets behind CDN/WAF (Akamai, Cloudflare): run recon.nmap then recon.http_probe. TLS cert SANs on a scoped IP identify the vhost — use those hostnames in http_targets (worker connects to connectIp with Host header). Respect target scope entries only.",
+        "  - If webScan.vhost is set, web tools connect to connectIp with Host/SNI for that hostname.",
+        "  - Do NOT repeat recon.tls_check or recon.waf_detect if they already appear in history unless new ports appeared.",
+        "  - Do NOT invoke recon.hydra, exploit.*, or postex.session_recon during recon — the operator starts a separate exploit phase after recon succeeds.",
+        "  - Follow tool `requires` hints; do not invoke a tool whose preconditions are clearly unmet.",
+        "  - Prefer system.tool_installer only when a prior failure indicated a missing remote CLI (recentFailures.missingTool) — the orchestrator may force-install before you run again.",
+        "",
+        "Downstream: a prompter turns your intentGoal into prose; an execution-writer LLM fills JSON `args` per the tool's argSchema (not raw shell — the worker maps args → CLI safely).",
+        "You never see raw tool stdout. Use `knownFindings`, `discoveredEndpoints` (truncated sample), `discoveredEndpointCount`, and `history` as summaries.",
+        "",
+        "Args discipline:",
+        "- recon.http_probe: prefer `services` (from nmap) and/or explicit `urls`; optional `ports` when using context fallback.",
+        "- recon.spider: pass `http_targets` (array of seed URLs on the target host) and/or `url`.",
+        "- recon.gobuster: pass `url` and/or `http_targets` (base URLs on the target host, e.g. http://TARGET:80/). Optional `targetUrl` without FUZZ is treated like `url`; do not use placeholder/example IPs.",
+        "- recon.ffuf: pass `targetUrl` with a FUZZ marker on the target host (e.g. http://TARGET:80/FUZZ).",
+        "",
+        "Rules:",
+        "- Choose exactly one tool per step (no batching).",
+        "- Stop when diminishing returns, budget is low, or nothing safe remains.",
+        "- Use history to avoid useless repeats unless a retry is justified (e.g. after install or new evidence)."
+      ].join("\n");
 
   const attempts: Array<{ mode: ManagerPayloadMode; temp: number; maxTokens: number }> = [
     { mode: "full", temp: 0.15, maxTokens: 1600 },
@@ -478,16 +594,23 @@ function resolveRegisteredTool(server: MCPServer, tool: string): string | null {
   if (ci) return ci;
   if (!t.includes(".")) {
     if (server.has(`recon.${t}`)) return `recon.${t}`;
+    if (server.has(`exploit.${t}`)) return `exploit.${t}`;
     if (server.has(`system.${t}`)) return `system.${t}`;
   }
   return null;
 }
 
 /** When the manager model fails, continue with the best tool the last specialist already suggested. */
-function fallbackFromRecommendations(server: MCPServer, ctx: ManagerContext): ManagerDecision | null {
+function fallbackFromRecommendations(
+  server: MCPServer,
+  ctx: ManagerContext,
+  opts?: { exploitOnly?: boolean }
+): ManagerDecision | null {
   const list = [...(ctx.pendingRecommendations ?? [])].sort((a, b) => b.priority - a.priority);
   for (const p of list) {
     if (!server.has(p.agent)) continue;
+    if (opts?.exploitOnly && !isGatedExploitTool(p.agent)) continue;
+    if (!opts?.exploitOnly && isGatedExploitTool(p.agent)) continue;
     if (!recommendationHasRunnableArgs(p)) continue;
     const decision: ManagerDecision = {
       action: "invoke",
@@ -524,30 +647,65 @@ function truncateUrlForPlanner(url: string, max = 140): string {
 
 function buildManagerUserPayload(server: MCPServer, ctx: ManagerContext, mode: ManagerPayloadMode): Record<string, unknown> {
   const epAll = ctx.discoveredEndpoints ?? [];
+  const isExploit = ctx.runPhase === "exploit";
+  const plannerTools = isExploit
+    ? exploitToolsForPlanner(server).map((t) =>
+        mode === "minimal"
+          ? { name: t.name, requires: t.requires, tags: t.tags }
+          : {
+              name: t.name,
+              requires: t.requires,
+              tags: t.tags,
+              summary: t.description.length > 110 ? `${t.description.slice(0, 107)}…` : t.description
+            }
+      )
+    : mode === "minimal"
+      ? server.list().filter((t) => !isGatedExploitTool(t.name)).map((t) => ({ name: t.name, requires: t.requires }))
+      : server
+          .list()
+          .filter((t) => !isGatedExploitTool(t.name))
+          .map((t) => ({
+            name: t.name,
+            requires: t.requires,
+            tags: t.tags,
+            summary: t.description.length > 110 ? `${t.description.slice(0, 107)}…` : t.description
+          }));
+
+  const findingsSlice = isExploit ? ctx.knownFindings.slice(-40) : ctx.knownFindings.slice(-20);
+  const findingsPayload = findingsSlice.map((f) => ({
+    title: f.title.length > (isExploit ? 220 : 180) ? `${f.title.slice(0, isExploit ? 217 : 177)}…` : f.title,
+    severity: f.severity,
+    claimType: f.claimType ?? null,
+    evidence: isExploit && f.evidence ? (f.evidence.length > 160 ? `${f.evidence.slice(0, 157)}…` : f.evidence) : undefined
+  }));
+
+  const historyForPlanner = isExploit
+    ? ctx.invocationHistory.filter((h) => isGatedExploitTool(h.tool) || h.tool === "system.tool_installer").slice(-15)
+    : ctx.invocationHistory.slice(mode === "minimal" ? -12 : -20);
+
   if (mode === "minimal") {
     return {
-      tools: server.list().map((t) => ({ name: t.name, requires: t.requires })),
+      runPhase: ctx.runPhase ?? "recon",
+      tools: plannerTools,
       target: ctx.targetHost,
       targetName: ctx.targetName ?? null,
       stepsRemaining: ctx.stepsRemaining,
       knownPorts: ctx.knownPorts,
-      knownServices: ctx.knownServices.slice(0, 20),
+      knownServices: ctx.knownServices.slice(0, isExploit ? 40 : 20),
       discoveredEndpointCount: epAll.length,
       pendingRecommendations: ctx.pendingRecommendations.slice(0, 10),
-      knownFindingsSample: ctx.knownFindings.slice(-6).map((f) => ({
-        title: f.title.length > 120 ? `${f.title.slice(0, 117)}…` : f.title,
-        severity: f.severity
-      })),
-      history: ctx.invocationHistory.slice(-10),
+      knownFindingsSample: findingsPayload.slice(-8),
+      history: historyForPlanner,
       recentFailures: (ctx.recentFailures ?? []).slice(-3),
-      runHints: ctx.runHints ?? null,
+      runHints: isExploit ? null : ctx.runHints ?? null,
       webScan: ctx.webScan
     };
   }
 
-  const epTail = epAll.slice(-18);
+  const epTail = isExploit ? epAll.slice(-30) : epAll.slice(-18);
   return {
-    tools: server.manifestCompact(),
+    runPhase: ctx.runPhase ?? "recon",
+    tools: plannerTools,
     target: ctx.targetHost,
     targetName: ctx.targetName ?? null,
     stepsRemaining: ctx.stepsRemaining,
@@ -562,11 +720,8 @@ function buildManagerUserPayload(server: MCPServer, ctx: ManagerContext, mode: M
     discoveredEndpointCount: epAll.length,
     pendingVerifications: (ctx.pendingVerifications ?? []).slice(-10),
     pendingRecommendations: ctx.pendingRecommendations.slice(0, 12),
-    knownFindings: ctx.knownFindings.slice(-20).map((f) => ({
-      title: f.title.length > 180 ? `${f.title.slice(0, 177)}…` : f.title,
-      severity: f.severity
-    })),
-    history: ctx.invocationHistory.slice(-20),
+    knownFindings: findingsPayload,
+    history: historyForPlanner,
     recentFailures: (ctx.recentFailures ?? []).slice(-5),
     runHints: ctx.runHints ?? null,
     webScan: ctx.webScan,

@@ -79,6 +79,15 @@ const EnvSchema = z.object({
   HYDRA_PASSLIST: z.string().optional(),
   HYDRA_STOP_ON_FIRST_FIND: z.coerce.boolean().default(false),
   HYDRA_THREADS: z.coerce.number().optional(),
+
+  /** Gated exploit tool toggles (only active when RECON_MODE=gated_exploit). */
+  SQLMAP_ENABLED: z.coerce.boolean().default(true),
+  MSF_ENABLED: z.coerce.boolean().default(true),
+  COMMIX_ENABLED: z.coerce.boolean().default(true),
+  CRACKMAPEXEC_ENABLED: z.coerce.boolean().default(true),
+  /** Comma/newline separated Metasploit module paths; empty uses built-in lab-friendly defaults. */
+  MSF_MODULE_ALLOWLIST: z.string().optional().default(""),
+
   NMAP_ARGS: z
     .string()
     .optional()

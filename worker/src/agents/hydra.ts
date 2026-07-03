@@ -1,6 +1,8 @@
 import { ToolDefinition, ToolEnvelope, ToolFinding } from "../mcp/types.js";
 import { env } from "../env.js";
-import { requireRemoteTool } from "./shared.js";
+import { remoteScript, requireRemoteTool } from "./shared.js";
+import { getWordlistCatalog } from "./wordlists.js";
+import { shellQuote } from "./webTarget.js";
 import { hydraFromNmapServices, type HydraCredSource } from "../hydraScan.js";
 import { requestApproval, waitForApproval } from "../approvals.js";
 
@@ -34,18 +36,19 @@ export const hydraTool: ToolDefinition = {
       };
     }
 
-    const credSource = buildCredSource();
-    if (!credSource) {
+    const credResolved = await resolveCredSource(input.signal, (s) => emit.log(s));
+    if (!credResolved.source) {
       return {
-        status: "skipped",
-        error: "No hydra credentials configured. Set HYDRA_USERNAME/HYDRA_PASSWORD or HYDRA_USERLIST/HYDRA_PASSLIST.",
+        status: "failed",
+        error: credResolved.error ?? "No hydra credentials configured.",
         artifacts: { commands: [] },
         facts: [],
         findings: [],
         recommendations: [],
-        meta: {}
+        meta: credResolved.meta ?? {}
       };
     }
+    const credSource = credResolved.source;
 
     const services = (input.context?.knownServices ?? []).map((s) => ({ port: s.port, serviceName: s.name }));
     const attackable = services.filter((s) => isAttackable(s.serviceName));
@@ -90,42 +93,54 @@ export const hydraTool: ToolDefinition = {
 
     emit.log(`Approved (id=${approvalId}); running hydra`);
     const stopOnFirstFind = (input.args as { stopOnFirstFind?: boolean } | undefined)?.stopOnFirstFind !== false;
-    const results = await hydraFromNmapServices(input.target.host, attackable, credSource, {
-      stopOnFirstFind,
-      threads: env.HYDRA_THREADS,
-      onOutput: (s) => emit.log(s),
-      signal: input.signal
-    });
+    try {
+      const results = await hydraFromNmapServices(input.target.host, attackable, credSource, {
+        stopOnFirstFind,
+        threads: env.HYDRA_THREADS,
+        onOutput: (s) => emit.log(s),
+        signal: input.signal
+      });
 
-    const findings: ToolFinding[] = [];
-    const facts: ToolEnvelope["facts"] = [];
-    let rawAll = "";
-    for (const r of results) {
-      rawAll += r.raw;
-      for (const cred of r.credentials) {
-        facts.push({ type: "credential", value: { host: cred.host, port: cred.port, service: cred.service, username: cred.username }, source: "hydra" });
-        findings.push({
-          title: `Weak credentials on ${cred.service} ${cred.host}:${cred.port}`,
-          severity: "critical",
-          port: cred.port,
-          protocol: "tcp",
-          evidence: `hydra found valid login: ${cred.username}:**** on ${cred.service}`,
-          fingerprint: `weak-cred|${cred.host}|${cred.port}|${cred.username}`,
-          confidence: "high",
-          requiresVerification: false,
-          claimType: "weak_credentials"
-        });
+      const findings: ToolFinding[] = [];
+      const facts: ToolEnvelope["facts"] = [];
+      let rawAll = "";
+      for (const r of results) {
+        rawAll += r.raw;
+        for (const cred of r.credentials) {
+          facts.push({ type: "credential", value: { host: cred.host, port: cred.port, service: cred.service, username: cred.username }, source: "hydra" });
+          findings.push({
+            title: `Weak credentials on ${cred.service} ${cred.host}:${cred.port}`,
+            severity: "critical",
+            port: cred.port,
+            protocol: "tcp",
+            evidence: `hydra found valid login: ${cred.username}:**** on ${cred.service}`,
+            fingerprint: `weak-cred|${cred.host}|${cred.port}|${cred.username}`,
+            confidence: "high",
+            requiresVerification: false,
+            claimType: "weak_credentials"
+          });
+        }
       }
-    }
 
-    return {
-      status: "succeeded",
-      facts,
-      findings,
-      recommendations: [],
-      artifacts: { commands: [plannedCommand], stdoutSnippet: rawAll.slice(0, 1500) },
-      meta: { approvalId, attacked: attackable, credentialsFound: findings.length, commandSummary: plannedCommand }
-    };
+      return {
+        status: "succeeded",
+        facts,
+        findings,
+        recommendations: [],
+        artifacts: { commands: [plannedCommand], stdoutSnippet: rawAll.slice(0, 1500) },
+        meta: { approvalId, attacked: attackable, credentialsFound: findings.length, commandSummary: plannedCommand, ...credResolved.meta }
+      };
+    } catch (e) {
+      return {
+        status: "failed",
+        error: (e as Error).message,
+        artifacts: { commands: [plannedCommand] },
+        facts: [],
+        findings: [],
+        recommendations: [],
+        meta: { approvalId, attacked: attackable, plannedCommand, ...credResolved.meta }
+      };
+    }
   }
 };
 
@@ -135,12 +150,94 @@ function isAttackable(serviceName?: string): boolean {
 }
 
 function buildCredSource(): HydraCredSource | null {
-  const hasUser = Boolean(env.HYDRA_USERNAME);
-  const hasUserList = Boolean(env.HYDRA_USERLIST);
-  const hasPass = Boolean(env.HYDRA_PASSWORD);
-  const hasPassList = Boolean(env.HYDRA_PASSLIST);
+  const hasUser = Boolean(env.HYDRA_USERNAME?.trim());
+  const hasUserList = Boolean(env.HYDRA_USERLIST?.trim());
+  const hasPass = Boolean(env.HYDRA_PASSWORD?.trim());
+  const hasPassList = Boolean(env.HYDRA_PASSLIST?.trim());
   if (!(hasUser || hasUserList) || !(hasPass || hasPassList)) return null;
-  const user = hasUserList ? { userList: env.HYDRA_USERLIST! } : { username: env.HYDRA_USERNAME! };
-  const pass = hasPassList ? { passwordList: env.HYDRA_PASSLIST! } : { password: env.HYDRA_PASSWORD! };
+  const user = hasUserList ? { userList: env.HYDRA_USERLIST!.trim() } : { username: env.HYDRA_USERNAME!.trim() };
+  const pass = hasPassList ? { passwordList: env.HYDRA_PASSLIST!.trim() } : { password: env.HYDRA_PASSWORD!.trim() };
   return { ...user, ...pass } as HydraCredSource;
+}
+
+async function remoteFileExists(path: string, signal?: AbortSignal): Promise<boolean> {
+  const script = `test -f ${shellQuote(path)} && echo FILE_OK || echo FILE_MISSING`;
+  const r = await remoteScript(script, signal);
+  return /FILE_OK/.test(r.stdout);
+}
+
+async function resolveCredSource(
+  signal?: AbortSignal,
+  emitLog?: (s: string) => void
+): Promise<{
+  source: HydraCredSource | null;
+  error?: string;
+  meta?: Record<string, unknown>;
+}> {
+  const hasUser = Boolean(env.HYDRA_USERNAME?.trim());
+  const hasPass = Boolean(env.HYDRA_PASSWORD?.trim());
+  if (hasUser && hasPass) {
+    return {
+      source: { username: env.HYDRA_USERNAME!.trim(), password: env.HYDRA_PASSWORD!.trim() },
+      meta: { credMode: "single" }
+    };
+  }
+
+  const catalog = await getWordlistCatalog({ signal });
+  const tried: string[] = [];
+
+  const pickList = async (envPath: string | undefined, fallback: string | null, label: string): Promise<string | null> => {
+    if (envPath?.trim()) {
+      tried.push(envPath.trim());
+      if (await remoteFileExists(envPath.trim(), signal)) return envPath.trim();
+      emitLog?.(`[hydra] ${label} not found on SSH host: ${envPath.trim()}`);
+    }
+    if (fallback) {
+      tried.push(fallback);
+      if (await remoteFileExists(fallback, signal)) {
+        emitLog?.(`[hydra] using SecLists default ${label}: ${fallback}`);
+        return fallback;
+      }
+    }
+    return null;
+  };
+
+  const userList = await pickList(env.HYDRA_USERLIST, catalog.defaults.usernames, "userlist");
+  const passList = await pickList(env.HYDRA_PASSLIST, catalog.defaults.passwords, "passlist");
+
+  if (hasUser && passList) {
+    return {
+      source: { username: env.HYDRA_USERNAME!.trim(), passwordList: passList },
+      meta: { credMode: "user+passlist", userList: null, passList }
+    };
+  }
+  if (userList && hasPass) {
+    return {
+      source: { userList, password: env.HYDRA_PASSWORD!.trim() },
+      meta: { credMode: "userlist+pass", userList, passList: null }
+    };
+  }
+  if (userList && passList) {
+    return {
+      source: { userList, passwordList: passList },
+      meta: { credMode: "lists", userList, passList }
+    };
+  }
+
+  const configured = buildCredSource();
+  if (configured) {
+    return {
+      source: null,
+      error:
+        `Hydra credential files missing on the SSH tools host. Tried: ${tried.join(", ") || "(none)"}. ` +
+        `Set HYDRA_USERLIST/HYDRA_PASSLIST to paths under ${catalog.root} on Kali, or HYDRA_USERNAME/HYDRA_PASSWORD for a single cred pair.`,
+      meta: { tried, catalogRoot: catalog.root, catalogDefaults: catalog.defaults }
+    };
+  }
+
+  return {
+    source: null,
+    error: "No hydra credentials configured. Set HYDRA_USERNAME/HYDRA_PASSWORD or HYDRA_USERLIST/HYDRA_PASSLIST.",
+    meta: { catalogRoot: catalog.root }
+  };
 }

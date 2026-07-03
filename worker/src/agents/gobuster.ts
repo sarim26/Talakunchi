@@ -9,6 +9,7 @@ import {
   hostAllowed,
   isIpAddress,
   normalizeHttpUrl,
+  requiresCdnVhost,
   resolveWebScanFromInput,
   vhostAcceptPolicyFromInput
 } from "./webTarget.js";
@@ -21,6 +22,8 @@ type GobusterArgs = {
   basePath?: string;
   wordlist?: string;
   threads?: number;
+  /** Per-request HTTP timeout in seconds (gobuster --timeout). Default 8. */
+  timeoutSec?: number;
 };
 
 /**
@@ -35,7 +38,7 @@ export const gobusterTool: ToolDefinition = {
     "Brute-force common content paths on a discovered HTTP(S) endpoint using gobuster. Wordlist is chosen by the manager from the SecLists catalog. Pass `url` and/or `http_targets` (base URLs on the target host).",
   tags: ["recon", "web"],
   requires: ["http_targets"],
-  defaultTimeoutMs: 6 * 60 * 1000,
+  defaultTimeoutMs: 15 * 60 * 1000,
   argSchema: {
     url: { type: "string", description: "Single base URL for gobuster dir mode (http/https, hostname must match target)." },
     http_targets: {
@@ -53,7 +56,8 @@ export const gobusterTool: ToolDefinition = {
       description: "Optional path under each base URL to brute-force from (e.g. /admin/)."
     },
     wordlist: { type: "string", description: "Absolute path under /home/kali/Desktop/SecLists/. Manager should pick from the run-time catalog." },
-    threads: { type: "number", default: 20 }
+    threads: { type: "number", default: 20 },
+    timeoutSec: { type: "number", default: 8, description: "Per-request HTTP timeout (gobuster --timeout), seconds." }
   },
   handler: async (input, emit): Promise<ToolEnvelope> => {
     const args = (input.args ?? {}) as GobusterArgs;
@@ -63,7 +67,7 @@ export const gobusterTool: ToolDefinition = {
       applyBasePath(connectIpUrl(normalizeHttpUrl(u), webScan), args.basePath)
     );
 
-    if (bases.length === 0 && webScan.connectIp && !webScan.vhost) {
+    if (bases.length === 0 && requiresCdnVhost(input.target.host, webScan)) {
       return {
         status: "skipped",
         error:
@@ -116,6 +120,7 @@ export const gobusterTool: ToolDefinition = {
     }
 
     const threads = Math.max(1, Math.min(50, Number(args.threads ?? 20)));
+    const timeoutSec = Math.max(3, Math.min(30, Number(args.timeoutSec ?? 8)));
 
     const allFacts: ToolEnvelope["facts"] = [];
     const allCommands: string[] = [];
@@ -126,6 +131,7 @@ export const gobusterTool: ToolDefinition = {
     let anyFlagErr = false;
     let anyHardFailure = false;
     let anyRunOk = false;
+    let anyTimedOut = false;
 
     const hostFlag = cdnHostHeaderFlag(webScan);
 
@@ -138,7 +144,7 @@ export const gobusterTool: ToolDefinition = {
         `  echo "WORDLIST_MISSING: $WORDLIST"`,
         `  exit 0`,
         `fi`,
-        `gobuster dir -u "$URL" -w "$WORDLIST" -k --no-error --quiet -t ${threads} -b 404,403${hostFlag ? ` ${hostFlag}` : ""}`
+        `gobuster dir -u "$URL" -w "$WORDLIST" -k --no-error --quiet -t ${threads} --timeout ${timeoutSec}s -b 404${hostFlag ? ` ${hostFlag}` : ""}`
       ].join("\n");
 
       emit.log(
@@ -152,6 +158,11 @@ export const gobusterTool: ToolDefinition = {
       stdoutAgg += (stdoutAgg ? "\n" : "") + r.stdout;
       stderrAgg += (stderrAgg ? "\n" : "") + (r.stderr ?? "");
 
+      if (r.aborted) {
+        anyTimedOut = true;
+        emit.log(`[gobuster] scan aborted (tool timeout); parsing ${r.stdout.length} bytes of partial output`);
+      }
+
       if (r.stdout.includes("WORDLIST_MISSING")) {
         anyWordlistMissing = true;
         continue;
@@ -164,13 +175,13 @@ export const gobusterTool: ToolDefinition = {
         continue;
       }
 
-      if (r.exitCode != null && r.exitCode !== 0) {
+      if (r.exitCode != null && r.exitCode !== 0 && !r.aborted) {
         anyHardFailure = true;
         continue;
       }
 
-      anyRunOk = true;
-      const facts = collectGobusterFacts(r.stdout, url);
+      const facts = collectGobusterFacts(`${r.stdout}\n${r.stderr ?? ""}`, url);
+      if (facts.length > 0 || r.aborted || r.exitCode === 0 || r.exitCode === null) anyRunOk = true;
       allFacts.push(...facts);
     }
 
@@ -213,29 +224,45 @@ export const gobusterTool: ToolDefinition = {
     }
 
     const status: ToolEnvelope["status"] =
-      (anyHardFailure && anyRunOk) || (anyFlagErr && anyRunOk) ? "partial" : "succeeded";
+      anyTimedOut
+        ? allFacts.length > 0
+          ? "partial"
+          : "failed"
+        : (anyHardFailure && anyRunOk) || (anyFlagErr && anyRunOk)
+          ? "partial"
+          : "succeeded";
 
     const webLlm = await findingsFromWebFactsLlm({
       tool: "recon.gobuster",
       targetHost: input.target.host,
       facts: allFacts,
-      signal: input.signal,
+      signal: anyTimedOut ? undefined : input.signal,
       emitLog: (s) => emit.log(s)
     });
 
     return {
       status,
       durationMs: totalDurationMs,
+      error: anyTimedOut
+        ? allFacts.length > 0
+          ? `Gobuster hit the tool time limit; kept ${allFacts.length} path(s) from partial output`
+          : "Gobuster timed out before any paths were collected"
+        : undefined,
       artifacts: { commands: allCommands, stdoutSnippet: snippet(stdoutAgg), stderrSnippet: snippet(stderrAgg) },
       facts: allFacts,
       findings: webLlm.findings,
-      recommendations: [],
+      recommendations: anyTimedOut
+        ? [{ agent: "recon.ffuf", reason: "Gobuster timed out — surgically fuzz high-value paths with ffuf", priority: 72 }]
+        : [],
       meta: {
         wordlist,
         wordlistSource,
         count: allFacts.length,
         bases,
+        timedOut: anyTimedOut,
         webFindingsLlm: webLlm.meta,
+        threads,
+        timeoutSec,
         commandSummary: `Brute-force common web paths on ${bases.length} base URL(s) using gobuster.`
       }
     };

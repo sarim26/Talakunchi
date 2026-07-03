@@ -116,8 +116,77 @@ export function vhostAcceptPolicyFromInput(
     knownDomains: input.context?.knownDomains ?? [],
     scopeEntries: input.context?.scopeEntries ?? [],
     scopeEnforce: input.context?.scopeEnforce ?? false,
-    cdnDetected
+    cdnDetected: cdnDetected || isIpAddress(targetHost)
   };
+}
+
+function acceptedVhost(hostname: string | null | undefined, policy: VhostAcceptPolicy): string | null {
+  if (!hostname?.trim()) return null;
+  return acceptVhostCandidate(hostname, policy) ? normHost(hostname) : null;
+}
+
+/** Prefer `www.` hostnames when multiple in-scope identities exist. */
+function pickPreferredVhost(candidates: string[]): string | null {
+  const uniq = [...new Set(candidates.map((c) => normHost(c)).filter(Boolean))];
+  if (!uniq.length) return null;
+  return uniq.find((h) => h.startsWith("www.")) ?? uniq[0];
+}
+
+/**
+ * Resolve an HTTP hostname for CDN/IP targets when `webScan.vhost` is still empty.
+ * Uses configured vhost, TLS/cert domains, discovered URLs, scope entries, and seeds.
+ */
+export function inferVhostForIpTarget(
+  targetHost: string,
+  webScan: WebScanHints,
+  policy: VhostAcceptPolicy,
+  opts?: {
+    seeds?: string[];
+    discoveredEndpoints?: Array<{ url: string }>;
+  }
+): string | null {
+  if (!isIpAddress(targetHost)) return webScan.vhost;
+  if (webScan.vhost) return webScan.vhost;
+
+  const candidates: string[] = [];
+
+  const configured = acceptedVhost(policy.configuredVhost, policy);
+  if (configured) return configured;
+
+  for (const d of policy.knownDomains ?? []) {
+    const ok = acceptedVhost(d, policy);
+    if (ok) candidates.push(ok);
+  }
+
+  for (const ep of opts?.discoveredEndpoints ?? []) {
+    try {
+      const ok = acceptedVhost(new URL(ep.url).hostname, policy);
+      if (ok) candidates.push(ok);
+    } catch {
+      // ignore
+    }
+  }
+
+  for (const raw of policy.scopeEntries ?? []) {
+    const entry = raw.trim();
+    if (!entry || entry.includes("/")) continue;
+    if (net.isIP(entry) !== 0) continue;
+    const ok = acceptedVhost(entry, policy);
+    if (ok) candidates.push(ok);
+  }
+
+  for (const s of opts?.seeds ?? []) {
+    try {
+      const h = new URL(s).hostname;
+      if (isIpAddress(h)) continue;
+      const ok = acceptedVhost(h, policy);
+      if (ok) candidates.push(ok);
+    } catch {
+      // ignore
+    }
+  }
+
+  return pickPreferredVhost(candidates);
 }
 
 export function emptyWebScanHints(targetHost: string, configuredVhost?: string | null): WebScanHints {
@@ -134,6 +203,11 @@ export function mergeWebScanHints(base: WebScanHints, patch: Partial<WebScanHint
     cdnDetected: patch.cdnDetected !== undefined ? patch.cdnDetected : base.cdnDetected,
     cdnVendor: patch.cdnVendor !== undefined ? patch.cdnVendor : base.cdnVendor
   };
+}
+
+/** True when the target IP is a CDN edge and web tools need a Host/vhost before crawling. */
+export function requiresCdnVhost(targetHost: string, webScan: WebScanHints): boolean {
+  return isIpAddress(targetHost) && webScan.cdnDetected && !webScan.vhost;
 }
 
 export function isIpAddress(host: string): boolean {

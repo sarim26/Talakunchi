@@ -58,6 +58,7 @@ export async function ensureAgentTables() {
     await c.query(`alter table agent_runs add column if not exists initial_nmap_profile text`);
     await c.query(`alter table agent_runs add column if not exists initial_nmap_ports int[]`);
     await c.query(`alter table agent_runs add column if not exists initial_nmap_extra_args text`);
+    await c.query(`alter table agent_runs add column if not exists phase text not null default 'recon'`);
     await c.query(`create index if not exists idx_agent_runs_target on agent_runs(target_id, created_at desc)`);
 
     await c.query(`

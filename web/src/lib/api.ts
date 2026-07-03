@@ -386,6 +386,7 @@ export const AgentRunSchema = z.object({
   invocationCount: z.number(),
   findingCount: z.number(),
   serviceCount: z.number(),
+  phase: z.enum(["recon", "exploit"]),
   notes: z.string().nullable().optional(),
   startedAt: z.any().nullable().optional(),
   finishedAt: z.any().nullable().optional(),
@@ -442,6 +443,14 @@ export async function listAgentRuns(params?: { targetId?: string; limit?: number
 
 export async function cancelAgentRun(id: string) {
   return http(`/api/agent-runs/${id}/cancel`, { method: "POST", body: "{}" }, z.object({ ok: z.boolean() }));
+}
+
+export async function startExploitPhase(id: string, maxSteps = 8) {
+  return http(
+    `/api/agent-runs/${id}/start-exploit`,
+    { method: "POST", body: JSON.stringify({ maxSteps }) },
+    z.object({ id: z.string().uuid(), status: z.string(), phase: z.literal("exploit") })
+  );
 }
 
 export async function getAgentRun(id: string) {

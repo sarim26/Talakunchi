@@ -30,6 +30,7 @@ import {
   AgentRunSummary,
   AgentRunReport,
   AgentTool,
+  cancelAgentRun,
   explainAgentRun,
   getAgentRunReport,
   getAgentRun,
@@ -38,7 +39,8 @@ import {
   listAgentRuns,
   listAgentTools,
   listTargets,
-  startAgentRun
+  startAgentRun,
+  startExploitPhase
 } from "../../lib/api";
 import { jsPDF } from "jspdf";
 
@@ -297,14 +299,27 @@ export function AgenticReconPage() {
           run={run}
           invocations={invocationsQ.data ?? []}
           events={eventsQ.data ?? []}
+          onRunUpdated={() => {
+            void qc.invalidateQueries({ queryKey: ["agent-runs"] });
+            if (selectedRunId) {
+              void qc.invalidateQueries({ queryKey: ["agent-run", selectedRunId] });
+              void qc.invalidateQueries({ queryKey: ["agent-run-invocations", selectedRunId] });
+              void qc.invalidateQueries({ queryKey: ["agent-run-events", selectedRunId] });
+            }
+          }}
         />
       </Box>
     </Box>
   );
 }
 
-function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[]; events: AgentEvent[] }) {
-  const { run, invocations, events } = props;
+function RunMonitor(props: {
+  run: AgentRun | null;
+  invocations: AgentInvocation[];
+  events: AgentEvent[];
+  onRunUpdated?: () => void;
+}) {
+  const { run, invocations, events, onRunUpdated } = props;
   const [openInvocation, setOpenInvocation] = React.useState<string | null>(null);
   const [summaryOpen, setSummaryOpen] = React.useState(false);
   const [summary, setSummary] = React.useState<AgentRunSummary | null>(null);
@@ -312,6 +327,14 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
   const [reportOpen, setReportOpen] = React.useState(false);
   const [report, setReport] = React.useState<AgentRunReport | null>(null);
   const [reportError, setReportError] = React.useState<string | null>(null);
+  const [exploitError, setExploitError] = React.useState<string | null>(null);
+
+  const exploitM = useMutation({
+    mutationFn: (id: string) => startExploitPhase(id, 8),
+    onMutate: () => setExploitError(null),
+    onSuccess: () => onRunUpdated?.(),
+    onError: (err) => setExploitError((err as Error)?.message ?? "Failed to start exploit phase")
+  });
 
   const summaryM = useMutation({
     mutationFn: (id: string) => explainAgentRun(id),
@@ -355,6 +378,8 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
   const finishedCount = invocations.filter((i) => ["succeeded", "failed", "skipped"].includes(i.status)).length;
   const progress = run.maxSteps > 0 ? Math.min(100, Math.round((run.stepsTaken / run.maxSteps) * 100)) : 0;
   const summaryAvailable = run.status === "succeeded" || run.status === "failed";
+  const exploitEligible = run.status === "succeeded" && run.phase === "recon";
+  const exploitActive = run.phase === "exploit" && (run.status === "running" || run.status === "queued");
 
   const latestDecision = (decisionEvents[decisionEvents.length - 1]?.payload ?? {}) as {
     snapshot?: {
@@ -382,7 +407,33 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
             </Box>
             <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
               <StatusChip status={run.status} />
+              <Chip
+                size="small"
+                label={run.phase === "exploit" ? "exploit phase" : "recon phase"}
+                variant="outlined"
+                color={run.phase === "exploit" ? "warning" : "default"}
+              />
               <Chip size="small" label={`${finishedCount}/${invocations.length} agents finished`} variant="outlined" />
+              {exploitEligible ? (
+                <Tooltip title="Resume this run with gated exploit tools (hydra, post-ex). Approve commands in Pipeline → Stage 4.">
+                  <span>
+                    <Button
+                      size="small"
+                      variant="contained"
+                      color="warning"
+                      disabled={exploitM.isPending}
+                      onClick={() => exploitM.mutate(run.id)}
+                    >
+                      {exploitM.isPending ? "Starting…" : "Start exploit phase"}
+                    </Button>
+                  </span>
+                </Tooltip>
+              ) : null}
+              {exploitActive ? (
+                <Button size="small" variant="outlined" color="warning" component={Link} to="/pipeline">
+                  Approve exploits (Pipeline)
+                </Button>
+              ) : null}
               <Tooltip title={summaryAvailable ? "Generate one AI summary for this whole scan" : "Available once the run finishes"}>
                 <span>
                   <Button
@@ -412,6 +463,11 @@ function RunMonitor(props: { run: AgentRun | null; invocations: AgentInvocation[
               <Button size="small" component={Link} to={`/graph`}>Open graph</Button>
             </Stack>
           </Stack>
+          {exploitError ? (
+            <Alert severity="error" sx={{ mt: 1 }}>
+              {exploitError}
+            </Alert>
+          ) : null}
           <Box sx={{ mt: 2 }}>
             <LinearProgress
               variant="determinate"

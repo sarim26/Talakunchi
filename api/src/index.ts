@@ -520,6 +520,52 @@ app.post("/api/agent-runs/:id/cancel", async (req, reply) => {
   return reply.send({ ok: true });
 });
 
+const StartExploitPhaseSchema = z.object({
+  maxSteps: z.coerce.number().int().positive().max(30).optional()
+});
+
+app.post("/api/agent-runs/:id/start-exploit", async (req, reply) => {
+  const agentRunId = z.string().uuid().parse((req.params as any).id);
+  const body = StartExploitPhaseSchema.parse(req.body ?? {});
+  const maxSteps = body.maxSteps ?? 8;
+
+  const result = await withClient(async (c) => {
+    await c.query(`alter table agent_runs add column if not exists phase text not null default 'recon'`);
+    await c.query("begin");
+    try {
+      const r = await c.query(
+        `update agent_runs
+         set phase = 'exploit', status = 'queued', max_steps = $2, steps_taken = 0,
+             finished_at = null, cancel_requested = false, started_at = null
+         where id = $1 and status = 'succeeded' and coalesce(phase, 'recon') = 'recon'
+         returning target_id`,
+        [agentRunId, maxSteps]
+      );
+      if (!r.rows[0]) {
+        await c.query("rollback");
+        return null;
+      }
+      const targetId = r.rows[0].target_id as string;
+      await c.query(`insert into jobs (type, status, payload) values ('recon-mcp', 'queued', $1::jsonb)`, [
+        JSON.stringify({ agentRunId, targetId, phase: "exploit" })
+      ]);
+      await c.query(`insert into agent_events (agent_run_id, kind, payload) values ($1, 'run.exploit_queued', $2::jsonb)`, [
+        agentRunId,
+        JSON.stringify({ maxSteps })
+      ]);
+      await c.query("commit");
+      return { targetId };
+    } catch (e) {
+      await c.query("rollback");
+      throw e;
+    }
+  });
+
+  if (!result) return reply.code(409).send({ error: "Run is not eligible for exploit phase (must be succeeded recon)" });
+  await writeAuditEvent("agent.exploit.queued", { agentRunId, maxSteps }, undefined, "operator");
+  return reply.code(202).send({ id: agentRunId, status: "queued", phase: "exploit" });
+});
+
 app.get("/api/scans/:id/messages", async (req) => {
   const scanRunId = z.string().uuid().parse((req.params as any).id);
   const rows = await withClient(async (c) => {
@@ -1068,6 +1114,7 @@ async function ensureAgentTablesApi() {
     await c.query(`alter table agent_runs add column if not exists initial_nmap_profile text`);
     await c.query(`alter table agent_runs add column if not exists initial_nmap_ports int[]`);
     await c.query(`alter table agent_runs add column if not exists initial_nmap_extra_args text`);
+    await c.query(`alter table agent_runs add column if not exists phase text not null default 'recon'`);
     await c.query(`create index if not exists idx_agent_runs_target on agent_runs(target_id, created_at desc)`);
     await c.query(`
       create table if not exists agent_invocations (
@@ -1190,6 +1237,7 @@ app.get("/api/agent-runs", async (req) => {
     invocationCount: r.invocation_count,
     findingCount: r.finding_count,
     serviceCount: r.service_count,
+    phase: r.phase ?? "recon",
     notes: r.notes ?? null,
     startedAt: r.started_at,
     finishedAt: r.finished_at,
@@ -1221,6 +1269,7 @@ app.get("/api/agent-runs/:id", async (req, reply) => {
     invocationCount: data.invocation_count,
     findingCount: data.finding_count,
     serviceCount: data.service_count,
+    phase: data.phase ?? "recon",
     notes: data.notes ?? null,
     startedAt: data.started_at,
     finishedAt: data.finished_at,

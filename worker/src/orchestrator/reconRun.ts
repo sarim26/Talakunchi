@@ -70,6 +70,133 @@ export async function startReconRun(input: StartReconRunInput): Promise<string> 
   return runId;
 }
 
+/** Operator-triggered second phase: gated exploit tools on the same agent run. */
+export async function startExploitPhase(agentRunId: string, maxSteps = 8): Promise<void> {
+  await ensureAgentTables();
+  const updated = await withClient(async (c) => {
+    const r = await c.query(
+      `update agent_runs
+       set phase = 'exploit', status = 'queued', max_steps = $2, steps_taken = 0,
+           finished_at = null, cancel_requested = false, started_at = null
+       where id = $1 and status = 'succeeded' and coalesce(phase, 'recon') = 'recon'
+       returning target_id`,
+      [agentRunId, maxSteps]
+    );
+    return r.rows[0] as { target_id: string } | undefined;
+  });
+  if (!updated) throw new Error("Run is not eligible for exploit phase (must be succeeded recon)");
+
+  await withClient(async (c) => {
+    await c.query(`insert into jobs (type, status, payload) values ('recon-mcp', 'queued', $1::jsonb)`, [
+      JSON.stringify({ agentRunId, targetId: updated.target_id, phase: "exploit" })
+    ]);
+    await c.query(`insert into agent_events (agent_run_id, kind, payload) values ($1, 'run.exploit_queued', $2::jsonb)`, [
+      agentRunId,
+      JSON.stringify({ maxSteps })
+    ]);
+  });
+}
+
+async function hydrateManagerContextFromDb(
+  agentRunId: string,
+  targetId: string
+): Promise<Pick<
+  ManagerContext,
+  "knownPorts" | "knownServices" | "knownFindings" | "discoveredEndpoints" | "invocationHistory" | "webScan"
+>> {
+  const services = await withClient(async (c) => {
+    const r = await c.query(
+      `select port, protocol, service_name, product, version from services where target_id = $1 order by port asc`,
+      [targetId]
+    );
+    return r.rows as Array<{ port: number; protocol: string; service_name: string | null; product: string | null; version: string | null }>;
+  });
+
+  const invocations = await withClient(async (c) => {
+    const r = await c.query(
+      `select tool, status, envelope from agent_invocations where agent_run_id = $1 order by started_at asc`,
+      [agentRunId]
+    );
+    return r.rows as Array<{ tool: string; status: string; envelope: ToolEnvelope | null }>;
+  });
+
+  const findings = await withClient(async (c) => {
+    const r = await c.query(
+      `select title, severity, fingerprint, evidence_redacted, confidence, requires_verification, claim_type
+       from findings where target_id = $1 order by last_seen_at desc limit 120`,
+      [targetId]
+    );
+    return r.rows as Array<{
+      title: string;
+      severity: string;
+      fingerprint: string;
+      evidence_redacted: string;
+      confidence: string;
+      requires_verification: boolean;
+      claim_type: string | null;
+    }>;
+  });
+
+  const knownServices = services.map((s) => ({
+    port: s.port,
+    protocol: s.protocol,
+    name: s.service_name ?? undefined,
+    product: s.product ?? undefined,
+    version: s.version ?? undefined
+  }));
+  const knownPorts = [...new Set(knownServices.map((s) => s.port))];
+
+  const discoveredEndpoints: ManagerContext["discoveredEndpoints"] = [];
+  const endpointSeen = new Set<string>();
+  let webScan: WebScanHints = emptyWebScanHints("", null);
+
+  for (const inv of invocations) {
+    const env = inv.envelope;
+    if (!env) continue;
+    const metaPatch = webScanFromEnvelopeMeta(env.meta as Record<string, unknown> | undefined);
+    if (metaPatch) webScan = mergeWebScanHints(webScan, metaPatch);
+    for (const f of env.facts ?? []) {
+      if (f.type === "virtual_host" && f.value && typeof f.value === "object") {
+        const vv = f.value as { vhost?: string; connectIp?: string; cdnVendor?: string };
+        if (vv.vhost) {
+          webScan = mergeWebScanHints(webScan, {
+            vhost: vv.vhost,
+            connectIp: vv.connectIp ?? webScan.connectIp,
+            cdnVendor: vv.cdnVendor ?? webScan.cdnVendor,
+            cdnDetected: true
+          });
+        }
+      }
+      if (f.type !== "web_url" && f.type !== "web_path" && f.type !== "http_endpoint") continue;
+      const v = (f.value ?? {}) as { url?: string; method?: string; status?: number | null };
+      if (!v.url) continue;
+      const method = v.method ?? "GET";
+      const key = `${method} ${v.url}`;
+      if (endpointSeen.has(key)) continue;
+      endpointSeen.add(key);
+      discoveredEndpoints.push({ url: v.url, method, status: typeof v.status === "number" ? v.status : null, sourceTool: inv.tool });
+    }
+  }
+
+  const knownFindings: ToolFinding[] = findings.map((f) => ({
+    title: f.title,
+    severity: f.severity as ToolFinding["severity"],
+    evidence: f.evidence_redacted,
+    fingerprint: f.fingerprint,
+    confidence: (f.confidence as ToolFinding["confidence"]) ?? "medium",
+    requiresVerification: f.requires_verification,
+    claimType: f.claim_type ?? undefined
+  }));
+
+  const invocationHistory = invocations.map((inv) => ({
+    tool: inv.tool,
+    status: inv.status,
+    summary: `${inv.tool} (${inv.status})`
+  }));
+
+  return { knownPorts, knownServices, knownFindings, discoveredEndpoints, invocationHistory, webScan };
+}
+
 async function loadPipelineScopeConfig(): Promise<{ allowedCidrs: string[]; enforceScope: boolean }> {
   const cfg = await withClient(async (c) => {
     const r = await c.query(`select config from pipeline_configs where id = 1`);
@@ -90,7 +217,7 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
 
   const data = await withClient(async (c) => {
     const r = await c.query(
-      `select ar.id, ar.target_id, ar.max_steps,
+      `select ar.id, ar.target_id, ar.max_steps, ar.phase,
               ar.initial_nmap_profile, ar.initial_nmap_ports, ar.initial_nmap_extra_args,
               t.name as target_name, t.address as target_address, t.vhost as target_vhost,
               t.scope as target_scope
@@ -104,6 +231,7 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
           id: string;
           target_id: string;
           max_steps: number;
+          phase: string | null;
           initial_nmap_profile: string | null;
           initial_nmap_ports: number[] | null;
           initial_nmap_extra_args: string | null;
@@ -115,9 +243,15 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       | undefined;
   });
   if (!data) throw new Error(`agent_run ${agentRunId} not found`);
-  // Re-bind so TypeScript preserves the non-null narrowing inside nested
-  // async helpers (it gets lost across closure boundaries otherwise).
   const run = data;
+  const runPhase: "recon" | "exploit" = run.phase === "exploit" ? "exploit" : "recon";
+
+  if (runPhase === "exploit" && env.RECON_MODE !== "gated_exploit") {
+    await setAgentRunStatus(agentRunId, "failed", {
+      notes: "Exploit phase requires RECON_MODE=gated_exploit on the worker"
+    });
+    return;
+  }
 
   const pipelineScope = await loadPipelineScopeConfig();
   const scope = resolveEngagementScope({
@@ -178,24 +312,32 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
   const targetVhost = run.target_vhost?.trim() || null;
   const webScan: WebScanHints = emptyWebScanHints(run.target_address, targetVhost);
 
+  const hydrated =
+    runPhase === "exploit"
+      ? await hydrateManagerContextFromDb(agentRunId, run.target_id)
+      : null;
+
   const ctx: ManagerContext = {
     targetHost: run.target_address,
     targetName: run.target_name,
     stepsRemaining: run.max_steps,
-    knownPorts: [],
-    knownServices: [],
-    knownFindings: [],
+    knownPorts: hydrated?.knownPorts ?? [],
+    knownServices: hydrated?.knownServices ?? [],
+    knownFindings: hydrated?.knownFindings ?? [],
     knownDomains: [],
-    discoveredEndpoints: [],
-    webScan,
+    discoveredEndpoints: hydrated?.discoveredEndpoints ?? [],
+    webScan: hydrated?.webScan?.vhost
+      ? mergeWebScanHints(webScan, hydrated.webScan)
+      : webScan,
     pendingVerifications: [],
-    invocationHistory: [],
+    invocationHistory: hydrated?.invocationHistory ?? [],
     pendingRecommendations: [],
     wordlistCatalog,
     recentFailures: [],
     installedToolsAttempted: [],
     installedToolsInstalled: [],
     blockedOnMissingTool: null,
+    runPhase,
     runHints: {
       initialNmapProfile: run.initial_nmap_profile,
       initialNmapPorts: run.initial_nmap_ports,
@@ -485,8 +627,9 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
     // Drop queued recommendation once we have run that specialist.
     ctx.pendingRecommendations = ctx.pendingRecommendations.filter((p) => p.agent !== toolName);
 
-    // Session loop: once credentials are confirmed, queue gated read-only post-ex.
+    // Session loop: once credentials are confirmed, queue gated read-only post-ex (exploit phase only).
     if (
+      ctx.runPhase === "exploit" &&
       server.has("postex.session_recon") &&
       (envelope.findings ?? []).some((f) => f.claimType === "weak_credentials") &&
       !ctx.pendingRecommendations.some((p) => p.agent === "postex.session_recon")
@@ -613,7 +756,10 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       invocationCount: ctx.invocationHistory.length,
       findingCount: allFindings.length,
       serviceCount: ctx.knownServices.length,
-      notes: `MCP recon complete: ${ctx.invocationHistory.length} agent invocations, ${allFindings.length} findings${hadFailure ? " (with some failed steps)" : ""}`
+      notes:
+        runPhase === "exploit"
+          ? `Exploit phase complete: ${ctx.invocationHistory.length} invocations, ${allFindings.length} findings${hadFailure ? " (with some failed steps)" : ""}`
+          : `MCP recon complete: ${ctx.invocationHistory.length} agent invocations, ${allFindings.length} findings${hadFailure ? " (with some failed steps)" : ""}`
     });
   } finally {
     clearInterval(cancelPoll);

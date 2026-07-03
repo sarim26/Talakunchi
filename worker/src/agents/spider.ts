@@ -1,6 +1,17 @@
 import { ToolDefinition, ToolEnvelope } from "../mcp/types.js";
 import { remoteScript, requireRemoteTool, snippet } from "./shared.js";
-import { cdnHostHeaderFlag, connectIpUrl, hostAllowed, isIpAddress, normalizeHttpUrl, resolveWebScanFromInput, vhostAcceptPolicyFromInput } from "./webTarget.js";
+import {
+  cdnHostHeaderFlag,
+  connectIpUrl,
+  hostAllowed,
+  inferVhostForIpTarget,
+  isIpAddress,
+  mergeWebScanHints,
+  normalizeHttpUrl,
+  requiresCdnVhost,
+  resolveWebScanFromInput,
+  vhostAcceptPolicyFromInput
+} from "./webTarget.js";
 
 const KATANA_BIN = "katana";
 
@@ -72,26 +83,47 @@ export const spiderTool: ToolDefinition = {
     const presence = await requireRemoteTool(KATANA_BIN, input.signal, { installCommand: KATANA_INSTALL_COMMAND });
     if (presence.missing) return presence.envelope;
 
-    if (isIpAddress(input.target.host) && !webScan.vhost) {
-      return {
-        status: "skipped",
-        error:
-          "CDN/IP target: run recon.http_probe first (or set target vhost) before spidering a bare IP — Akamai/CDN edges return 400 without a Host header.",
-        artifacts: { commands: [] },
-        facts: [],
-        findings: [],
-        recommendations: [{ agent: "recon.http_probe", reason: "Resolve vhost from TLS cert before crawling", priority: 90 }],
-        meta: { webScan }
-      };
+    // Only CDN edges need a vhost Host header on IP connects. Direct lab IPs
+    // (Apache/Jetty on 172.x, etc.) crawl fine without virtual-host resolution.
+    let effectiveWebScan = webScan;
+    if (requiresCdnVhost(input.target.host, webScan)) {
+      const derived = inferVhostForIpTarget(input.target.host, webScan, vhostPolicy, {
+        seeds,
+        discoveredEndpoints: input.context?.discoveredEndpoints
+      });
+
+      if (derived) {
+        effectiveWebScan = mergeWebScanHints(webScan, {
+          vhost: derived,
+          connectIp: input.target.host,
+          cdnDetected: true
+        });
+        emit.log(`[spider] resolved vhost for CDN/IP crawl: ${derived}`);
+      } else {
+        const scopeHint = (input.context?.scopeEntries ?? []).filter((e) => e && !e.includes("/") && !isIpAddress(e)).join(", ");
+        emit.log(
+          `[spider] no vhost (webScan.vhost=null, knownDomains=${(input.context?.knownDomains ?? []).length}, scopeDomains=${scopeHint || "none"})`
+        );
+        return {
+          status: "skipped",
+          error:
+            "CDN edge target: no vhost available. Run recon.http_probe, set target vhost, add a hostname to target scope, or pass a hostname in http_targets.",
+          artifacts: { commands: [] },
+          facts: [],
+          findings: [],
+          recommendations: [{ agent: "recon.http_probe", reason: "Resolve vhost from TLS cert before crawling", priority: 90 }],
+          meta: { webScan, knownDomains: input.context?.knownDomains ?? [], scopeEntries: input.context?.scopeEntries ?? [] }
+        };
+      }
     }
 
     const depth = clampInt(args.depth ?? 3, 1, 6);
     const concurrency = clampInt(args.concurrency ?? 10, 1, 30);
     const timeoutSec = clampInt(args.timeoutSec ?? 10, 3, 30);
     const jsCrawl = args.jsCrawl !== false;
-    const hostFlag = cdnHostHeaderFlag(webScan);
+    const hostFlag = cdnHostHeaderFlag(effectiveWebScan);
     const fieldScope =
-      webScan.vhost && webScan.connectIp ? "rdn" : args.includeSubdomains ? "rdn" : "fqdn";
+      effectiveWebScan.vhost && effectiveWebScan.connectIp ? "rdn" : args.includeSubdomains ? "rdn" : "fqdn";
 
     const allFacts: ToolEnvelope["facts"] = [];
     const allFindings: ToolEnvelope["findings"] = [];
@@ -103,12 +135,12 @@ export const spiderTool: ToolDefinition = {
     let stdoutAggregate = "";
 
     for (const seedUrl of seeds) {
-      const crawlUrl = connectIpUrl(normalizeHttpUrl(seedUrl), webScan);
+      const crawlUrl = connectIpUrl(normalizeHttpUrl(seedUrl), effectiveWebScan);
       const flags = buildKatanaArgv(crawlUrl, depth, concurrency, timeoutSec, fieldScope, jsCrawl, hostFlag);
       const script = [`set +e`, `${KATANA_BIN} ${flags.join(" ")}`].join("\n");
       emit.log(
-        webScan.vhost && webScan.connectIp
-          ? `Running katana against ${crawlUrl} Host:${webScan.vhost} (depth=${depth})`
+        effectiveWebScan.vhost && effectiveWebScan.connectIp
+          ? `Running katana against ${crawlUrl} Host:${effectiveWebScan.vhost} (depth=${depth})`
           : `Running katana against ${crawlUrl} (depth=${depth}, concurrency=${concurrency}, jsCrawl=${jsCrawl})`
       );
       const r = await remoteScript(script, input.signal, (s) => emit.log(s));

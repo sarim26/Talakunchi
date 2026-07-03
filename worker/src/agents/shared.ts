@@ -44,6 +44,8 @@ export type RemoteRunResult = {
    */
   commands: string[];
   durationMs: number;
+  /** Set when the invocation was aborted (tool timeout) but partial stdout/stderr was kept. */
+  aborted?: boolean;
 };
 
 /** Runs a single program (with args) over SSH. Returns stdout/stderr. */
@@ -67,7 +69,8 @@ export async function remoteRun(
     stderr: r.stderr,
     command: cmd,
     commands: [cmd],
-    durationMs: Date.now() - start
+    durationMs: Date.now() - start,
+    aborted: r.aborted
   };
 }
 
@@ -94,7 +97,8 @@ export async function remoteScript(
     stderr: r.stderr,
     command: extracted[0] ?? "bash <<inline>>",
     commands: extracted,
-    durationMs: Date.now() - start
+    durationMs: Date.now() - start,
+    aborted: r.aborted
   };
 }
 

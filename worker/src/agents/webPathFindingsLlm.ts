@@ -14,6 +14,10 @@ const LlmOutputSchema = z.object({
   findings: z.array(LlmFindingSchema).max(80)
 });
 
+/** High-signal paths worth reporting even when the findings LLM fails or omits them. */
+const SENSITIVE_PATH =
+  /(?:^|\/)\.(?:env|git|htaccess|htpasswd|bash_history|ssh|svn|DS_Store|aws|docker)(?:\/|$)|(?:^|\/)(?:web\.config|server-status|phpmyadmin|wp-admin|wp-login|backup|config\.php|admin|graphql|swagger|actuator|jenkins)(?:\/|$)/i;
+
 export type WebObservation = {
   url: string;
   httpStatus: number | null;
@@ -45,6 +49,7 @@ export async function findingsFromWebFactsLlm(opts: {
 
   const maxSend = Math.min(opts.maxObservations ?? 160, 260);
   const prioritized = prioritizeObservations(observations).slice(0, maxSend);
+  const deterministic = findingsFromObservationsDeterministic(prioritized, opts.tool);
   const model = env.webFindingsModel;
 
   const system = [
@@ -99,55 +104,42 @@ export async function findingsFromWebFactsLlm(opts: {
     });
 
     if (r.value === null) {
-      opts.emitLog?.(`[web-findings-llm] no JSON from model (raw len ${r.raw?.length ?? 0})`);
-      return {
-        findings: [],
-        meta: {
-          modelUsed: model,
-          sentCount: prioritized.length,
-          inputCount: observations.length,
-          diag: "LLM returned no parseable JSON for web findings"
-        }
-      };
+      opts.emitLog?.(`[web-findings-llm] no JSON from model (raw len ${r.raw?.length ?? 0}); using deterministic fallback`);
+      return finishWebFindings(deterministic, {
+        modelUsed: model,
+        sentCount: prioritized.length,
+        inputCount: observations.length,
+        diag: "LLM returned no parseable JSON for web findings"
+      });
     }
 
-    const parsed = LlmOutputSchema.safeParse(r.value);
-    if (!parsed.success) {
-      opts.emitLog?.(`[web-findings-llm] schema mismatch: ${parsed.error.message}`);
-      return {
-        findings: [],
-        meta: {
-          modelUsed: model,
-          sentCount: prioritized.length,
-          inputCount: observations.length,
-          diag: parsed.error.issues.slice(0, 3).map((e) => `${e.path.join(".")}: ${e.message}`).join("; ")
-        }
-      };
+    const coerced = coerceLlmOutput(r.value);
+    const parsed = coerced ? LlmOutputSchema.safeParse(coerced) : null;
+    if (!parsed?.success) {
+      const errMsg = parsed?.error?.message ?? "unrecognized LLM JSON shape";
+      opts.emitLog?.(`[web-findings-llm] schema mismatch: ${errMsg}; using deterministic fallback`);
+      return finishWebFindings(deterministic, {
+        modelUsed: model,
+        sentCount: prioritized.length,
+        inputCount: observations.length,
+        diag: parsed?.error?.issues.slice(0, 3).map((e) => `${e.path.join(".")}: ${e.message}`).join("; ") ?? errMsg
+      });
     }
 
-    const urlPool = prioritized.map((o) => o.url);
-    const out: ToolEnvelope["findings"] = [];
-    const seenFp = new Set<string>();
-
+    const llmFindings: ToolEnvelope["findings"] = [];
     for (const f of parsed.data.findings) {
-      const matchedUrl = longestUrlContainedIn(f.evidence, urlPool);
-      if (!matchedUrl) continue;
+      const matched = matchObservationForEvidence(f.evidence, prioritized);
+      if (!matched) continue;
 
-      const baseFp =
+      const evidence = formatObservationEvidence(matched);
+      const fp =
         f.fingerprint?.trim() ||
-        `llm-web|${opts.tool}|${matchedUrl}|${f.severity}|${fingerprintTitlePart(f.title)}`;
-      let fp = baseFp;
-      let dup = 0;
-      while (seenFp.has(fp)) {
-        dup += 1;
-        fp = `${baseFp}#${dup}`;
-      }
-      seenFp.add(fp);
+        `llm-web|${opts.tool}|${matched.url}|${matched.httpStatus ?? "null"}|${fingerprintTitlePart(f.title)}`;
 
-      out.push({
+      llmFindings.push({
         title: f.title,
         severity: f.severity,
-        evidence: f.evidence,
+        evidence,
         fingerprint: fp,
         confidence: "medium",
         requiresVerification: true,
@@ -155,22 +147,111 @@ export async function findingsFromWebFactsLlm(opts: {
       });
     }
 
-    return {
-      findings: out,
-      meta: { modelUsed: model, sentCount: prioritized.length, inputCount: observations.length }
-    };
+    const merged = mergeWebFindings(deterministic, llmFindings);
+    if (llmFindings.length === 0 && deterministic.length > 0) {
+      opts.emitLog?.(`[web-findings-llm] LLM produced 0 grounded findings; kept ${deterministic.length} deterministic`);
+    }
+
+    return finishWebFindings(merged, {
+      modelUsed: model,
+      sentCount: prioritized.length,
+      inputCount: observations.length
+    });
   } catch (e) {
-    opts.emitLog?.(`[web-findings-llm] ${(e as Error).message}`);
-    return {
-      findings: [],
-      meta: {
-        modelUsed: model,
-        sentCount: prioritized.length,
-        inputCount: observations.length,
-        diag: (e as Error).message
-      }
-    };
+    opts.emitLog?.(`[web-findings-llm] ${(e as Error).message}; using deterministic fallback`);
+    return finishWebFindings(deterministic, {
+      modelUsed: model,
+      sentCount: prioritized.length,
+      inputCount: observations.length,
+      diag: (e as Error).message
+    });
   }
+}
+
+function finishWebFindings(
+  findings: ToolEnvelope["findings"],
+  meta: { modelUsed: string; sentCount: number; inputCount: number; diag?: string }
+): { findings: ToolEnvelope["findings"]; meta: { modelUsed: string; sentCount: number; inputCount: number; diag?: string } } {
+  return { findings, meta };
+}
+
+function coerceLlmOutput(raw: unknown): unknown | null {
+  if (raw === null || raw === undefined) return null;
+  if (Array.isArray(raw)) return { findings: raw };
+  if (typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  if (Array.isArray(o.findings)) return { findings: o.findings };
+  for (const key of ["results", "items", "data", "output"]) {
+    const v = o[key];
+    if (Array.isArray(v)) return { findings: v };
+  }
+  if (typeof o.title === "string" && typeof o.severity === "string" && typeof o.evidence === "string") return { findings: [o] };
+  return null;
+}
+
+function findingsFromObservationsDeterministic(observations: WebObservation[], tool: string): ToolEnvelope["findings"] {
+  const out: ToolEnvelope["findings"] = [];
+  const seen = new Set<string>();
+  for (const obs of observations) {
+    if (!isInterestingStatus(obs.httpStatus)) continue;
+    let path = "";
+    try { path = new URL(obs.url).pathname || ""; } catch { continue; }
+    if (!SENSITIVE_PATH.test(path)) continue;
+    const fp = `det-web|${tool}|${obs.url}|${obs.httpStatus ?? "null"}`;
+    if (seen.has(fp)) continue;
+    seen.add(fp);
+    out.push({
+      title: `Sensitive web path observed: ${path}`,
+      severity: severityForSensitivePath(obs.httpStatus),
+      evidence: formatObservationEvidence(obs),
+      fingerprint: fp,
+      confidence: obs.httpStatus === 401 || obs.httpStatus === 403 ? "medium" : "high",
+      requiresVerification: obs.httpStatus === 401 || obs.httpStatus === 403,
+      claimType: "web_path"
+    });
+  }
+  return out;
+}
+
+function isInterestingStatus(status: number | null): boolean {
+  return status === 200 || status === 204 || status === 301 || status === 302 || status === 307 || status === 401 || status === 403;
+}
+
+function severityForSensitivePath(status: number | null): "info" | "low" | "medium" | "high" | "critical" {
+  if (status === 200 || status === 204) return "medium";
+  if (status === 401 || status === 403) return "low";
+  if (status === 301 || status === 302 || status === 307) return "info";
+  return "low";
+}
+
+function formatObservationEvidence(obs: WebObservation): string {
+  const statusPart = obs.httpStatus === null ? "HTTP status unknown" : `HTTP ${obs.httpStatus}`;
+  const sizePart = obs.responseBytes != null ? `, ${obs.responseBytes} bytes` : "";
+  return `${obs.url} -> ${statusPart}${sizePart}`;
+}
+
+function mergeWebFindings(a: ToolEnvelope["findings"], b: ToolEnvelope["findings"]): ToolEnvelope["findings"] {
+  const seen = new Set(a.map((f) => f.fingerprint));
+  const out = [...a];
+  for (const f of b) {
+    if (seen.has(f.fingerprint)) continue;
+    seen.add(f.fingerprint);
+    out.push(f);
+  }
+  return out;
+}
+
+function matchObservationForEvidence(evidence: string, observations: WebObservation[]): WebObservation | null {
+  const urlPool = observations.map((o) => o.url);
+  const matchedUrl = longestUrlContainedIn(evidence, urlPool);
+  if (matchedUrl) return observations.find((o) => o.url === matchedUrl) ?? null;
+  for (const obs of observations) {
+    let path = "";
+    try { path = new URL(obs.url).pathname || ""; } catch { continue; }
+    if (!path || path === "/") continue;
+    if (evidence.includes(path)) return obs;
+  }
+  return null;
 }
 
 function extractObservations(facts: ToolFact[]): WebObservation[] {

@@ -8,6 +8,7 @@ import {
   hostAllowed,
   isIpAddress,
   normHost,
+  requiresCdnVhost,
   resolveWebScanFromInput,
   vhostAcceptPolicyFromInput
 } from "./webTarget.js";
@@ -68,7 +69,7 @@ export const ffufTool: ToolDefinition = {
     const vhostPolicy = vhostAcceptPolicyFromInput(input.target.host, input, webScan.cdnDetected);
     const targets = collectTargetUrls(args, input.target.host, webScan.vhost, vhostPolicy);
     if (targets.length === 0) {
-      if (isIpAddress(input.target.host) && !webScan.vhost) {
+      if (requiresCdnVhost(input.target.host, webScan)) {
         return {
           status: "skipped",
           error: "CDN/IP target: run recon.http_probe to resolve vhost before ffuf on a bare IP.",
