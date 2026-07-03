@@ -1,16 +1,28 @@
-# Talakunchi Security Prototype (Local)
+# Talakunchi
 
-Local, CEO-demo-friendly prototype for:
-- Target onboarding (Windows host on LAN)
-- Scan runs (MCP recon loop; mock data still supported)
-- Findings tracking (first seen / last seen, status)
-- Neo4j graph view (Target → Service → Finding)
-- "AI Explain" button (mock now, Azure OpenAI later)
+Local agentic recon platform. You register targets, kick off a run, and a multi-LLM loop drives real tools on a Kali box over SSH — nmap, httpx, gobuster, nuclei, hydra, sqlmap, the usual. Findings land in Postgres; the graph view is Neo4j. Exploit-phase tools sit behind pipeline approvals when `RECON_MODE=gated_exploit`.
+
+Built for lab work (Metasploitable, vulnweb, LAN VMs), not production pentest delivery yet.
+
+## How the agent works
+
+Each run is orchestrated in `worker/src/orchestrator/reconRun.ts`:
+
+1. **Manager** (Ollama) — reads the tool manifest, what's already been found, and picks the next tool or stops.
+2. **Prompter** — turns that intent into instructions the specialist can act on.
+3. **Execution writer** — for tools with structured args, fills the JSON payload (targets, wordlists, flags).
+4. **Tool invoke** — worker SSHs into Kali and runs the command. Output gets parsed into findings/services and fed back into context for the next step.
+
+Recon runs until the manager stops or you hit `RECON_MAX_STEPS`. When recon finishes, you can hit **Start exploit phase** in the UI — same run, new phase, gated tools only (hydra, sqlmap, msf, commix, crackmapexec). Each gated command waits for approval in the Pipeline before it executes.
+
+Tools don't run inside Docker. The worker container is Node + SSH client. Kali is the tools host.
 
 ## Requirements
-- Docker Desktop (with Compose)
-- OLLAMA
-- VirtualBox Kali (tools host)
+
+- Docker Desktop + Compose
+- Ollama on the host (models pulled locally)
+- Kali VM with SSH reachable from Docker (`host.docker.internal` + port forward is the usual setup)
+- SecLists on Kali at `/home/kali/Desktop/SecLists` (or symlink from apt's `seclists` package)
 
 ## Quick start
 
@@ -18,55 +30,60 @@ Local, CEO-demo-friendly prototype for:
 docker compose up --build
 ```
 
-Then open:
-- Web UI: `http://localhost:5173`
-- API: `http://localhost:8080/health`
-- Neo4j Browser: `http://localhost:7474` (user: `neo4j`, password: `neo4jpassword`)
+- Web UI: http://localhost:5173
+- API health: http://localhost:8080/health
+- Neo4j: http://localhost:7474 (`neo4j` / `neo4jpassword`)
 
-## Prototype behavior
-- You can add targets without knowing the final IP yet.
-- Running a scan executes a **manager → prompter → specialist** recon loop (see `worker/src/orchestrator/reconRun.ts`).
-- Tools execute on a **Kali tools host over SSH** (the worker container is Node + ssh; it does not run nmap/katana/etc locally).
-- Re-running scans will update `lastSeenAt` and show deltas (new/fixed).
+Add a target (hostname or IP in **IP/Hostname**; **vhost** is only for CDN/IP targets where you need a `Host` header). Start agentic recon from the UI.
 
-## Config: tools host (Kali over SSH)
-Configure these in `.env`:
-- `REMOTE_SSH_HOST`, `REMOTE_SSH_USER`, `REMOTE_SSH_PORT`
-- One auth method: `REMOTE_SSH_PASSWORD` **or** `REMOTE_SSH_IDENTITY_FILE`
-- Optional sudo: `REMOTE_SSH_SUDO_PASSWORD` (used by the installer)
+## Config
 
-Important notes:
-- `REMOTE_SSH_HOST=host.docker.internal` means “the Docker host machine”, not your scan target IP. If your Kali is a VM, you usually need **port-forwarding** (host port → guest sshd 22) or a bridged/host-only IP that Docker can reach.
-- If a tool is installed under `~/go/bin` on Kali, ensure it is on PATH for non-interactive SSH sessions, or symlink it into `/usr/local/bin`.
+Copy `.env.example` → `.env`. The important bits:
 
-## Auto-install missing tools (`system.tool_installer`)
-Specialists preflight required binaries with `command -v <tool>`. If a tool is missing, the orchestrator queues `system.tool_installer` and retries.
+**Kali SSH**
+- `REMOTE_SSH_HOST`, `REMOTE_SSH_PORT`, `REMOTE_SSH_USER`
+- `REMOTE_SSH_PASSWORD` or `REMOTE_SSH_IDENTITY_FILE`
+- `REMOTE_SSH_SUDO_PASSWORD` if you want `system.tool_installer` to apt-install missing tools
 
-`system.tool_installer` supports:
-- `args.tool`: binary name to verify (required)
-- `args.installCommand`: optional full install snippet (for tools not available via apt). The script exposes `$SUDO` for privileged steps.
+`REMOTE_SSH_HOST=host.docker.internal` is the Docker host, not your scan target. Port-forward VM SSH (e.g. host `2227` → guest `22`) or use a bridged IP Docker can reach.
 
-## Project layout
-- `web/`: Vite + React + TypeScript dashboard
-- `api/`: TypeScript API (Fastify) backed by Postgres + Neo4j
-- `worker/`: TypeScript worker that polls Postgres for scan jobs
-- `db/init.sql`: DB schema for prototype
+**Agent / models**
+- `OLLAMA_URL` — usually `http://host.docker.internal:11434`
+- `OLLAMA_MANAGER_MODEL` — tool choice (`qwen3:8b` on 16 GB RAM; avoid keeping DeepSeek 14B loaded alongside everything else)
+- `OLLAMA_PROMPTER_MODEL`, `OLLAMA_SPECIALIST_MODEL`, `OLLAMA_COMMAND_WRITER_MODEL`
+- `OLLAMA_EXPLAIN_MODEL` — API-side summaries/reports
 
-## Ollama model RAM tiers (16 GB host)
-The MCP recon system uses several Ollama models. On a 16 GB machine, keep **one heavy model loaded at a time** — the worker calls them serially, so memory pressure comes from leaving multiple large models resident.
+**Modes**
+- `RECON_MODE=readonly` — recon tools only
+- `RECON_MODE=gated_exploit` — recon + gated exploit tools (needs `HYDRA_ENABLED=true` etc.)
+- `RECON_MAX_STEPS`, `APPROVAL_WAIT_MS`, `EXPLOIT_LHOST_ALLOWLIST`
 
-| Role | Env var | Suggested model (16 GB) | Notes |
-|------|---------|-------------------------|-------|
-| Manager (reasoning, tool choice) | `OLLAMA_MANAGER_MODEL` | `qwen3:8b` (or `deepseek-r1:14b` only with free RAM) | DeepSeek-R1 needs `stripModelReasoning` (already applied) and enough free host RAM after lowering Docker/WSL caps |
-| Prompter (intent → prose) | `OLLAMA_PROMPTER_MODEL` | `qwen3:8b`–`qwen3:14b` | |
-| Execution writer / specialist | `OLLAMA_SPECIALIST_MODEL`, `OLLAMA_COMMAND_WRITER_MODEL` | `qwen2.5-coder:7b` | structured arg filling |
-| AI summary / report (API) | `OLLAMA_EXPLAIN_MODEL` | `qwen3:14b` (run one at a time) | |
+Go binaries on Kali (`httpx`, `katana`, `nuclei`) need to be on PATH for non-interactive SSH — put `$HOME/go/bin` in `.bashrc` / `.profile`.
 
-Tips for 16 GB / WSL2:
-- Lower the WSL `memory=` cap (e.g. 6–8 GB) in `%UserProfile%\.wslconfig` so the host keeps RAM for native Ollama.
-- Use `ollama ps` to see loaded models and `ollama stop <model>` to free one before loading another.
-- If the manager stops on step 1 with a memory/CUDA error, switch `OLLAMA_MANAGER_MODEL` to a smaller model; the orchestrator still falls back to `recon.nmap` on a cold start.
+## Missing tools
 
-## Notes
-- This is a prototype. Hardening (Okta, approvals, strict allowlists, Azure deployment) comes next.
+Specialists check `command -v` before running. If something's missing, the orchestrator can queue `system.tool_installer` (allowlisted apt packages) and retry. Custom installs go through `args.installCommand`.
 
+## Layout
+
+- `web/` — React dashboard
+- `api/` — Fastify API, Postgres, Neo4j
+- `worker/` — job poller, MCP tools, orchestrator
+- `db/init.sql` — schema
+
+## 16 GB RAM / Ollama
+
+Several models get called in one run but not all at once. Still, don't leave a 14B model resident while Docker + WSL eat half your RAM.
+
+| Role | Env var | What I'd use on 16 GB |
+|------|---------|------------------------|
+| Manager | `OLLAMA_MANAGER_MODEL` | `qwen3:8b` |
+| Prompter | `OLLAMA_PROMPTER_MODEL` | `qwen3:8b` |
+| Arg writer | `OLLAMA_COMMAND_WRITER_MODEL` | `qwen2.5-coder:7b` |
+| Summaries | `OLLAMA_EXPLAIN_MODEL` | `qwen3:8b` |
+
+`ollama ps` / `ollama stop <model>` to free memory. Cap WSL in `%UserProfile%\.wslconfig` if Ollama OOMs on step 1 — orchestrator falls back to `recon.nmap` on a cold manager failure.
+
+## Not done yet
+
+Auth, strict production hardening, cloud deploy, recon brief/RAG for exploit phase. This is a working lab stack, not a shipped product.
