@@ -4,6 +4,7 @@ import { remoteScript, requireRemoteTool, snippet } from "./shared.js";
 import { isLhostAllowed } from "../approvals.js";
 import {
   matchMsfModuleForService,
+  msfAllowAllModules,
   parseMsfModuleAllowlist,
   quoteShell,
   requireGatedExploitMode,
@@ -55,7 +56,8 @@ export const msfModuleTool: ToolDefinition = {
       action?: string;
     };
 
-    const allow = new Set(parseMsfModuleAllowlist());
+    const allowAll = msfAllowAllModules();
+    const allow = allowAll ? null : new Set(parseMsfModuleAllowlist());
     let module = args.module?.trim() ?? "";
     let rport = Number(args.rport ?? 0);
 
@@ -70,17 +72,17 @@ export const msfModuleTool: ToolDefinition = {
       }
     }
 
-    if (!module || !allow.has(module)) {
+    if (!module || (!allowAll && !allow?.has(module))) {
       return {
         status: "skipped",
         error: module
           ? `MSF module "${module}" is not in MSF_MODULE_ALLOWLIST.`
-          : `No matching MSF module for discovered services. Allowed: ${[...allow].slice(0, 8).join(", ")}…`,
+          : `No matching MSF module for discovered services. Allowed: ${[...(allow ?? new Set())].slice(0, 8).join(", ")}…`,
         artifacts: { commands: [] },
         facts: [],
         findings: [],
         recommendations: [],
-        meta: { allowedModules: [...allow] }
+        meta: { allowedModules: allow ? [...allow] : ["*"] }
       };
     }
 
