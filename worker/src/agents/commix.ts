@@ -85,6 +85,7 @@ export const commixTool: ToolDefinition = {
     const facts: ToolEnvelope["facts"] = [];
     const commands: string[] = [];
     let stdoutAll = "";
+    const scanned: Array<{ url: string; injectable: boolean; notes: string[] }> = [];
 
     for (const targetUrl of targets) {
       const script = [
@@ -97,7 +98,13 @@ export const commixTool: ToolDefinition = {
       commands.push(`commix --url=${targetUrl}`);
       stdoutAll += r.stdout;
 
-      if (/injectable|command injection|os-shell|The payload/i.test(r.stdout)) {
+      const injectable = /injectable|command injection|os-shell|The payload/i.test(r.stdout);
+      const notes: string[] = [];
+      if (/WAF|IPS|blocked|forbidden/i.test(r.stdout)) notes.push("possible_waf_or_block");
+      if (/timeout|timed out/i.test(r.stdout)) notes.push("timeout");
+      scanned.push({ url: targetUrl, injectable, notes });
+
+      if (injectable) {
         facts.push({ type: "cmdi", value: { url: targetUrl, snippet: snippet(r.stdout, 400) }, source: "commix" });
         findings.push({
           title: `Command injection likely on ${targetUrl}`,
@@ -109,6 +116,14 @@ export const commixTool: ToolDefinition = {
           claimType: "rce"
         });
       }
+    }
+
+    if (findings.length === 0) {
+      facts.push({
+        type: "commix_summary",
+        value: { urlsTested: targets, level, result: "no_injection_detected", perUrl: scanned },
+        source: "commix"
+      });
     }
 
     return {

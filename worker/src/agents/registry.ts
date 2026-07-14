@@ -19,6 +19,7 @@ import { hydraTool } from "./hydra.js";
 import { postexTools } from "./postex.js";
 import { sqlmapTool } from "./sqlmap.js";
 import { msfModuleTool } from "./msf.js";
+import { msfSearchTool } from "./msfSearch.js";
 import { commixTool } from "./commix.js";
 import { crackmapexecTool } from "./crackmapexec.js";
 import { env } from "../env.js";
@@ -48,7 +49,10 @@ export function buildReconMCPServer(): MCPServer {
   if (env.RECON_MODE === "gated_exploit") {
     if (env.HYDRA_ENABLED) server.register(hydraTool);
     if (env.SQLMAP_ENABLED) server.register(sqlmapTool);
-    if (env.MSF_ENABLED) server.register(msfModuleTool);
+    if (env.MSF_ENABLED) {
+      server.register(msfSearchTool);
+      server.register(msfModuleTool);
+    }
     if (env.COMMIX_ENABLED) server.register(commixTool);
     if (env.CRACKMAPEXEC_ENABLED) server.register(crackmapexecTool);
     for (const tool of postexTools) server.register(tool);

@@ -22,6 +22,8 @@ export function TargetsPage() {
   const [vhost, setVhost] = useState("");
   const [scope, setScope] = useState("");
   const [tags, setTags] = useState("lab,staging");
+  const [hydraUserlist, setHydraUserlist] = useState("");
+  const [hydraPasslist, setHydraPasslist] = useState("");
 
   const createM = useMutation({
     mutationFn: createTarget,
@@ -87,6 +89,22 @@ export function TargetsPage() {
               onChange={(e) => setTags(e.target.value)}
               fullWidth
             />
+            <TextField
+              label="Hydra userlist (optional)"
+              placeholder="/home/kali/engagements/client/users.txt"
+              value={hydraUserlist}
+              onChange={(e) => setHydraUserlist(e.target.value)}
+              fullWidth
+              size="small"
+            />
+            <TextField
+              label="Hydra passlist (optional)"
+              placeholder="/home/kali/engagements/client/passwords.txt"
+              value={hydraPasslist}
+              onChange={(e) => setHydraPasslist(e.target.value)}
+              fullWidth
+              size="small"
+            />
             <Button
               variant="contained"
               onClick={() =>
@@ -95,7 +113,9 @@ export function TargetsPage() {
                   address,
                   vhost: vhost.trim() || undefined,
                   scope: scopeList.length ? scopeList : undefined,
-                  tags: tagList
+                  tags: tagList,
+                  hydraUserlist: hydraUserlist.trim() || undefined,
+                  hydraPasslist: hydraPasslist.trim() || undefined
                 })
               }
               disabled={createM.isPending}

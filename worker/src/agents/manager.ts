@@ -87,6 +87,28 @@ export type ManagerContext = {
   } | null;
   /** `recon` (default) or `exploit` after operator starts gated exploit phase. */
   runPhase?: "recon" | "exploit";
+  /** Compact facts from prior tool runs (msf_search modules, sqlmap summaries, etc.). */
+  toolFacts?: Array<{ type: string; value: unknown; source?: string }>;
+  /**
+   * Recent tool stdout/stderr snippets + plain-English hints for exploit-phase
+   * retries (e.g. sqlmap saying raise --level/--risk).
+   */
+  recentToolOutputs?: Array<{
+    tool: string;
+    status: string;
+    plainEnglish?: string;
+    stdoutSnippet?: string;
+    stderrSnippet?: string;
+    suggestedArgs?: Record<string, unknown>;
+    hints?: string[];
+  }>;
+  /** Per-target engagement wordlists / creds (from Targets page). */
+  engagementCreds?: {
+    username?: string | null;
+    password?: string | null;
+    userlist?: string | null;
+    passlist?: string | null;
+  };
   /** From `agent_runs` — not a policy; the LLM may ignore or apply when choosing `recon.nmap`. */
   runHints?: ManagerRunHints;
 };
@@ -128,7 +150,11 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
 
     const llmDecision = await tryLlmDecision(server, ctx, signal);
     if (llmDecision) {
-      if (llmDecision.action === "stop") return llmDecision;
+      if (llmDecision.action === "stop") {
+        const keepGoing = exploitCoverageFallback(server, ctx);
+        if (keepGoing) return keepGoing;
+        return llmDecision;
+      }
       if (llmDecision.action === "invoke" && server.has(llmDecision.tool)) {
         const phased = enforcePhaseToolPolicy(llmDecision, ctx);
         if (phased) {
@@ -140,6 +166,9 @@ export async function decideNextAction(server: MCPServer, ctx: ManagerContext, s
 
     const fromRec = fallbackFromRecommendations(server, ctx, { exploitOnly: true });
     if (fromRec) return fromRec;
+
+    const coverage = exploitCoverageFallback(server, ctx);
+    if (coverage) return coverage;
 
     if (ctx.stepsRemaining <= 0) {
       return { action: "stop", reason: "Exploit step budget exhausted" };
@@ -267,7 +296,7 @@ function fallbackInitialNmap(server: MCPServer, ctx: ManagerContext): ManagerDec
   };
 }
 
-/** Prevent burning steps re-running slow specialists with no new intel. */
+/** Prevent burning steps re-running specialists with no new intel; allow output-driven tweaks. */
 function suppressRepeatToolInvocation(decision: ManagerDecision, ctx: ManagerContext): ManagerDecision | null {
   if (decision.action !== "invoke") return decision;
 
@@ -275,16 +304,46 @@ function suppressRepeatToolInvocation(decision: ManagerDecision, ctx: ManagerCon
   const priorRuns = history.filter((h) => h.tool === decision.tool).length;
   if (priorRuns === 0) return decision;
 
+  const maxRepeats = ctx.runPhase === "exploit" ? 2 : 2;
+  if (priorRuns >= maxRepeats) return null;
+
+  const pending = (ctx.pendingRecommendations ?? []).find((p) => p.agent === decision.tool && p.args);
+  const lastOut = (ctx.recentToolOutputs ?? []).filter((o) => o.tool === decision.tool).slice(-1)[0];
+  const hasTweak =
+    Boolean(pending?.args) ||
+    Boolean(lastOut?.suggestedArgs) ||
+    (lastOut?.hints?.length ?? 0) > 0;
+
+  if (hasTweak) {
+    if (pending?.args && (!decision.args || Object.keys(decision.args).length === 0)) {
+      return { ...decision, args: { ...pending.args, ...(decision.args ?? {}) } };
+    }
+    if (lastOut?.suggestedArgs) {
+      return {
+        ...decision,
+        args: { ...(decision.args ?? {}), ...lastOut.suggestedArgs },
+        reasoning: `${decision.reasoning ?? ""} | retry from output: ${lastOut.plainEnglish ?? lastOut.hints?.[0] ?? "tweaked args"}`.trim()
+      };
+    }
+    return decision;
+  }
+
+  // Hard no-repeat (unless tweak above) for expensive one-shot tools.
   const noRepeat = new Set([
     "recon.tls_check",
     "recon.waf_detect",
+    "recon.cve_enricher",
     "exploit.sqlmap",
     "exploit.commix",
     "exploit.crackmapexec",
+    "exploit.msf_search",
     "recon.hydra",
     "postex.session_recon"
   ]);
   if (noRepeat.has(decision.tool) && priorRuns >= 1) return null;
+
+  // Default: block identical re-runs without new evidence.
+  if (priorRuns >= 1) return null;
 
   return decision;
 }
@@ -361,6 +420,87 @@ function exploitToolsForPlanner(server: MCPServer): ToolDefinition[] {
   return server.list().filter((t) => isGatedExploitTool(t.name) || t.name === "system.tool_installer");
 }
 
+/**
+ * Deterministic exploit keep-going: if the LLM wants to stop (or failed),
+ * still try remaining gated tools that match open services / endpoints and
+ * haven't been attempted yet.
+ */
+function exploitCoverageFallback(server: MCPServer, ctx: ManagerContext): ManagerDecision | null {
+  if (ctx.stepsRemaining <= 0) return null;
+  const ran = new Set((ctx.invocationHistory ?? []).map((h) => h.tool));
+  const services = ctx.knownServices ?? [];
+  const endpoints = ctx.discoveredEndpoints ?? [];
+  const hasAuthPorts = services.some((s) => [21, 22, 23, 25, 110, 143, 445, 3306, 3389, 5432, 5900].includes(s.port));
+  const hasSmb = services.some((s) => s.port === 445 || /smb|microsoft-ds|netbios/i.test(`${s.name ?? ""} ${s.product ?? ""}`));
+  const hasFtp = services.some((s) => s.port === 21 || /\bftp\b/i.test(s.name ?? ""));
+  const hasParamUrls = endpoints.some((e) => /[?&][^=]+=/.test(e.url));
+  const hasWeb = endpoints.length > 0 || services.some((s) => [80, 443, 8080, 8443].includes(s.port));
+
+  const tryInvoke = (tool: string, intentGoal: string, args: Record<string, unknown>, reasoning: string): ManagerDecision | null => {
+    if (!server.has(tool) || ran.has(tool)) return null;
+    const decision: ManagerDecision = { action: "invoke", tool, intentGoal, args, reasoning };
+    return suppressRepeatToolInvocation(decision, ctx);
+  };
+
+  const hasMsfSearchIntel = (ctx.toolFacts ?? []).some((f) => f.type === "msf_search");
+
+  // Prefer searching MSF before inventing module names when FTP/SMB is present.
+  if (hasFtp && server.has("exploit.msf_search") && !ran.has("exploit.msf_search") && !hasMsfSearchIntel) {
+    return tryInvoke(
+      "exploit.msf_search",
+      "Search Metasploit for FTP/ProFTPd modules available on Kali",
+      { query: "proftpd" },
+      "Coverage-first: FTP present and msf_search not run yet"
+    );
+  }
+  if (hasSmb && server.has("exploit.msf_search") && !ran.has("exploit.msf_search") && ran.has("exploit.msf_module")) {
+    return tryInvoke(
+      "exploit.msf_search",
+      "Search Metasploit for Samba modules available on Kali",
+      { query: "samba" },
+      "Coverage-first: SMB present and prior msf_module may have used invalid paths"
+    );
+  }
+
+  if (hasWeb && hasParamUrls && server.has("exploit.sqlmap") && !ran.has("exploit.sqlmap")) {
+    return tryInvoke(
+      "exploit.sqlmap",
+      "Test discovered parameterized web URLs for SQL injection",
+      { urls: endpoints.filter((e) => /[?&][^=]+=/.test(e.url)).slice(0, 8).map((e) => e.url), level: 2, risk: 2 },
+      "Coverage-first: parameterized HTTP URLs exist but sqlmap not run yet"
+    );
+  }
+
+  if (hasWeb && hasParamUrls && server.has("exploit.commix") && !ran.has("exploit.commix")) {
+    return tryInvoke(
+      "exploit.commix",
+      "Test parameterized web URLs for command injection",
+      { urls: endpoints.filter((e) => /[?&][^=]+=/.test(e.url)).slice(0, 6).map((e) => e.url), level: 2 },
+      "Coverage-first: parameterized HTTP URLs exist but commix not run yet"
+    );
+  }
+
+  if (hasSmb && server.has("exploit.crackmapexec") && !ran.has("exploit.crackmapexec")) {
+    return tryInvoke(
+      "exploit.crackmapexec",
+      "Enumerate SMB shares / auth posture",
+      { action: "shares" },
+      "Coverage-first: SMB 445 present but crackmapexec not run yet"
+    );
+  }
+
+  if (hasAuthPorts && server.has("recon.hydra") && !ran.has("recon.hydra")) {
+    return tryInvoke(
+      "recon.hydra",
+      "Brute-force open authentication services with hydra",
+      { services, stopOnFirstFind: true },
+      "Coverage-first: auth ports present but hydra not run yet"
+    );
+  }
+
+  return null;
+}
+
 type ToolDefinition = ReturnType<MCPServer["list"]>[number];
 
 function buildExploitSystemPrompt(): string {
@@ -374,30 +514,38 @@ function buildExploitSystemPrompt(): string {
     '  { "action": "stop", "reason": "<short why exploitation is complete or blocked>" }',
     "",
     "Gated exploit tools (pick based on recon findings — services, endpoints, findings, CVE hints):",
-    "  - recon.hydra: credential brute on auth services (ssh, ftp, smb, mysql, rdp, telnet, vnc, smtp…). Use when auth ports are open and creds not yet found.",
-    "  - exploit.sqlmap: SQL injection on HTTP(S) URLs with parameters (phpMyAdmin, DVWA, ?id=, login forms). Pass urls or http_targets.",
+    "  - recon.hydra: credential brute on auth services. Uses engagement wordlists from target config / HYDRA_* env — do NOT invent passlist paths. Never use SecLists router lists (e.g. 3bb_default-passwords).",
+    "  - exploit.sqlmap: SQL injection workflow on HTTP(S) URLs with parameters (phpMyAdmin, DVWA, ?id=, login forms). Modes: detect (default), search_creds (no dump), dump (requires sensitiveOk=true and explicit dump.db/table/columns).",
     "  - exploit.commix: command injection on parameterized web URLs.",
-    "  - exploit.msf_module: Metasploit module check/run when service banner/version matches a known exploit (vsFTPd 2.3.4, ProFTPd, Samba, Tomcat, PHP-CGI…). Pass module, rport, action=check then run.",
+    "  - exploit.msf_search: FIRST search Metasploit on Kali for real module paths (query=proftpd|vsftpd|samba…). Do this BEFORE exploit.msf_module if unsure of the module name.",
+    "  - exploit.msf_module: Metasploit module check/run ONLY with a module path returned by exploit.msf_search or a known exact path. Never invent module paths. action=run requires sensitiveOk=true.",
     "  - exploit.crackmapexec: SMB share enum, auth test, or spray when port 445 is open or weak creds exist.",
     "  - postex.session_recon: read-only SSH session enum AFTER valid credentials found (hydra/nxc).",
-  "  - system.tool_installer: only when recentFailures shows a missing remote CLI.",
+    "  - system.tool_installer: only when recentFailures shows a missing remote CLI.",
     "",
     "Decision guidance:",
-    "  - Web apps with query params / admin panels → exploit.sqlmap before commix.",
-    "  - vsFTPd 2.3.4 / ProFTPd / Samba / distcc banners → exploit.msf_module with matching module.",
-    "  - Open SSH/FTP/MySQL without web attack surface → recon.hydra.",
-    "  - SMB 445 + creds or anonymous access → exploit.crackmapexec.",
-    "  - After weak_credentials finding on SSH → postex.session_recon.",
-    "  - Do NOT repeat a tool already in history unless new evidence justifies it.",
-    "  - Stop when all relevant exploit paths are exhausted or step budget is low.",
+    "  - Do NOT stop after a single skipped/failed attempt. Keep trying other gated tools that still fit open services/endpoints.",
+    "  - READ recentToolOutputs for EVERY gated tool (sqlmap, commix, msf_search, msf_module, crackmapexec/nxc, hydra, postex). plainEnglish + stdoutSnippet tell you what to change.",
+    "  - Prefer pendingRecommendations (auto-built from tool output) — they already contain tweaked args or the next tool.",
+    "  - If output says raise flags / change module / try tamper / use different URLs, RE-INVOKE that tool ONCE with those tweaks, then move on.",
+    "  - For exploit.sqlmap: never waste steps on static .css/.js/.png. Prefer ?param= pages. Follow level/risk/tamper hints.",
+    "  - For exploit.msf_*: search → check → (only with sensitiveOk) run. Never invent module paths.",
+    "  - For NetExec/hydra timeouts: do not identical-retry; switch service or fix reachability.",
+    "  - Web params/admin panels → sqlmap then commix. FTP/Samba/distcc → msf_search then msf_module. Auth ports → hydra. SMB → crackmapexec. Creds on SSH → postex.",
+    "  - LHOST is Kali/attacker IP, never the target IP.",
+    "  - Do NOT blindly repeat any tool with identical args. Only repeat when recentToolOutputs/pendingRecommendations justify a tweak.",
+    "  - Stop only when remaining step budget is low AND all relevant gated paths for discovered services have been attempted or clearly blocked.",
     "",
     "Args discipline:",
-    "- exploit.sqlmap / exploit.commix: pass urls[] or http_targets[] from discoveredEndpoints.",
-    "- exploit.msf_module: module, rport, action (check|run), optional lhost for reverse shells.",
-    "- recon.hydra: services[], stopOnFirstFind.",
-    "- exploit.crackmapexec: action shares|auth|spray, username/password when known.",
+    "- exploit.sqlmap / exploit.commix: pass urls[] or http_targets[] from discoveredEndpoints (parameterized only).",
+    "- exploit.sqlmap: mode/level/risk/tamper/randomAgent; follow stdout hints for retries.",
+    "- exploit.msf_search: query string (short keyword).",
+    "- exploit.msf_module: module (exact path), rport, action (check|run), sensitiveOk (required for run). Omit lhost for check.",
+    "- recon.hydra: services[], stopOnFirstFind; omit userlist/passlist unless engagementCreds is empty — never pick 3bb/router password files.",
+    "- exploit.crackmapexec: action shares|auth|spray; uses same engagement cred/wordlist config for auth/spray.",
+    "- Never dump client data by default. Only use exploit.sqlmap mode=dump when the operator explicitly requested it and set sensitiveOk=true with narrow dump.columns + small dump.limit.",
     "",
-    "Use knownServices (product/version), discoveredEndpoints, knownFindings (titles + claimType), and history."
+    "Use knownServices (product/version), discoveredEndpoints, knownFindings, toolFacts, recentToolOutputs, pendingRecommendations, and history."
   ].join("\n");
 }
 
@@ -487,6 +635,8 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
         '  { "action": "stop", "reason": "<short why we are stopping>" }',
         "",
         "Use the tools list as the authoritative registry. Pick the single best next step from context:",
+        "  - READ recentToolOutputs (plainEnglish + stdoutSnippet) and pendingRecommendations for EVERY recon tool — if nmap timed out, gobuster found 0 paths, http_probe failed, etc., follow the suggested tweak ONCE then move on.",
+        "  - Prefer pendingRecommendations.args when present (auto-built from prior tool stdout).",
         "  - No open ports yet → usually start with recon.nmap (or recon.dns_enum if you already have enough host intel).",
         "  - Optional, low priority: for PUBLIC hostnames you may run recon.passive_dns / recon.osint before nmap to gather passive intel; these no-op without API keys, so skip them otherwise.",
         "  - After services exist → choose the most informative specialist (http_probe, ssh_enum, smb_enum, tls_check, cve_enricher, spider, waybackurls, gobuster, ffuf, etc.).",
@@ -494,15 +644,16 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
         "  - recon.nuclei (safe tags) and recon.waf_detect operate on web origins: run recon.http_probe first so HTTP seeds/discoveredEndpoints exist, then use them.",
         "  - IP targets behind CDN/WAF (Akamai, Cloudflare): run recon.nmap then recon.http_probe. TLS cert SANs on a scoped IP identify the vhost — use those hostnames in http_targets (worker connects to connectIp with Host header). Respect target scope entries only.",
         "  - If webScan.vhost is set, web tools connect to connectIp with Host/SNI for that hostname.",
-        "  - Do NOT repeat recon.tls_check or recon.waf_detect if they already appear in history unless new ports appeared.",
+        "  - Do NOT blindly repeat a tool with identical args. Only repeat when recentToolOutputs/pendingRecommendations justify a tweak (e.g. nmap deep timed out → retry profile=fast).",
         "  - Do NOT invoke recon.hydra, exploit.*, or postex.session_recon during recon — the operator starts a separate exploit phase after recon succeeds.",
         "  - Follow tool `requires` hints; do not invoke a tool whose preconditions are clearly unmet.",
         "  - Prefer system.tool_installer only when a prior failure indicated a missing remote CLI (recentFailures.missingTool) — the orchestrator may force-install before you run again.",
         "",
         "Downstream: a prompter turns your intentGoal into prose; an execution-writer LLM fills JSON `args` per the tool's argSchema (not raw shell — the worker maps args → CLI safely).",
-        "You never see raw tool stdout. Use `knownFindings`, `discoveredEndpoints` (truncated sample), `discoveredEndpointCount`, and `history` as summaries.",
+        "You see tool summaries via knownFindings, discoveredEndpoints, history, recentToolOutputs, and pendingRecommendations (not the full live log stream).",
         "",
         "Args discipline:",
+        "- recon.nmap: profile fast|targeted|deep|full; if deep/full times out, retry fast.",
         "- recon.http_probe: prefer `services` (from nmap) and/or explicit `urls`; optional `ports` when using context fallback.",
         "- recon.spider: pass `http_targets` (array of seed URLs on the target host) and/or `url`.",
         "- recon.gobuster: pass `url` and/or `http_targets` (base URLs on the target host, e.g. http://TARGET:80/). Optional `targetUrl` without FUZZ is treated like `url`; do not use placeholder/example IPs.",
@@ -511,7 +662,7 @@ async function tryLlmDecision(server: MCPServer, ctx: ManagerContext, signal?: A
         "Rules:",
         "- Choose exactly one tool per step (no batching).",
         "- Stop when diminishing returns, budget is low, or nothing safe remains.",
-        "- Use history to avoid useless repeats unless a retry is justified (e.g. after install or new evidence)."
+        "- Use history + recentToolOutputs to avoid useless identical repeats; allow one tweaked retry when output asks for it."
       ].join("\n");
 
   const attempts: Array<{ mode: ManagerPayloadMode; temp: number; maxTokens: number }> = [
@@ -695,9 +846,12 @@ function buildManagerUserPayload(server: MCPServer, ctx: ManagerContext, mode: M
       discoveredEndpointCount: epAll.length,
       pendingRecommendations: ctx.pendingRecommendations.slice(0, 10),
       knownFindingsSample: findingsPayload.slice(-8),
+      toolFacts: (ctx.toolFacts ?? []).slice(-12),
+      recentToolOutputs: (ctx.recentToolOutputs ?? []).slice(-4),
       history: historyForPlanner,
       recentFailures: (ctx.recentFailures ?? []).slice(-3),
       runHints: isExploit ? null : ctx.runHints ?? null,
+      engagementCreds: ctx.engagementCreds ?? null,
       webScan: ctx.webScan
     };
   }
@@ -721,9 +875,12 @@ function buildManagerUserPayload(server: MCPServer, ctx: ManagerContext, mode: M
     pendingVerifications: (ctx.pendingVerifications ?? []).slice(-10),
     pendingRecommendations: ctx.pendingRecommendations.slice(0, 12),
     knownFindings: findingsPayload,
+    toolFacts: (ctx.toolFacts ?? []).slice(-20),
+    recentToolOutputs: (ctx.recentToolOutputs ?? []).slice(-6),
     history: historyForPlanner,
     recentFailures: (ctx.recentFailures ?? []).slice(-5),
     runHints: ctx.runHints ?? null,
+    engagementCreds: ctx.engagementCreds ?? null,
     webScan: ctx.webScan,
     knownDomains: (ctx.knownDomains ?? []).slice(0, 15)
   };

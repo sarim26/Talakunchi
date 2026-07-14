@@ -31,6 +31,10 @@ export const TargetSchema = z.object({
   scope: z.array(z.string()).default([]),
   tags: z.array(z.string()),
   owner: z.string().nullable().optional(),
+  hydraUserlist: z.string().nullable().optional(),
+  hydraPasslist: z.string().nullable().optional(),
+  hydraUsername: z.string().nullable().optional(),
+  hydraPassword: z.string().nullable().optional(),
   createdAt: z.string().or(z.date())
 });
 export type Target = z.infer<typeof TargetSchema>;
@@ -183,6 +187,10 @@ export async function createTarget(input: {
   scope?: string[];
   tags?: string[];
   owner?: string;
+  hydraUserlist?: string;
+  hydraPasslist?: string;
+  hydraUsername?: string;
+  hydraPassword?: string;
 }) {
   return http("/api/targets", { method: "POST", body: JSON.stringify(input) }, TargetSchema);
 }
@@ -424,12 +432,13 @@ export async function startAgentRun(input: {
   targetId: string;
   maxSteps?: number;
   notes?: string;
+  phase?: "recon" | "exploit";
   initialNmap?: { profile?: "fast" | "targeted" | "deep" | "full"; ports?: number[]; extraArgs?: string };
 }) {
   return http(
     "/api/agent-runs",
     { method: "POST", body: JSON.stringify(input) },
-    z.object({ id: z.string().uuid(), status: z.string() })
+    z.object({ id: z.string().uuid(), status: z.string(), phase: z.enum(["recon", "exploit"]).optional() })
   );
 }
 
@@ -448,6 +457,22 @@ export async function cancelAgentRun(id: string) {
 export async function startExploitPhase(id: string, maxSteps = 8) {
   return http(
     `/api/agent-runs/${id}/start-exploit`,
+    { method: "POST", body: JSON.stringify({ maxSteps }) },
+    z.object({ id: z.string().uuid(), status: z.string(), phase: z.literal("exploit") })
+  );
+}
+
+export async function restartReconPhase(id: string, maxSteps = 20) {
+  return http(
+    `/api/agent-runs/${id}/restart-recon`,
+    { method: "POST", body: JSON.stringify({ maxSteps }) },
+    z.object({ id: z.string().uuid(), status: z.string(), phase: z.literal("recon") })
+  );
+}
+
+export async function restartExploitPhase(id: string, maxSteps = 8) {
+  return http(
+    `/api/agent-runs/${id}/restart-exploit`,
     { method: "POST", body: JSON.stringify({ maxSteps }) },
     z.object({ id: z.string().uuid(), status: z.string(), phase: z.literal("exploit") })
   );

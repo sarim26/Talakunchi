@@ -49,16 +49,74 @@ export const nmapTool: ToolDefinition = {
     emit.log(`Starting nmap (${profile}) on ${input.target.host}`);
 
     const r = await remoteRun("nmap", baseArgs, input.signal, (s) => emit.log(s));
+    if (r.aborted) {
+      const lighter = profile === "full" || profile === "deep" ? "fast" : "targeted";
+      return {
+        status: "failed",
+        error: `nmap ${profile} timed out before finishing. Retry with profile=${lighter}.`,
+        artifacts: { commands: [r.command], stdoutSnippet: snippet(r.stdout), stderrSnippet: snippet(r.stderr) },
+        facts: [
+          {
+            type: "nmap_summary",
+            value: {
+              plainEnglish: `nmap ${profile} timed out. Next: run recon.nmap with profile=${lighter}.`,
+              profile,
+              suggestedProfile: lighter
+            },
+            source: "nmap"
+          }
+        ],
+        findings: [],
+        recommendations: [
+          {
+            agent: "recon.nmap",
+            reason: `Previous ${profile} scan timed out — retry lighter profile`,
+            priority: 92,
+            args: { profile: lighter }
+          }
+        ],
+        meta: {
+          exitCode: r.exitCode,
+          profile,
+          aborted: true,
+          outputHints: [
+            {
+              plainEnglish: `nmap ${profile} timed out. Retry profile=${lighter}.`,
+              suggestedArgs: { profile: lighter }
+            }
+          ]
+        },
+        durationMs: r.durationMs
+      };
+    }
+
     const parsed = parseNmapXml(r.stdout, input.target.host);
     if (!parsed) {
       return {
         status: "failed",
-        error: "Failed to parse nmap XML output",
+        error: "Failed to parse nmap XML output (often incomplete/timeout). Retry with profile=fast.",
         artifacts: { commands: [r.command], stdoutSnippet: snippet(r.stdout), stderrSnippet: snippet(r.stderr) },
-        facts: [],
+        facts: [
+          {
+            type: "nmap_summary",
+            value: { plainEnglish: "nmap XML parse failed. Retry recon.nmap with profile=fast.", profile },
+            source: "nmap"
+          }
+        ],
         findings: [],
-        recommendations: [],
-        meta: { exitCode: r.exitCode, profile },
+        recommendations: [
+          {
+            agent: "recon.nmap",
+            reason: "Parse failed — retry fast profile",
+            priority: 90,
+            args: { profile: "fast" }
+          }
+        ],
+        meta: {
+          exitCode: r.exitCode,
+          profile,
+          outputHints: [{ plainEnglish: "nmap parse failed — retry profile=fast", suggestedArgs: { profile: "fast" } }]
+        },
         durationMs: r.durationMs
       };
     }
@@ -76,6 +134,44 @@ export const nmapTool: ToolDefinition = {
 
     for (const svc of openServices) emit.fact({ type: "service", value: svc, source: "nmap" });
 
+    if (openServices.length === 0) {
+      return {
+        status: "succeeded",
+        durationMs: r.durationMs,
+        artifacts: { commands: [r.command], stdoutSnippet: snippet(r.stdout), stderrSnippet: snippet(r.stderr) },
+        facts: [
+          {
+            type: "nmap_summary",
+            value: {
+              plainEnglish: `nmap ${profile}: no open ports reported (host ${parsed.status}). Verify reachability from Kali, or retry profile=fast.`,
+              profile,
+              hostStatus: parsed.status
+            },
+            source: "nmap"
+          }
+        ],
+        findings: [],
+        recommendations:
+          profile !== "fast"
+            ? [
+                {
+                  agent: "recon.nmap",
+                  reason: "No open ports — retry once with fast profile if reachability is unclear",
+                  priority: 80,
+                  args: { profile: "fast" }
+                }
+              ]
+            : [],
+        meta: {
+          exitCode: r.exitCode,
+          profile,
+          serviceCount: 0,
+          hostStatus: parsed.status,
+          commandSummary: `Scan ${input.target.host} for open ports and service banners using nmap (${profile} profile).`
+        }
+      };
+    }
+
     return {
       status: "succeeded",
       durationMs: r.durationMs,
@@ -87,11 +183,7 @@ export const nmapTool: ToolDefinition = {
         port: svc.port,
         protocol: svc.protocol,
         evidence: `Detected ${svc.name || "service"}${svc.product ? ` ${svc.product}` : ""}${svc.version ? ` ${svc.version}` : ""} on ${input.target.host}:${svc.port}/${svc.protocol}`,
-        // Stable, normalised claim key so other tools (httpx, tls_check, etc.)
-        // can corroborate the same open-port claim via verifiesFingerprint.
         fingerprint: `open-port|${input.target.host}|${svc.protocol}|${svc.port}`,
-        // A single-tool open-port claim should be corroborated before we
-        // treat it as confirmed (Situation 1).
         confidence: "medium",
         requiresVerification: true,
         claimType: "open_port"

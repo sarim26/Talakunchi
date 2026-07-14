@@ -154,13 +154,21 @@ async function discoverCatalog(signal?: AbortSignal): Promise<WordlistCatalog> {
   }
 
   const pickDefault = (cat: WordlistCategory, regex?: RegExp) => {
-    const list = byCategory[cat];
+    const list = byCategory[cat].filter((e) => {
+      if (cat !== "passwords") return true;
+      const p = e.path.replace(/\\/g, "/").toLowerCase();
+      // Never default to tiny vendor/router lists (LLM + size-sort loved 3bb).
+      if (/3bb_default|\/routers\//.test(p)) return false;
+      return true;
+    });
     if (!list.length) return null;
     if (regex) {
       const match = list.find((e) => regex.test(e.relPath));
       if (match) return match.path;
     }
-    return list[0].path;
+    // Prefer mid-size common lists over the absolute smallest file.
+    const preferred = list.find((e) => e.sizeBytes >= 500 && e.sizeBytes <= 2_000_000);
+    return (preferred ?? list[0]).path;
   };
 
   return {
@@ -171,7 +179,12 @@ async function discoverCatalog(signal?: AbortSignal): Promise<WordlistCatalog> {
     defaults: {
       webContent: pickDefault("discovery-web-content", /common\.txt$/i) ?? pickDefault("discovery-web-content"),
       dnsSubdomains: pickDefault("discovery-dns", /subdomains-top1million-5000\.txt$/i) ?? pickDefault("discovery-dns"),
-      passwords: pickDefault("passwords", /10-million.*-top-?(?:1000|10000)\.txt$/i) ?? pickDefault("passwords"),
+      passwords:
+        pickDefault("passwords", /10-million.*-top-1000\.txt$/i) ??
+        pickDefault("passwords", /10-million.*-top-10000\.txt$/i) ??
+        pickDefault("passwords", /best1050/i) ??
+        pickDefault("passwords", /common-credentials/i) ??
+        pickDefault("passwords"),
       usernames: pickDefault("usernames", /top-?usernames-shortlist|cirt-default-usernames/i) ?? pickDefault("usernames")
     }
   };
@@ -210,7 +223,12 @@ export function isWordlistAllowed(catalog: WordlistCatalog, candidate: string | 
  * burning the context window. We hand it ~15 paths per category max.
  */
 export function summariseCatalogForLLM(catalog: WordlistCatalog) {
-  const cap = (list: WordlistEntry[], n = 15) => list.slice(0, n).map((e) => ({ path: e.path, label: e.label, sizeBytes: e.sizeBytes }));
+  const notJunkPass = (e: WordlistEntry) => {
+    const p = e.path.replace(/\\/g, "/").toLowerCase();
+    return !/3bb_default|\/routers\//.test(p);
+  };
+  const cap = (list: WordlistEntry[], n = 15) =>
+    list.slice(0, n).map((e) => ({ path: e.path, label: e.label, sizeBytes: e.sizeBytes }));
   return {
     root: catalog.root,
     rootExists: catalog.rootExists,
@@ -218,7 +236,8 @@ export function summariseCatalogForLLM(catalog: WordlistCatalog) {
     categories: {
       webContent: cap(catalog.byCategory["discovery-web-content"]),
       dnsSubdomains: cap(catalog.byCategory["discovery-dns"]),
-      passwords: cap(catalog.byCategory.passwords),
+      // Exclude tiny router/vendor lists — size-sort put 3bb first and the LLM copied it.
+      passwords: cap(catalog.byCategory.passwords.filter(notJunkPass)),
       usernames: cap(catalog.byCategory.usernames),
       fuzzing: cap(catalog.byCategory.fuzzing)
     }

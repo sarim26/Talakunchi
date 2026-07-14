@@ -15,6 +15,12 @@ function buildSshArgv(program: string, programArgs: string[]): { exe: string; ar
     `StrictHostKeyChecking=${env.REMOTE_SSH_STRICT_HOST_KEY_CHECKING}`,
     "-o",
     "UserKnownHostsFile=/tmp/talakunchi_worker_known_hosts",
+    "-o",
+    "ConnectTimeout=12",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=2",
     "-p",
     String(env.REMOTE_SSH_PORT)
   ];

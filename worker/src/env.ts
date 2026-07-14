@@ -50,7 +50,9 @@ const EnvSchema = z.object({
    */
   RECON_MODE: z.enum(["readonly", "gated_exploit"]).default("readonly"),
   /** Max time a gated tool waits for a command approval before skipping. */
-  APPROVAL_WAIT_MS: z.coerce.number().int().nonnegative().default(120_000),
+  APPROVAL_WAIT_MS: z.coerce.number().int().nonnegative().default(600_000),
+  /** Auto-approve gated tools marked impact=low (e.g. read-only msf module search). */
+  APPROVAL_AUTO_APPROVE_LOW_IMPACT: z.coerce.boolean().default(true),
   /** Allowlist (comma/space separated) of exploit command prefixes permitted in gated mode. */
   EXPLOIT_COMMAND_ALLOWLIST: z.string().optional().default(""),
   /** Allowlist of LHOST values usable by exploit/post-ex handlers. */
@@ -79,6 +81,11 @@ const EnvSchema = z.object({
   HYDRA_PASSLIST: z.string().optional(),
   HYDRA_STOP_ON_FIRST_FIND: z.coerce.boolean().default(false),
   HYDRA_THREADS: z.coerce.number().optional(),
+  /**
+   * Extra absolute directories on the Kali tools host where engagement/client
+   * wordlists live (comma/newline separated). Example: /home/kali/engagements,/opt/wordlists
+   */
+  WORDLISTS_EXTRA_ROOTS: z.string().optional().default(""),
 
   /** Gated exploit tool toggles (only active when RECON_MODE=gated_exploit). */
   SQLMAP_ENABLED: z.coerce.boolean().default(true),

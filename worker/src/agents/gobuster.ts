@@ -63,7 +63,7 @@ export const gobusterTool: ToolDefinition = {
     const args = (input.args ?? {}) as GobusterArgs;
     const webScan = resolveWebScanFromInput(input.target.host, input.target.vhost, input.context?.webScan);
     const vhostPolicy = vhostAcceptPolicyFromInput(input.target.host, input, webScan.cdnDetected);
-    const bases = collectGobusterBaseUrls(args, input.target.host, webScan.vhost, vhostPolicy).map((u) =>
+    let bases = collectGobusterBaseUrls(args, input.target.host, webScan.vhost, vhostPolicy).map((u) =>
       applyBasePath(connectIpUrl(normalizeHttpUrl(u), webScan), args.basePath)
     );
 
@@ -78,6 +78,19 @@ export const gobusterTool: ToolDefinition = {
         recommendations: [{ agent: "recon.http_probe", reason: "Resolve vhost from TLS cert before directory brute-force", priority: 90 }],
         meta: { webScan }
       };
+    }
+
+    // If the LLM passed a bad URL (e.g. 10.10.10.10), fall back to open HTTP ports.
+    if (bases.length === 0) {
+      const httpPorts = (input.context?.knownServices ?? [])
+        .filter((s) => /http|www|https/i.test(s.name ?? "") || [80, 443, 8080, 8000, 8443].includes(s.port))
+        .map((s) => s.port);
+      const ports = httpPorts.length ? [...new Set(httpPorts)] : [80];
+      for (const p of ports) {
+        const scheme = p === 443 || p === 8443 ? "https" : "http";
+        bases.push(connectIpUrl(`${scheme}://${input.target.host}:${p}/`, webScan));
+      }
+      emit.log(`[gobuster] no valid url args — falling back to ${bases.join(", ")}`);
     }
 
     if (bases.length === 0) {
@@ -289,8 +302,24 @@ function tryAddBaseUrl(
   out: string[]
 ): void {
   if (!raw || typeof raw !== "string") return;
-  const candidate = fuzzToBaseUrl(raw);
+  let candidate = fuzzToBaseUrl(raw);
   if (!candidate) return;
+  try {
+    const u = new URL(candidate);
+    const h = u.hostname.toLowerCase();
+    // LLM often invents lab placeholders (10.10.10.10) — rewrite to engagement host.
+    if (
+      !hostAllowed(u.hostname, targetHost, vhost, policy) &&
+      /^(10\.10\.10\.10|10\.0\.0\.1|192\.168\.[01]\.1|127\.0\.0\.1|localhost|example\.(com|org)|target|victim)$/i.test(
+        h
+      )
+    ) {
+      u.hostname = targetHost;
+      candidate = u.toString();
+    }
+  } catch {
+    return;
+  }
   try {
     const u = new URL(candidate);
     if (!hostAllowed(u.hostname, targetHost, vhost, policy)) return;

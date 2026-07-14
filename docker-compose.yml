@@ -75,7 +75,8 @@ services:
       AGENT_SCOPE: "${AGENT_SCOPE:-}"
       # Recon policy: readonly (default) or gated_exploit (exposes recon.hydra + exploit jobs behind approvals).
       RECON_MODE: "${RECON_MODE:-readonly}"
-      APPROVAL_WAIT_MS: "${APPROVAL_WAIT_MS:-120000}"
+      APPROVAL_WAIT_MS: "${APPROVAL_WAIT_MS:-600000}"
+      APPROVAL_AUTO_APPROVE_LOW_IMPACT: "${APPROVAL_AUTO_APPROVE_LOW_IMPACT:-true}"
       EXPLOIT_COMMAND_ALLOWLIST: "${EXPLOIT_COMMAND_ALLOWLIST:-}"
       EXPLOIT_LHOST_ALLOWLIST: "${EXPLOIT_LHOST_ALLOWLIST:-}"
       # Optional online CVE enrichment + OSINT connector keys (all optional).
@@ -88,8 +89,9 @@ services:
       # Optional deterministic credential checks during scan stage (legacy hydra path)
       HYDRA_ENABLED: "${HYDRA_ENABLED:-false}"
       # Hydra runs on the SSH host; these paths must exist there (container /wordlists mount is optional).
-      HYDRA_USERLIST: "${HYDRA_USERLIST:-/home/kali/Desktop/SecLists/Usernames/top-usernames-shortlist.txt}"
-      HYDRA_PASSLIST: "${HYDRA_PASSLIST:-/home/kali/Desktop/SecLists/Passwords/Common-Credentials/10-million-password-list-top-10000.txt}"
+      HYDRA_USERLIST: "${HYDRA_USERLIST:-}"
+      HYDRA_PASSLIST: "${HYDRA_PASSLIST:-}"
+      WORDLISTS_EXTRA_ROOTS: "${WORDLISTS_EXTRA_ROOTS:-/home/kali/engagements}"
       HYDRA_THREADS: "${HYDRA_THREADS:-10}"
       HYDRA_STOP_ON_FIRST_FIND: "${HYDRA_STOP_ON_FIRST_FIND:-false}"
       SQLMAP_ENABLED: "${SQLMAP_ENABLED:-true}"

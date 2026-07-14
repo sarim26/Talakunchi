@@ -8,7 +8,12 @@ export const CreateTargetSchema = z.object({
   /** IPs, CIDRs, and/or hostnames in scope for this target (per-engagement). */
   scope: z.array(z.string()).optional().default([]),
   tags: z.array(z.string()).optional().default([]),
-  owner: z.string().optional()
+  owner: z.string().optional(),
+  /** Absolute paths on Kali tools host — per-client engagement wordlists. */
+  hydraUserlist: z.string().min(1).optional(),
+  hydraPasslist: z.string().min(1).optional(),
+  hydraUsername: z.string().min(1).optional(),
+  hydraPassword: z.string().min(1).optional()
 });
 
 export const CreateScanSchema = z.object({

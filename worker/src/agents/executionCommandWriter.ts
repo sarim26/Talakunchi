@@ -22,6 +22,7 @@ import { env } from "../env.js";
 import { chatJSON } from "../llm/ollama.js";
 import type { TargetCtx, ToolDefinition, ToolFinding } from "../mcp/types.js";
 import { isWordlistAllowed, type WordlistCatalog } from "./wordlists.js";
+import { isAllowedWordlistPath, isJunkPasswordWordlist } from "../credSource.js";
 import { acceptVhostCandidate, hostnameMatchesScopeEntry, isIpAddress, isScopedIpEngagement, normHost, type WebScanHints, vhostAcceptPolicyFromInput } from "./webTarget.js";
 
 export type ExecutionWriterContext = {
@@ -80,8 +81,9 @@ const DraftSchema = z.object({
 });
 
 /**
- * Merge writer-drafted args with manager-provided args. Manager wins on
- * conflict so explicit decisions higher up the stack are never overridden.
+ * Merge writer-drafted args with manager-provided args.
+ * Manager wins on conflict — but only after both sides are sanitized
+ * (so placeholder hosts like 10.10.10.10 cannot survive from the manager).
  */
 function mergeArgs(
   managerArgs: Record<string, unknown> | undefined,
@@ -96,6 +98,34 @@ function mergeArgs(
     touched = true;
   }
   return { merged: base, source: touched ? "merged" : "manager" };
+}
+
+/** Rewrite obvious LLM placeholder hosts to the engagement target. */
+function rewritePlaceholderHost(urlStr: string, targetHost: string): string | null {
+  try {
+    const u = new URL(urlStr.trim());
+    const h = u.hostname.toLowerCase();
+    const placeholders = new Set([
+      "10.10.10.10",
+      "10.0.0.1",
+      "192.168.0.1",
+      "192.168.1.1",
+      "127.0.0.1",
+      "localhost",
+      "example.com",
+      "example.org",
+      "target",
+      "victim",
+      "host"
+    ]);
+    if (placeholders.has(h) || /^xxx+\./i.test(h)) {
+      u.hostname = targetHost;
+      return u.href;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -122,8 +152,10 @@ function sanitizeDraft(
       const ok: string[] = [];
       for (const item of v) {
         if (typeof item !== "string") continue;
+        const rewritten = rewritePlaceholderHost(item, ctx.target.host);
+        const candidate = rewritten ?? item.trim();
         try {
-          const u = new URL(item.trim());
+          const u = new URL(candidate);
           if (!urlHostAllowed(u.hostname, ctx)) {
             dropped.push(`http_targets item (host ${u.hostname} != target ${ctx.target.host})`);
             continue;
@@ -144,8 +176,10 @@ function sanitizeDraft(
         const t = item.trim();
         if (!t) continue;
         if (/^https?:\/\//i.test(t)) {
+          const rewritten = rewritePlaceholderHost(t, ctx.target.host);
+          const candidate = rewritten ?? t;
           try {
-            const u = new URL(t);
+            const u = new URL(candidate);
             if (!urlHostAllowed(u.hostname, ctx)) {
               dropped.push(`urls item (host ${u.hostname} != target ${ctx.target.host})`);
               continue;
@@ -166,6 +200,26 @@ function sanitizeDraft(
       if (ok.length) cleaned[k] = ok;
       continue;
     }
+    if ((k === "url" || k === "targetUrl") && typeof v === "string") {
+      const rewritten = rewritePlaceholderHost(v, ctx.target.host);
+      const candidate = rewritten ?? v.trim();
+      try {
+        const u = new URL(candidate);
+        if (!urlHostAllowed(u.hostname, ctx)) {
+          dropped.push(`${k} (host ${u.hostname} != target ${ctx.target.host})`);
+          continue;
+        }
+        if (u.protocol !== "http:" && u.protocol !== "https:") {
+          dropped.push(`${k} (non-http URL)`);
+          continue;
+        }
+        cleaned[k] = u.href;
+        if (rewritten) dropped.push(`${k} (rewrote placeholder host → ${ctx.target.host})`);
+      } catch {
+        dropped.push(`${k} (invalid URL)`);
+      }
+      continue;
+    }
     if (k === "services" && Array.isArray(v)) {
       const out: Record<string, unknown>[] = [];
       for (const item of v) {
@@ -184,21 +238,15 @@ function sanitizeDraft(
       if (out.length) cleaned[k] = out;
       continue;
     }
-    if ((k === "url" || k === "targetUrl") && typeof v === "string") {
-      try {
-        const u = new URL(v.replace(/FUZZ/g, "x"));
-        if (!urlHostAllowed(u.hostname, ctx)) {
-          dropped.push(`${k} (host ${u.hostname} != target ${ctx.target.host})`);
-          continue;
-        }
-      } catch {
-        dropped.push(`${k} (invalid URL)`);
+    if ((k === "wordlist" || k === "userlist" || k === "passlist") && typeof v === "string") {
+      const ok =
+        (ctx.wordlistCatalog && isWordlistAllowed(ctx.wordlistCatalog, v)) || isAllowedWordlistPath(v);
+      if (!ok) {
+        dropped.push(`${k} (not under allowed wordlist roots)`);
         continue;
       }
-    }
-    if (k === "wordlist" && typeof v === "string" && ctx.wordlistCatalog) {
-      if (!isWordlistAllowed(ctx.wordlistCatalog, v)) {
-        dropped.push(`wordlist (not in SecLists catalog)`);
+      if ((k === "passlist" || k === "wordlist") && isJunkPasswordWordlist(v)) {
+        dropped.push(`${k} (vendor/router junk list — e.g. 3bb)`);
         continue;
       }
     }
@@ -242,7 +290,8 @@ export async function draftExecutionPayload(input: ExecutionWriterInput): Promis
     context.webScan?.vhost
       ? `- CDN/vhost mode: URLs may also use the resolved vhost hostname (${context.webScan.vhost}). Tools connect to ${context.webScan.connectIp ?? context.target.host} with Host: ${context.webScan.vhost}.`
       : "",
-    "- If a wordlist is needed, choose an absolute path from the provided SecLists catalog.",
+    "- If a wordlist is needed, use an absolute path from the SecLists catalog or from engagement wordlist roots on Kali.",
+    "- For recon.hydra / exploit.crackmapexec: omit userlist/passlist when engagementCreds or env lists exist. Never use SecLists router defaults (3bb_default-passwords, Default-Credentials/Routers/*).",
     "- Do not invent unknown keys. Omit fields you are unsure about (defaults will apply).",
     "- Do not include a 'tool' or 'name' field; just args.",
     "",
@@ -275,13 +324,16 @@ export async function draftExecutionPayload(input: ExecutionWriterInput): Promis
     2
   );
 
-  const fallback = (diag: string): ExecutionWriterResult => ({
-    finalArgs: { ...(managerArgs ?? {}) },
-    draftArgs: {},
-    source: "manager",
-    diag,
-    modelUsed: model
-  });
+  const fallback = (diag: string): ExecutionWriterResult => {
+    const { cleaned, dropped } = sanitizeDraft(tool, managerArgs ?? {}, context);
+    return {
+      finalArgs: cleaned,
+      draftArgs: {},
+      source: "manager",
+      diag: dropped.length ? `${diag}; sanitized manager: ${dropped.join("; ")}` : diag,
+      modelUsed: model
+    };
+  };
 
   let raw = "";
   try {
@@ -304,12 +356,14 @@ export async function draftExecutionPayload(input: ExecutionWriterInput): Promis
       const msg = parsed.error.errors.slice(0, 4).map((e) => `${e.path.join(".")}: ${e.message}`).join("; ");
       return fallback(`Schema mismatch: ${msg}`);
     }
-    const { cleaned, dropped } = sanitizeDraft(tool, parsed.data.args, context);
-    const { merged, source } = mergeArgs(managerArgs, cleaned);
+    const draftSan = sanitizeDraft(tool, parsed.data.args, context);
+    const mgrSan = sanitizeDraft(tool, managerArgs ?? {}, context);
+    const { merged, source } = mergeArgs(mgrSan.cleaned, draftSan.cleaned);
+    const dropped = [...mgrSan.dropped, ...draftSan.dropped];
     return {
       finalArgs: merged,
       draftArgs: parsed.data.args,
-      source: source === "manager" && Object.keys(cleaned).length > 0 ? "merged" : source,
+      source: source === "manager" && Object.keys(draftSan.cleaned).length > 0 ? "merged" : source,
       diag: dropped.length > 0 ? `Dropped: ${dropped.join("; ")}` : undefined,
       modelUsed: model
     };

@@ -124,26 +124,104 @@ export function safeNumber(v: unknown, fallback = 0): number {
  */
 export type ToolPresenceCheck =
   | { missing: false }
-  | { missing: true; envelope: ToolEnvelope };
+  | { missing: true; envelope: ToolEnvelope }
+  /** SSH/presence probe failed — do NOT treat as "install missing package". */
+  | { missing: true; checkFailed: true; envelope: ToolEnvelope };
 
 /**
- * Check whether a CLI binary is installed on the remote tools host. This is the
- * preflight every specialist runs before invoking a heavy command — if the tool
- * is missing, the orchestrator queues `system.tool_installer` and retries.
+ * Check whether a CLI binary is installed on the remote tools host.
+ * Distinguishes true "not installed" from SSH flakes / timeouts so we don't
+ * burn steps apt-installing nmap that already ran successfully this session.
  */
 export async function requireRemoteTool(
   toolName: string,
   signal?: AbortSignal,
-  opts?: { installCommand?: string }
+  opts?: { installCommand?: string; knownPresent?: string[] }
 ): Promise<ToolPresenceCheck> {
   const safe = toolName.replace(/[^a-zA-Z0-9_.\-]/g, "");
   if (!safe) {
     return { missing: true, envelope: missingToolEnvelope(toolName, "Invalid tool name") };
   }
-  const script = `if command -v ${safe} >/dev/null 2>&1; then echo PRESENT; else echo MISSING; fi`;
-  const r = await remoteScript(script, signal);
-  if (/PRESENT/.test(r.stdout)) return { missing: false };
-  return { missing: true, envelope: missingToolEnvelope(toolName, undefined, opts?.installCommand) };
+
+  if (opts?.knownPresent?.some((t) => t === safe || t.endsWith(`/${safe}`))) {
+    return { missing: false };
+  }
+
+  // Short wall-clock for presence only — never inherit a 6–25 min tool timeout.
+  const ac = new AbortController();
+  const tid = setTimeout(() => ac.abort(), 20_000);
+  const onParentAbort = () => ac.abort();
+  if (signal) {
+    if (signal.aborted) ac.abort();
+    else signal.addEventListener("abort", onParentAbort, { once: true });
+  }
+
+  try {
+    // Login-ish PATH + common locations; match PRESENT anywhere (stdout/stderr).
+    const script = [
+      "set +e",
+      "export PATH=\"$PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/go/bin:$HOME/.local/bin\"",
+      `if command -v ${safe} >/dev/null 2>&1 || [ -x "/usr/bin/${safe}" ] || [ -x "/usr/local/bin/${safe}" ]; then`,
+      `  echo TK_TOOL_PRESENT=${safe}`,
+      "else",
+      `  echo TK_TOOL_MISSING=${safe}`,
+      "fi"
+    ].join("\n");
+
+    const r = await remoteScript(script, ac.signal);
+    const blob = `${r.stdout}\n${r.stderr}`;
+
+    if (r.aborted || ac.signal.aborted) {
+      return {
+        missing: true,
+        checkFailed: true,
+        envelope: presenceCheckFailedEnvelope(toolName, "SSH/presence check timed out or aborted")
+      };
+    }
+
+    if (blob.includes(`TK_TOOL_PRESENT=${safe}`)) return { missing: false };
+
+    if (blob.includes(`TK_TOOL_MISSING=${safe}`)) {
+      return { missing: true, envelope: missingToolEnvelope(toolName, undefined, opts?.installCommand) };
+    }
+
+    // Empty/garbage output = transport problem, not a missing package.
+    return {
+      missing: true,
+      checkFailed: true,
+      envelope: presenceCheckFailedEnvelope(
+        toolName,
+        `SSH presence check returned no clear result (exit=${r.exitCode ?? "?"}). Not treating as missing.`
+      )
+    };
+  } catch (e) {
+    return {
+      missing: true,
+      checkFailed: true,
+      envelope: presenceCheckFailedEnvelope(toolName, (e as Error).message ?? String(e))
+    };
+  } finally {
+    clearTimeout(tid);
+    signal?.removeEventListener("abort", onParentAbort);
+  }
+}
+
+export function presenceCheckFailedEnvelope(toolName: string, reason: string): ToolEnvelope {
+  return {
+    status: "failed",
+    error: `Could not verify '${toolName}' on remote host (${reason}). SSH may be flaky — retry the specialist; do not apt-install if it already worked this run.`,
+    facts: [],
+    findings: [],
+    recommendations: [
+      {
+        agent: toolName.startsWith("recon.") || toolName.startsWith("exploit.") ? toolName : "recon.nmap",
+        reason: `Presence check failed for ${toolName} — retry after SSH settles`,
+        priority: 70
+      }
+    ],
+    artifacts: { commands: [`command -v ${toolName}`] },
+    meta: { presenceCheckFailed: true, tool: toolName }
+  };
 }
 
 /**

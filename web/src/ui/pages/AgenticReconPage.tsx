@@ -39,6 +39,8 @@ import {
   listAgentRuns,
   listAgentTools,
   listTargets,
+  restartExploitPhase,
+  restartReconPhase,
   startAgentRun,
   startExploitPhase
 } from "../../lib/api";
@@ -88,6 +90,13 @@ export function AgenticReconPage() {
     refetchInterval: 3000
   });
 
+  const targetHasCompletedRecon = React.useMemo(() => {
+    if (!targetId) return false;
+    return (runsQ.data ?? []).some(
+      (r) => r.targetId === targetId && r.status === "succeeded" && r.phase === "recon"
+    );
+  }, [targetId, runsQ.data]);
+
   const startM = useMutation({
     mutationFn: () =>
       startAgentRun({
@@ -105,6 +114,21 @@ export function AgenticReconPage() {
               : undefined,
           extraArgs: initialNmapExtraArgs.trim() || undefined
         }
+      }),
+    onSuccess: async (created) => {
+      setSelectedRunId(created.id);
+      setNotes("");
+      await qc.invalidateQueries({ queryKey: ["agent-runs"] });
+    }
+  });
+
+  const exploitOnlyM = useMutation({
+    mutationFn: () =>
+      startAgentRun({
+        targetId,
+        maxSteps: Math.min(maxSteps, 30) || 8,
+        notes: notes.trim() || undefined,
+        phase: "exploit"
       }),
     onSuccess: async (created) => {
       setSelectedRunId(created.id);
@@ -207,13 +231,31 @@ export function AgenticReconPage() {
                 />
                 <Button
                   variant="contained"
-                  disabled={!targetId || startM.isPending}
+                  disabled={!targetId || startM.isPending || exploitOnlyM.isPending}
                   onClick={() => startM.mutate()}
                 >
-                  {startM.isPending ? "Queueing…" : "Start Agentic Recon"}
+                  {startM.isPending ? "Queueing…" : "Start recon scan"}
                 </Button>
+                {targetHasCompletedRecon ? (
+                  <Tooltip title="Skip recon and run gated exploit tools using services/findings already discovered for this target.">
+                    <span>
+                      <Button
+                        variant="outlined"
+                        color="warning"
+                        fullWidth
+                        disabled={!targetId || startM.isPending || exploitOnlyM.isPending}
+                        onClick={() => exploitOnlyM.mutate()}
+                      >
+                        {exploitOnlyM.isPending ? "Queueing…" : "Exploit only (skip recon)"}
+                      </Button>
+                    </span>
+                  </Tooltip>
+                ) : null}
                 {startM.isError ? (
                   <Alert severity="error">{(startM.error as Error)?.message ?? "Failed to start"}</Alert>
+                ) : null}
+                {exploitOnlyM.isError ? (
+                  <Alert severity="error">{(exploitOnlyM.error as Error)?.message ?? "Failed to start exploit"}</Alert>
                 ) : null}
               </Stack>
             </CardContent>
@@ -275,6 +317,12 @@ export function AgenticReconPage() {
                         {new Date(r.createdAt).toLocaleString()}
                       </Typography>
                       <Stack direction="row" spacing={1} sx={{ mt: 0.5 }} flexWrap="wrap" useFlexGap>
+                        <Chip
+                          size="small"
+                          label={r.phase === "exploit" ? "exploit" : "recon"}
+                          variant="outlined"
+                          color={r.phase === "exploit" ? "warning" : "default"}
+                        />
                         <Chip size="small" label={`steps ${r.stepsTaken}/${r.maxSteps}`} variant="outlined" />
                         <Chip size="small" label={`tools ${r.invocationCount}`} variant="outlined" />
                         <Chip
@@ -328,12 +376,30 @@ function RunMonitor(props: {
   const [report, setReport] = React.useState<AgentRunReport | null>(null);
   const [reportError, setReportError] = React.useState<string | null>(null);
   const [exploitError, setExploitError] = React.useState<string | null>(null);
+  const [phaseActionError, setPhaseActionError] = React.useState<string | null>(null);
 
   const exploitM = useMutation({
     mutationFn: (id: string) => startExploitPhase(id, 8),
-    onMutate: () => setExploitError(null),
+    onMutate: () => {
+      setExploitError(null);
+      setPhaseActionError(null);
+    },
     onSuccess: () => onRunUpdated?.(),
     onError: (err) => setExploitError((err as Error)?.message ?? "Failed to start exploit phase")
+  });
+
+  const restartReconM = useMutation({
+    mutationFn: (id: string) => restartReconPhase(id, run?.maxSteps ?? 20),
+    onMutate: () => setPhaseActionError(null),
+    onSuccess: () => onRunUpdated?.(),
+    onError: (err) => setPhaseActionError((err as Error)?.message ?? "Failed to re-run recon")
+  });
+
+  const restartExploitM = useMutation({
+    mutationFn: (id: string) => restartExploitPhase(id, run?.maxSteps ?? 8),
+    onMutate: () => setPhaseActionError(null),
+    onSuccess: () => onRunUpdated?.(),
+    onError: (err) => setPhaseActionError((err as Error)?.message ?? "Failed to re-run exploit")
   });
 
   const summaryM = useMutation({
@@ -378,8 +444,12 @@ function RunMonitor(props: {
   const finishedCount = invocations.filter((i) => ["succeeded", "failed", "skipped"].includes(i.status)).length;
   const progress = run.maxSteps > 0 ? Math.min(100, Math.round((run.stepsTaken / run.maxSteps) * 100)) : 0;
   const summaryAvailable = run.status === "succeeded" || run.status === "failed";
-  const exploitEligible = run.status === "succeeded" && run.phase === "recon";
+  const runFinished = run.status === "succeeded";
+  const exploitEligible = runFinished && run.phase === "recon";
+  const exploitRerunEligible = runFinished && run.phase === "exploit";
+  const reconRerunEligible = runFinished;
   const exploitActive = run.phase === "exploit" && (run.status === "running" || run.status === "queued");
+  const phaseActionPending = restartReconM.isPending || restartExploitM.isPending;
 
   const latestDecision = (decisionEvents[decisionEvents.length - 1]?.payload ?? {}) as {
     snapshot?: {
@@ -414,17 +484,46 @@ function RunMonitor(props: {
                 color={run.phase === "exploit" ? "warning" : "default"}
               />
               <Chip size="small" label={`${finishedCount}/${invocations.length} agents finished`} variant="outlined" />
+              {reconRerunEligible ? (
+                <Tooltip title="Re-run the full recon phase on this run (fresh steps, same run id).">
+                  <span>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      disabled={phaseActionPending || exploitM.isPending}
+                      onClick={() => restartReconM.mutate(run.id)}
+                    >
+                      {restartReconM.isPending ? "Queueing…" : "Re-run recon"}
+                    </Button>
+                  </span>
+                </Tooltip>
+              ) : null}
               {exploitEligible ? (
-                <Tooltip title="Resume this run with gated exploit tools (hydra, post-ex). Approve commands in Pipeline → Stage 4.">
+                <Tooltip title="Resume this run with gated exploit tools (hydra, sqlmap, msf, etc.). Approve commands in Pipeline → Stage 4.">
                   <span>
                     <Button
                       size="small"
                       variant="contained"
                       color="warning"
-                      disabled={exploitM.isPending}
+                      disabled={exploitM.isPending || phaseActionPending}
                       onClick={() => exploitM.mutate(run.id)}
                     >
-                      {exploitM.isPending ? "Starting…" : "Start exploit phase"}
+                      {exploitM.isPending ? "Starting…" : "Start exploit scan"}
+                    </Button>
+                  </span>
+                </Tooltip>
+              ) : null}
+              {exploitRerunEligible ? (
+                <Tooltip title="Re-run exploit tools using existing recon data (skips recon).">
+                  <span>
+                    <Button
+                      size="small"
+                      variant="contained"
+                      color="warning"
+                      disabled={restartExploitM.isPending || phaseActionPending}
+                      onClick={() => restartExploitM.mutate(run.id)}
+                    >
+                      {restartExploitM.isPending ? "Queueing…" : "Re-run exploit scan"}
                     </Button>
                   </span>
                 </Tooltip>
@@ -466,6 +565,11 @@ function RunMonitor(props: {
           {exploitError ? (
             <Alert severity="error" sx={{ mt: 1 }}>
               {exploitError}
+            </Alert>
+          ) : null}
+          {phaseActionError ? (
+            <Alert severity="error" sx={{ mt: 1 }}>
+              {phaseActionError}
             </Alert>
           ) : null}
           <Box sx={{ mt: 2 }}>

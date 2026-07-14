@@ -11,6 +11,7 @@ import { withClient } from "../db.js";
 import { rebuildNeo4jForTarget, upsertNeo4jTarget } from "../neo4jSync.js";
 import { buildReconMCPServer } from "../agents/registry.js";
 import { decideNextAction, getLastManagerOllamaError, type ManagerContext } from "../agents/manager.js";
+import { extractToolOutputHints, recommendationsFromOutputHints } from "../agents/outputHints.js";
 import { generatePrompt } from "../agents/prompter.js";
 import { draftExecutionPayload, shouldUseExecutionWriter } from "../agents/executionCommandWriter.js";
 import { getWordlistCatalog } from "../agents/wordlists.js";
@@ -72,19 +73,69 @@ export async function startReconRun(input: StartReconRunInput): Promise<string> 
 
 /** Operator-triggered second phase: gated exploit tools on the same agent run. */
 export async function startExploitPhase(agentRunId: string, maxSteps = 8): Promise<void> {
+  await queueExploitPhase(agentRunId, maxSteps);
+}
+
+/** Re-queue recon phase on a finished run (same run id, fresh recon steps). */
+export async function restartReconPhase(agentRunId: string, maxSteps = 20): Promise<void> {
   await ensureAgentTables();
   const updated = await withClient(async (c) => {
     const r = await c.query(
       `update agent_runs
-       set phase = 'exploit', status = 'queued', max_steps = $2, steps_taken = 0,
+       set phase = 'recon', status = 'queued', max_steps = $2, steps_taken = 0,
            finished_at = null, cancel_requested = false, started_at = null
-       where id = $1 and status = 'succeeded' and coalesce(phase, 'recon') = 'recon'
+       where id = $1 and status = 'succeeded'
        returning target_id`,
       [agentRunId, maxSteps]
     );
     return r.rows[0] as { target_id: string } | undefined;
   });
-  if (!updated) throw new Error("Run is not eligible for exploit phase (must be succeeded recon)");
+  if (!updated) throw new Error("Run is not eligible for recon restart (must be succeeded)");
+
+  await withClient(async (c) => {
+    await c.query(`insert into jobs (type, status, payload) values ('recon-mcp', 'queued', $1::jsonb)`, [
+      JSON.stringify({ agentRunId, targetId: updated.target_id, phase: "recon" })
+    ]);
+    await c.query(`insert into agent_events (agent_run_id, kind, payload) values ($1, 'run.recon_restarted', $2::jsonb)`, [
+      agentRunId,
+      JSON.stringify({ maxSteps })
+    ]);
+  });
+}
+
+/** Re-queue exploit phase (from completed recon or re-run after completed exploit). */
+export async function restartExploitPhase(agentRunId: string, maxSteps = 8): Promise<void> {
+  await queueExploitPhase(agentRunId, maxSteps, { allowExploitRerun: true });
+}
+
+async function queueExploitPhase(
+  agentRunId: string,
+  maxSteps: number,
+  opts?: { allowExploitRerun?: boolean }
+): Promise<void> {
+  await ensureAgentTables();
+  const phaseClause = opts?.allowExploitRerun
+    ? `and status = 'succeeded'`
+    : `and status = 'succeeded' and coalesce(phase, 'recon') = 'recon'`;
+
+  const updated = await withClient(async (c) => {
+    const r = await c.query(
+      `update agent_runs
+       set phase = 'exploit', status = 'queued', max_steps = $2, steps_taken = 0,
+           finished_at = null, cancel_requested = false, started_at = null
+       where id = $1 ${phaseClause}
+       returning target_id`,
+      [agentRunId, maxSteps]
+    );
+    return r.rows[0] as { target_id: string } | undefined;
+  });
+  if (!updated) {
+    throw new Error(
+      opts?.allowExploitRerun
+        ? "Run is not eligible for exploit restart (must be succeeded)"
+        : "Run is not eligible for exploit phase (must be succeeded recon)"
+    );
+  }
 
   await withClient(async (c) => {
     await c.query(`insert into jobs (type, status, payload) values ('recon-mcp', 'queued', $1::jsonb)`, [
@@ -92,7 +143,7 @@ export async function startExploitPhase(agentRunId: string, maxSteps = 8): Promi
     ]);
     await c.query(`insert into agent_events (agent_run_id, kind, payload) values ($1, 'run.exploit_queued', $2::jsonb)`, [
       agentRunId,
-      JSON.stringify({ maxSteps })
+      JSON.stringify({ maxSteps, rerun: Boolean(opts?.allowExploitRerun) })
     ]);
   });
 }
@@ -102,7 +153,7 @@ async function hydrateManagerContextFromDb(
   targetId: string
 ): Promise<Pick<
   ManagerContext,
-  "knownPorts" | "knownServices" | "knownFindings" | "discoveredEndpoints" | "invocationHistory" | "webScan"
+  "knownPorts" | "knownServices" | "knownFindings" | "discoveredEndpoints" | "invocationHistory" | "webScan" | "toolFacts"
 >> {
   const services = await withClient(async (c) => {
     const r = await c.query(
@@ -148,7 +199,18 @@ async function hydrateManagerContextFromDb(
 
   const discoveredEndpoints: ManagerContext["discoveredEndpoints"] = [];
   const endpointSeen = new Set<string>();
+  const toolFacts: ManagerContext["toolFacts"] = [];
   let webScan: WebScanHints = emptyWebScanHints("", null);
+
+  const interestingFactTypes = new Set([
+    "msf_search",
+    "msf_summary",
+    "msf_module_missing",
+    "msf_result",
+    "sqlmap_summary",
+    "commix_summary",
+    "sqli"
+  ]);
 
   for (const inv of invocations) {
     const env = inv.envelope;
@@ -156,6 +218,9 @@ async function hydrateManagerContextFromDb(
     const metaPatch = webScanFromEnvelopeMeta(env.meta as Record<string, unknown> | undefined);
     if (metaPatch) webScan = mergeWebScanHints(webScan, metaPatch);
     for (const f of env.facts ?? []) {
+      if (interestingFactTypes.has(f.type)) {
+        toolFacts.push({ type: f.type, value: f.value, source: f.source });
+      }
       if (f.type === "virtual_host" && f.value && typeof f.value === "object") {
         const vv = f.value as { vhost?: string; connectIp?: string; cdnVendor?: string };
         if (vv.vhost) {
@@ -194,7 +259,7 @@ async function hydrateManagerContextFromDb(
     summary: `${inv.tool} (${inv.status})`
   }));
 
-  return { knownPorts, knownServices, knownFindings, discoveredEndpoints, invocationHistory, webScan };
+  return { knownPorts, knownServices, knownFindings, discoveredEndpoints, invocationHistory, webScan, toolFacts };
 }
 
 async function loadPipelineScopeConfig(): Promise<{ allowedCidrs: string[]; enforceScope: boolean }> {
@@ -213,6 +278,10 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
   await withClient(async (c) => {
     await c.query(`alter table targets add column if not exists vhost text`);
     await c.query(`alter table targets add column if not exists scope text[] not null default '{}'::text[]`);
+    await c.query(`alter table targets add column if not exists hydra_userlist text`);
+    await c.query(`alter table targets add column if not exists hydra_passlist text`);
+    await c.query(`alter table targets add column if not exists hydra_username text`);
+    await c.query(`alter table targets add column if not exists hydra_password text`);
   });
 
   const data = await withClient(async (c) => {
@@ -220,7 +289,8 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       `select ar.id, ar.target_id, ar.max_steps, ar.phase,
               ar.initial_nmap_profile, ar.initial_nmap_ports, ar.initial_nmap_extra_args,
               t.name as target_name, t.address as target_address, t.vhost as target_vhost,
-              t.scope as target_scope
+              t.scope as target_scope,
+              t.hydra_userlist, t.hydra_passlist, t.hydra_username, t.hydra_password
        from agent_runs ar
        join targets t on t.id = ar.target_id
        where ar.id = $1`,
@@ -239,6 +309,10 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
           target_address: string;
           target_vhost: string | null;
           target_scope: string[] | null;
+          hydra_userlist: string | null;
+          hydra_passlist: string | null;
+          hydra_username: string | null;
+          hydra_password: string | null;
         }
       | undefined;
   });
@@ -317,6 +391,13 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       ? await hydrateManagerContextFromDb(agentRunId, run.target_id)
       : null;
 
+  const engagementCreds = {
+    username: run.hydra_username,
+    password: run.hydra_password,
+    userlist: run.hydra_userlist,
+    passlist: run.hydra_passlist
+  };
+
   const ctx: ManagerContext = {
     targetHost: run.target_address,
     targetName: run.target_name,
@@ -331,13 +412,16 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       : webScan,
     pendingVerifications: [],
     invocationHistory: hydrated?.invocationHistory ?? [],
+    toolFacts: hydrated?.toolFacts ?? [],
     pendingRecommendations: [],
     wordlistCatalog,
     recentFailures: [],
+    recentToolOutputs: [],
     installedToolsAttempted: [],
     installedToolsInstalled: [],
     blockedOnMissingTool: null,
     runPhase,
+    engagementCreds,
     runHints: {
       initialNmapProfile: run.initial_nmap_profile,
       initialNmapPorts: run.initial_nmap_ports,
@@ -466,6 +550,8 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
           webScan: ctx.webScan,
           scopeEntries: scope.entries,
           scopeEnforce: scope.enforce,
+          engagementCreds,
+          knownPresentTools: ctx.installedToolsInstalled ?? [],
           runId: agentRunId,
           invocationId: ""
         }
@@ -492,6 +578,7 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       attemptsByTool.set(toolName, prev + 1);
 
       const meta = envelope.meta as Record<string, unknown> | undefined;
+      const presenceCheckFailed = meta?.presenceCheckFailed === true;
       const missingTool = typeof meta?.missingTool === "string" ? String(meta.missingTool) : undefined;
       const missingToolInstallCommand =
         typeof meta?.missingToolInstallCommand === "string" ? String(meta.missingToolInstallCommand) : undefined;
@@ -504,7 +591,8 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
         stdoutSnippet: envelope.artifacts?.stdoutSnippet,
         stderrSnippet: envelope.artifacts?.stderrSnippet,
         missingTool,
-        missingToolInstallCommand
+        missingToolInstallCommand,
+        presenceCheckFailed
       };
       ctx.recentFailures = [...(ctx.recentFailures ?? []), failure].slice(-10);
 
@@ -515,17 +603,42 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
         );
       });
 
-      if (missingTool) {
-        ctx.blockedOnMissingTool = { tool: toolName, args: (args ?? {}) as Record<string, unknown>, missingTool };
-        if (server.has("system.tool_installer") && !(ctx.installedToolsAttempted ?? []).includes(missingTool)) {
-          const installArgs: Record<string, unknown> = { tool: missingTool };
-          if (missingToolInstallCommand) installArgs.installCommand = missingToolInstallCommand;
+      // SSH flake / presence timeout — do NOT apt-install. Retry the specialist once.
+      if (presenceCheckFailed) {
+        if (prev < 1) {
           ctx.pendingRecommendations.unshift({
-            agent: "system.tool_installer",
-            reason: `Install missing tool '${missingTool}' for ${toolName}`,
-            priority: 100,
-            args: installArgs
+            agent: toolName,
+            reason: `Presence check failed (SSH flake?) for ${toolName} — retry without installer`,
+            priority: 96,
+            args: (args ?? {}) as Record<string, unknown>
           });
+        }
+      } else if (missingTool) {
+        const alreadyProven =
+          (ctx.installedToolsInstalled ?? []).includes(missingTool) ||
+          toolAlreadyProvenThisRun(ctx, missingTool);
+        if (alreadyProven) {
+          // e.g. nmap already succeeded earlier — false "missing" from flaky SSH.
+          if (prev < 1) {
+            ctx.pendingRecommendations.unshift({
+              agent: toolName,
+              reason: `'${missingTool}' already worked this run — retry ${toolName} (skip installer)`,
+              priority: 97,
+              args: (args ?? {}) as Record<string, unknown>
+            });
+          }
+        } else {
+          ctx.blockedOnMissingTool = { tool: toolName, args: (args ?? {}) as Record<string, unknown>, missingTool };
+          if (server.has("system.tool_installer") && !(ctx.installedToolsAttempted ?? []).includes(missingTool)) {
+            const installArgs: Record<string, unknown> = { tool: missingTool };
+            if (missingToolInstallCommand) installArgs.installCommand = missingToolInstallCommand;
+            ctx.pendingRecommendations.unshift({
+              agent: "system.tool_installer",
+              reason: `Install missing tool '${missingTool}' for ${toolName}`,
+              priority: 100,
+              args: installArgs
+            });
+          }
         }
       } else if (prev < 1) {
         ctx.pendingRecommendations.unshift({
@@ -533,6 +646,15 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
           reason: `Recover from failure: ${envelope.error ?? "unknown error"}`,
           priority: 95
         });
+      }
+    }
+
+    // Mark binaries proven by successful specialists so later false "missing" checks skip apt.
+    if (envelope.status === "succeeded" || envelope.status === "partial") {
+      const proven = inferProvenBinary(toolName);
+      if (proven) {
+        const ok = ctx.installedToolsInstalled ?? [];
+        if (!ok.includes(proven)) ctx.installedToolsInstalled = [...ok, proven];
       }
     }
 
@@ -590,6 +712,17 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
     }
 
     for (const f of envelope.facts ?? []) {
+      if (
+        f.type === "msf_search" ||
+        f.type === "msf_summary" ||
+        f.type === "msf_module_missing" ||
+        f.type === "msf_result" ||
+        f.type === "sqlmap_summary" ||
+        f.type === "commix_summary" ||
+        f.type === "sqli"
+      ) {
+        ctx.toolFacts = [...(ctx.toolFacts ?? []), { type: f.type, value: f.value, source: f.source }];
+      }
       if (f.type === "subdomain" && typeof f.value === "string") {
         const sd = f.value.trim();
         if (sd && !(ctx.knownDomains ?? []).includes(sd)) {
@@ -620,12 +753,79 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
       summary: `${envelope.findings?.length ?? 0} findings, ${envelope.facts?.length ?? 0} facts`
     });
 
-    for (const rec of envelope.recommendations ?? []) {
-      if (!ctx.pendingRecommendations.some((p) => p.agent === rec.agent)) ctx.pendingRecommendations.push(rec);
+    // Capture stdout snippets + plain-English retry hints for ALL tools (recon + exploit).
+    {
+      const stdoutSnippet = envelope.artifacts?.stdoutSnippet;
+      const stderrSnippet = envelope.artifacts?.stderrSnippet;
+      const combined = `${stdoutSnippet ?? ""}\n${stderrSnippet ?? ""}\n${envelope.error ?? ""}`;
+      const hints = extractToolOutputHints(toolName, combined, args);
+      const metaHints = (envelope.meta as { outputHints?: Array<{ plainEnglish?: string; suggestedArgs?: Record<string, unknown> }> } | undefined)
+        ?.outputHints;
+      const mergedHints = [
+        ...hints,
+        ...(Array.isArray(metaHints)
+          ? metaHints.map((h) => ({
+              plainEnglish: h.plainEnglish ?? "",
+              suggestedArgs: h.suggestedArgs
+            }))
+          : [])
+      ].filter((h) => h.plainEnglish);
+
+      let factPlain: string | undefined;
+      for (const f of envelope.facts ?? []) {
+        if (f.value && typeof f.value === "object" && "plainEnglish" in (f.value as object)) {
+          const pe = (f.value as { plainEnglish?: string }).plainEnglish;
+          if (pe?.trim()) {
+            factPlain = pe.trim();
+            break;
+          }
+        }
+      }
+
+      const plain = mergedHints[0]?.plainEnglish || factPlain || undefined;
+      ctx.recentToolOutputs = [
+        ...(ctx.recentToolOutputs ?? []),
+        {
+          tool: toolName,
+          status: envelope.status,
+          plainEnglish: plain,
+          stdoutSnippet: stdoutSnippet ? String(stdoutSnippet).slice(0, 1800) : undefined,
+          stderrSnippet: stderrSnippet ? String(stderrSnippet).slice(0, 600) : undefined,
+          suggestedArgs: mergedHints.find((h) => h.suggestedArgs)?.suggestedArgs,
+          hints: mergedHints.map((h) => h.plainEnglish).slice(0, 4)
+        }
+      ].slice(-10);
+
+      const autoRecs = recommendationsFromOutputHints(toolName, mergedHints, args);
+      for (const rec of autoRecs) {
+        const exists = (envelope.recommendations ?? []).some(
+          (r) => r.agent === rec.agent && JSON.stringify(r.args ?? {}) === JSON.stringify(rec.args ?? {})
+        );
+        if (!exists) {
+          (envelope.recommendations as ToolEnvelope["recommendations"]) = [
+            ...(envelope.recommendations ?? []),
+            rec
+          ];
+        }
+      }
     }
 
-    // Drop queued recommendation once we have run that specialist.
-    ctx.pendingRecommendations = ctx.pendingRecommendations.filter((p) => p.agent !== toolName);
+    const incomingRecs = envelope.recommendations ?? [];
+    for (const rec of incomingRecs) {
+      const dup = ctx.pendingRecommendations.some(
+        (p) => p.agent === rec.agent && JSON.stringify(p.args ?? {}) === JSON.stringify(rec.args ?? {})
+      );
+      if (!dup) ctx.pendingRecommendations.push(rec);
+    }
+
+    // Drop only prior queued recs for this tool that we just consumed (keep NEW follow-ups from this envelope).
+    ctx.pendingRecommendations = ctx.pendingRecommendations.filter((p) => {
+      if (p.agent !== toolName) return true;
+      if (incomingRecs.some((r) => r.agent === p.agent && JSON.stringify(r.args ?? {}) === JSON.stringify(p.args ?? {}))) {
+        return true;
+      }
+      return false;
+    });
 
     // Session loop: once credentials are confirmed, queue gated read-only post-ex (exploit phase only).
     if (
@@ -764,4 +964,43 @@ export async function runReconLoop(agentRunId: string): Promise<void> {
   } finally {
     clearInterval(cancelPoll);
   }
+}
+
+/** Map specialist tool → primary remote binary it needs. */
+function inferProvenBinary(toolName: string): string | null {
+  const map: Record<string, string> = {
+    "recon.nmap": "nmap",
+    "recon.port_recheck": "nmap",
+    "recon.ftp_enum": "nmap",
+    "recon.smtp_enum": "nmap",
+    "recon.db_banner": "nmap",
+    "recon.rdp_enum": "nmap",
+    "recon.http_probe": "httpx",
+    "recon.spider": "katana",
+    "recon.gobuster": "gobuster",
+    "recon.ffuf": "ffuf",
+    "recon.dns_enum": "dnsx",
+    "recon.smb_enum": "enum4linux-ng",
+    "recon.ssh_enum": "ssh-audit",
+    "recon.tls_check": "testssl.sh",
+    "recon.nuclei": "nuclei",
+    "recon.waf_detect": "wafw00f",
+    "recon.hydra": "hydra",
+    "exploit.sqlmap": "sqlmap",
+    "exploit.commix": "commix",
+    "exploit.msf_search": "msfconsole",
+    "exploit.msf_module": "msfconsole",
+    "exploit.crackmapexec": "nxc"
+  };
+  return map[toolName] ?? null;
+}
+
+function toolAlreadyProvenThisRun(ctx: ManagerContext, binary: string): boolean {
+  if ((ctx.installedToolsInstalled ?? []).includes(binary)) return true;
+  // Successful prior specialist that uses this binary.
+  for (const h of ctx.invocationHistory ?? []) {
+    if (h.status !== "succeeded" && h.status !== "partial") continue;
+    if (inferProvenBinary(h.tool) === binary) return true;
+  }
+  return false;
 }

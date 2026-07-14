@@ -68,10 +68,14 @@ export function isCommandAllowlisted(command: string): boolean {
   return entries.some((prefix) => cmd.startsWith(prefix));
 }
 
-/** True when `lhost` is empty (nothing to check) or present in EXPLOIT_LHOST_ALLOWLIST. */
+/**
+ * True when `lhost` is empty (nothing to check), or present in EXPLOIT_LHOST_ALLOWLIST.
+ * Empty allowlist = lab mode (any listener IP accepted; prefer auto-detect on Kali).
+ */
 export function isLhostAllowed(lhost: string | undefined | null): boolean {
   const v = (lhost ?? "").trim();
   if (!v) return true;
   const entries = env.EXPLOIT_LHOST_ALLOWLIST.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+  if (entries.length === 0) return true;
   return entries.includes(v);
 }

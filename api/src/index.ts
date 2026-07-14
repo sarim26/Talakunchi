@@ -319,11 +319,26 @@ app.get("/api/ai/models", async (_req, reply) => {
 app.post("/api/targets", async (req, reply) => {
   const body = CreateTargetSchema.parse(req.body);
   const row = await withClient(async (c) => {
+    await c.query(`alter table targets add column if not exists hydra_userlist text`);
+    await c.query(`alter table targets add column if not exists hydra_passlist text`);
+    await c.query(`alter table targets add column if not exists hydra_username text`);
+    await c.query(`alter table targets add column if not exists hydra_password text`);
     const res = await c.query(
-      `insert into targets (name, address, tags, owner, vhost, scope)
-       values ($1, $2, $3, $4, $5, $6)
-       returning id, name, address, tags, owner, vhost, scope, created_at`,
-      [body.name, body.address, body.tags, body.owner ?? null, body.vhost?.trim() || null, body.scope ?? []]
+      `insert into targets (name, address, tags, owner, vhost, scope, hydra_userlist, hydra_passlist, hydra_username, hydra_password)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       returning id, name, address, tags, owner, vhost, scope, hydra_userlist, hydra_passlist, hydra_username, hydra_password, created_at`,
+      [
+        body.name,
+        body.address,
+        body.tags,
+        body.owner ?? null,
+        body.vhost?.trim() || null,
+        body.scope ?? [],
+        body.hydraUserlist?.trim() || null,
+        body.hydraPasslist?.trim() || null,
+        body.hydraUsername?.trim() || null,
+        body.hydraPassword?.trim() || null
+      ]
     );
     return res.rows[0];
   });
@@ -343,14 +358,23 @@ app.post("/api/targets", async (req, reply) => {
     scope: row.scope ?? [],
     tags: row.tags,
     owner: row.owner,
+    hydraUserlist: row.hydra_userlist,
+    hydraPasslist: row.hydra_passlist,
+    hydraUsername: row.hydra_username,
+    hydraPassword: row.hydra_password,
     createdAt: row.created_at
   });
 });
 
 app.get("/api/targets", async () => {
   const rows = await withClient(async (c) => {
+    await c.query(`alter table targets add column if not exists hydra_userlist text`);
+    await c.query(`alter table targets add column if not exists hydra_passlist text`);
+    await c.query(`alter table targets add column if not exists hydra_username text`);
+    await c.query(`alter table targets add column if not exists hydra_password text`);
     const res = await c.query(
-      `select id, name, address, tags, owner, vhost, scope, created_at
+      `select id, name, address, tags, owner, vhost, scope,
+              hydra_userlist, hydra_passlist, hydra_username, hydra_password, created_at
        from targets
        order by created_at desc`
     );
@@ -364,6 +388,10 @@ app.get("/api/targets", async () => {
     scope: r.scope ?? [],
     tags: r.tags,
     owner: r.owner,
+    hydraUserlist: r.hydra_userlist,
+    hydraPasslist: r.hydra_passlist,
+    hydraUsername: r.hydra_username,
+    hydraPassword: r.hydra_password,
     createdAt: r.created_at
   }));
 });
@@ -563,6 +591,94 @@ app.post("/api/agent-runs/:id/start-exploit", async (req, reply) => {
 
   if (!result) return reply.code(409).send({ error: "Run is not eligible for exploit phase (must be succeeded recon)" });
   await writeAuditEvent("agent.exploit.queued", { agentRunId, maxSteps }, undefined, "operator");
+  return reply.code(202).send({ id: agentRunId, status: "queued", phase: "exploit" });
+});
+
+const RestartPhaseSchema = z.object({
+  maxSteps: z.coerce.number().int().positive().max(60).optional()
+});
+
+app.post("/api/agent-runs/:id/restart-recon", async (req, reply) => {
+  const agentRunId = z.string().uuid().parse((req.params as any).id);
+  const body = RestartPhaseSchema.parse(req.body ?? {});
+  const maxSteps = body.maxSteps ?? 20;
+
+  const result = await withClient(async (c) => {
+    await c.query(`alter table agent_runs add column if not exists phase text not null default 'recon'`);
+    await c.query("begin");
+    try {
+      const r = await c.query(
+        `update agent_runs
+         set phase = 'recon', status = 'queued', max_steps = $2, steps_taken = 0,
+             finished_at = null, cancel_requested = false, started_at = null
+         where id = $1 and status = 'succeeded'
+         returning target_id`,
+        [agentRunId, maxSteps]
+      );
+      if (!r.rows[0]) {
+        await c.query("rollback");
+        return null;
+      }
+      const targetId = r.rows[0].target_id as string;
+      await c.query(`insert into jobs (type, status, payload) values ('recon-mcp', 'queued', $1::jsonb)`, [
+        JSON.stringify({ agentRunId, targetId, phase: "recon" })
+      ]);
+      await c.query(`insert into agent_events (agent_run_id, kind, payload) values ($1, 'run.recon_restarted', $2::jsonb)`, [
+        agentRunId,
+        JSON.stringify({ maxSteps })
+      ]);
+      await c.query("commit");
+      return { targetId };
+    } catch (e) {
+      await c.query("rollback");
+      throw e;
+    }
+  });
+
+  if (!result) return reply.code(409).send({ error: "Run is not eligible for recon restart (must be succeeded)" });
+  await writeAuditEvent("agent.recon.restarted", { agentRunId, maxSteps }, undefined, "operator");
+  return reply.code(202).send({ id: agentRunId, status: "queued", phase: "recon" });
+});
+
+app.post("/api/agent-runs/:id/restart-exploit", async (req, reply) => {
+  const agentRunId = z.string().uuid().parse((req.params as any).id);
+  const body = RestartPhaseSchema.parse(req.body ?? {});
+  const maxSteps = body.maxSteps ?? 8;
+
+  const result = await withClient(async (c) => {
+    await c.query(`alter table agent_runs add column if not exists phase text not null default 'recon'`);
+    await c.query("begin");
+    try {
+      const r = await c.query(
+        `update agent_runs
+         set phase = 'exploit', status = 'queued', max_steps = $2, steps_taken = 0,
+             finished_at = null, cancel_requested = false, started_at = null
+         where id = $1 and status = 'succeeded'
+         returning target_id`,
+        [agentRunId, maxSteps]
+      );
+      if (!r.rows[0]) {
+        await c.query("rollback");
+        return null;
+      }
+      const targetId = r.rows[0].target_id as string;
+      await c.query(`insert into jobs (type, status, payload) values ('recon-mcp', 'queued', $1::jsonb)`, [
+        JSON.stringify({ agentRunId, targetId, phase: "exploit" })
+      ]);
+      await c.query(`insert into agent_events (agent_run_id, kind, payload) values ($1, 'run.exploit_restarted', $2::jsonb)`, [
+        agentRunId,
+        JSON.stringify({ maxSteps })
+      ]);
+      await c.query("commit");
+      return { targetId };
+    } catch (e) {
+      await c.query("rollback");
+      throw e;
+    }
+  });
+
+  if (!result) return reply.code(409).send({ error: "Run is not eligible for exploit restart (must be succeeded)" });
+  await writeAuditEvent("agent.exploit.restarted", { agentRunId, maxSteps }, undefined, "operator");
   return reply.code(202).send({ id: agentRunId, status: "queued", phase: "exploit" });
 });
 
@@ -1150,6 +1266,8 @@ const StartAgentRunSchema = z.object({
   targetId: z.string().uuid(),
   maxSteps: z.coerce.number().int().positive().max(60).optional(),
   notes: z.string().optional(),
+  /** `recon` (default) or `exploit` to skip recon when target already has a completed recon run. */
+  phase: z.enum(["recon", "exploit"]).optional().default("recon"),
   initialNmap: z
     .object({
       profile: z.enum(["fast", "targeted", "deep", "full"]).optional(),
@@ -1161,45 +1279,70 @@ const StartAgentRunSchema = z.object({
 
 app.post("/api/agent-runs", async (req, reply) => {
   const body = StartAgentRunSchema.parse(req.body);
+  const phase = body.phase ?? "recon";
   const target = await withClient(async (c) => {
     const r = await c.query(`select id, name, address from targets where id = $1`, [body.targetId]);
     return r.rows[0] as { id: string; name: string; address: string } | undefined;
   });
   if (!target) return reply.code(404).send({ error: "Target not found" });
 
+  if (phase === "exploit") {
+    const priorRecon = await withClient(async (c) => {
+      const r = await c.query(
+        `select id from agent_runs
+         where target_id = $1 and status = 'succeeded' and coalesce(phase, 'recon') = 'recon'
+         limit 1`,
+        [body.targetId]
+      );
+      return r.rows[0]?.id as string | undefined;
+    });
+    if (!priorRecon) {
+      return reply.code(409).send({
+        error: "Cannot skip recon: no succeeded recon run exists for this target yet. Run recon first."
+      });
+    }
+  }
+
   const created = await withClient(async (c) => {
+    await c.query(`alter table agent_runs add column if not exists phase text not null default 'recon'`);
     await c.query("begin");
     try {
       const r = await c.query(
         `insert into agent_runs (
            target_id, status, manager_model, specialist_model, prompter_model, max_steps, notes,
-           initial_nmap_profile, initial_nmap_ports, initial_nmap_extra_args
+           initial_nmap_profile, initial_nmap_ports, initial_nmap_extra_args, phase
          )
-         values ($1, 'queued', '', '', '', $2, $3, $4, $5, $6)
+         values ($1, 'queued', '', '', '', $2, $3, $4, $5, $6, $7)
          returning id, max_steps`,
         [
           body.targetId,
-          body.maxSteps ?? 20,
+          body.maxSteps ?? (phase === "exploit" ? 8 : 20),
           body.notes ?? null,
           body.initialNmap?.profile ?? "deep",
           body.initialNmap?.ports ?? null,
-          body.initialNmap?.extraArgs ?? null
+          body.initialNmap?.extraArgs ?? null,
+          phase
         ]
       );
       const runId = r.rows[0].id as string;
       await c.query(
         `insert into jobs (type, status, payload) values ('recon-mcp','queued', $1::jsonb)`,
-        [JSON.stringify({ agentRunId: runId, targetId: body.targetId })]
+        [JSON.stringify({ agentRunId: runId, targetId: body.targetId, phase })]
       );
       await c.query("commit");
-      return { id: runId, maxSteps: r.rows[0].max_steps as number };
+      return { id: runId, maxSteps: r.rows[0].max_steps as number, phase };
     } catch (e) {
       await c.query("rollback");
       throw e;
     }
   });
-  await writeAuditEvent("agent.recon.queued", { agentRunId: created.id, targetId: body.targetId }, target.address, "operator");
-  return reply.code(202).send({ id: created.id, status: "queued" });
+  await writeAuditEvent(
+    phase === "exploit" ? "agent.exploit.queued" : "agent.recon.queued",
+    { agentRunId: created.id, targetId: body.targetId, phase, skipRecon: phase === "exploit" },
+    target.address,
+    "operator"
+  );
+  return reply.code(202).send({ id: created.id, status: "queued", phase: created.phase });
 });
 
 app.get("/api/agent-runs", async (req) => {

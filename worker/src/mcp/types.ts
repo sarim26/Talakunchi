@@ -127,8 +127,17 @@ export type ToolInput = {
       stdoutSnippet?: string;
       stderrSnippet?: string;
     };
+    /** Engagement credential / wordlist paths (per-target, set on Targets page). */
+    engagementCreds?: {
+      username?: string | null;
+      password?: string | null;
+      userlist?: string | null;
+      passlist?: string | null;
+    };
     runId: string;
     invocationId: string;
+    /** Binaries already proven present this run (skip false missing). */
+    knownPresentTools?: string[];
   };
   /** Hard cap; tool implementations should respect this. */
   timeoutMs?: number;

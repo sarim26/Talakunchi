@@ -40,7 +40,8 @@ const EnvSchema = z.object({
      */
     RECON_MODE: z.enum(["readonly", "gated_exploit"]).default("readonly"),
     /** Max time a gated tool waits for a command approval before skipping. */
-    APPROVAL_WAIT_MS: z.coerce.number().int().nonnegative().default(120_000),
+    APPROVAL_WAIT_MS: z.coerce.number().int().nonnegative().default(600_000),
+    APPROVAL_AUTO_APPROVE_LOW_IMPACT: z.coerce.boolean().default(true),
     /** Allowlist (comma/space separated) of exploit command prefixes permitted in gated mode. */
     EXPLOIT_COMMAND_ALLOWLIST: z.string().optional().default(""),
     /** Allowlist of LHOST values usable by exploit/post-ex handlers. */
@@ -66,6 +67,7 @@ const EnvSchema = z.object({
     HYDRA_PASSLIST: z.string().optional(),
     HYDRA_STOP_ON_FIRST_FIND: z.coerce.boolean().default(false),
     HYDRA_THREADS: z.coerce.number().optional(),
+    WORDLISTS_EXTRA_ROOTS: z.string().optional().default(""),
     NMAP_ARGS: z
         .string()
         .optional()

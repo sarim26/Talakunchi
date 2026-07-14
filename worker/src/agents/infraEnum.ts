@@ -63,7 +63,9 @@ function makeNmapScriptTool(opts: {
     defaultTimeoutMs: 6 * 60 * 1000,
     handler: async (input, emit): Promise<ToolEnvelope> => {
       const ports = matchedPorts(input, opts.match, opts.defaultPorts);
-      const presence = await requireRemoteTool("nmap", input.signal);
+      const presence = await requireRemoteTool("nmap", input.signal, {
+        knownPresent: input.context?.knownPresentTools
+      });
       if (presence.missing) return presence.envelope;
 
       const host = input.target.host;
